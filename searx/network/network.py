@@ -60,6 +60,7 @@ class Network:
         'max_redirects',
         'retries',
         'retry_on_http_error',
+        'using_browser',
         '_local_addresses_cycle',
         '_proxies_cycle',
         '_clients',
@@ -83,6 +84,7 @@ class Network:
         retries: int = 0,
         retry_on_http_error: bool = False,
         max_redirects: int = 30,
+        using_browser: bool = False,
         logger_name: str = None,  # pyright: ignore[reportArgumentType]
     ):
 
@@ -97,6 +99,7 @@ class Network:
         self.retries = retries
         self.retry_on_http_error = retry_on_http_error
         self.max_redirects = max_redirects
+        self.using_browser = using_browser
         self._local_addresses_cycle = self.get_ipaddress_cycle()
         self._proxies_cycle = self.get_proxy_cycles()
         self._clients = {}
@@ -269,6 +272,13 @@ class Network:
         return True
 
     async def call_client(self, stream: bool, method: str, url: str, **kwargs: t.Any) -> SXNG_Response:
+        if self.using_browser and not stream:
+            # the browser fetch pool does not support streaming:
+            # stream requests (image proxy) keep using the HTTP client
+            return await self.call_browser(method, url, **kwargs)
+        return await self.call_curl_client(stream, method, url, **kwargs)
+
+    async def call_curl_client(self, stream: bool, method: str, url: str, **kwargs: t.Any) -> SXNG_Response:
         retries = self.retries
         was_disconnected = False
         do_raise_for_httperror = Network.extract_do_raise_for_httperror(kwargs)
@@ -299,6 +309,52 @@ class Network:
             except RequestException as e:
                 if retries <= 0:
                     raise e
+            retries -= 1
+
+    async def call_browser(self, method: str, url: str, **kwargs: t.Any) -> SXNG_Response:
+        """Serve a request through the masqueraded Chromium fetch pool.
+
+        Mirrors the retry/raise logic of :py:meth:`call_curl_client`. Engine
+        timeouts are honored with a browser-mode floor: challenge warm-up
+        renders take several seconds, a strict curl-sized budget would expire
+        before the challenge resolves.
+        """
+        # pylint: disable=import-outside-toplevel
+        from searx.exceptions import SearxEngineAccessDeniedException, SearxEngineTooManyRequestsException
+        from searx.network.browser import BrowserFetchError, get_browser_fetch_pool
+
+        do_raise_for_httperror = Network.extract_do_raise_for_httperror(kwargs)
+        Network.extract_kwargs_clients(kwargs)
+        retries = self.retries
+        allow_redirects = kwargs.get('allow_redirects', True)
+        while True:
+            try:
+                response = await get_browser_fetch_pool().fetch(
+                    method,
+                    url,
+                    headers=kwargs.get('headers'),
+                    params=kwargs.get('params'),
+                    data=kwargs.get('data'),
+                    json_body=kwargs.get('json'),
+                    content=kwargs.get('content'),
+                    cookies=kwargs.get('cookies'),
+                    timeout=kwargs.get('timeout'),
+                    allow_redirects=allow_redirects,
+                    max_redirects=self.max_redirects,
+                )
+            except (SearxEngineAccessDeniedException, SearxEngineTooManyRequestsException):
+                # engine-level errors: report as-is so the engine gets suspended
+                raise
+            except BrowserFetchError as e:
+                if retries <= 0:
+                    raise
+                retries -= 1
+                self._logger.warning(f'browser fetch error, retrying: {e}')
+                continue
+            if sxng_debug:
+                await self.log_response(response)
+            if self.is_valid_response(response) or retries <= 0:
+                return self.patch_response(response, do_raise_for_httperror)
             retries -= 1
 
     async def request(self, method: str, url: str, **kwargs: t.Any) -> SXNG_Response:
@@ -359,6 +415,7 @@ def initialize(
         'max_redirects': settings_outgoing['max_redirects'],
         'retries': settings_outgoing['retries'],
         'retry_on_http_error': False,
+        'using_browser': settings_outgoing.get('using_browser', False),
     }
 
     def new_network(params: dict[str, t.Any], logger_name: str | None = None):

@@ -260,6 +260,12 @@ SCHEMA: dict[str, t.Any] = {
         'retries': SettingsValue(int, 0),
         'proxies': SettingsValue((None, str, dict), None),
         'source_ips': SettingsValue((None, str, list), None),
+        # Masqueraded Chromium fetch pool (see searx/network/browser.py):
+        # route engine requests through a real browser instead of curl_cffi.
+        # Slower per request, but defeats engine bot detection that curl
+        # fingerprints cannot (CAPTCHAs, wrong-results degradation, ...).
+        'using_browser': SettingsValue(bool, False),
+        'browser_pool_size': SettingsValue(int, 3),
         # Tor configuration
         'using_tor_proxy': SettingsValue(bool, False),
         'extra_proxy_timeout': SettingsValue(int, 0),
