@@ -45,15 +45,13 @@ from types import SimpleNamespace
 from urllib.parse import urlencode
 
 from lxml import html
-
 from searx.exceptions import (
     SearxEngineAccessDeniedException,
-    SearxEngineCaptchaException,
     SearxEngineTooManyRequestsException,
 )
 from searx.extended_types import SXNG_URL
 
-logger = logging.getLogger('searx.network.browser')
+logger = logging.getLogger("searx.network.browser")
 
 # Grace period after a challenge navigation to let challenge JS settle.
 _BOT_CHALLENGE_GRACE_MS = 5000
@@ -91,6 +89,27 @@ def _discover_chromium():
     return None
 
 
+def _cleanup_stale_x_locks():
+    """Remove X lock/socket leftovers from a previous container run.
+
+    The container filesystem survives restarts while processes do not: a
+    stale lock for the display makes a freshly started Xvfb exit at once,
+    and a stale socket then looks like a working display.
+    """
+    display_number = _XVFB_DISPLAY.lstrip(":")
+    stale_paths = (
+        f"/tmp/.X{display_number}-lock",  # noqa: S108
+        f"/tmp/.X11-unix/X{display_number}",  # noqa: S108
+    )
+    for path in stale_paths:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.warning("Could not remove stale X server file %s", path)
+
+
 def _ensure_display():
     """Return an X display for a headed browser, starting Xvfb if needed.
 
@@ -109,21 +128,46 @@ def _ensure_display():
             return None
         try:
             os.makedirs("/tmp/.X11-unix", exist_ok=True)  # noqa: S108
+            _cleanup_stale_x_locks()
             _xvfb_process = subprocess.Popen(  # pylint: disable=consider-using-with
-                [xvfb, _XVFB_DISPLAY, "-screen", "0", _XVFB_GEOMETRY, "-nolisten", "tcp"],
+                [
+                    xvfb,
+                    _XVFB_DISPLAY,
+                    "-screen",
+                    "0",
+                    _XVFB_GEOMETRY,
+                    "-nolisten",
+                    "tcp",
+                ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
         except OSError:
             logger.warning("Failed to start Xvfb; falling back to headless browser")
             return None
+        # Wait for a live process AND a fresh socket: a leftover socket from
+        # a stopped X server must not count as a working display.
         socket_path = f"/tmp/.X11-unix/X{_XVFB_DISPLAY.lstrip(':')}"  # noqa: S108
-        for _ in range(50):  # up to 5s for the display socket to appear
-            if os.path.exists(socket_path):
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if _xvfb_process.poll() is not None:
                 break
+            if os.path.exists(socket_path):
+                logger.info(
+                    "Started Xvfb on %s for masqueraded browser fetches", _XVFB_DISPLAY
+                )
+                return _XVFB_DISPLAY
             time.sleep(0.1)
-        logger.info("Started Xvfb on %s for masqueraded browser fetches", _XVFB_DISPLAY)
-        return _XVFB_DISPLAY
+        logger.warning(
+            "Xvfb on %s did not come up; falling back to headless browser",
+            _XVFB_DISPLAY,
+        )
+        try:
+            _xvfb_process.kill()
+        except OSError:
+            pass
+        _xvfb_process = None
+        return None
 
 
 # Playwright's default launch args tilt toward automation and test farms.
@@ -259,7 +303,9 @@ def _stealth_init_script(chrome_major: str, chrome_full: str) -> str:
 
 # A Cloudflare challenge interstitial is identified by its page title and by
 # Cloudflare-specific strings in the page body.
-_CF_CHALLENGE_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+_CF_CHALLENGE_TITLE_RE = re.compile(
+    r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL
+)
 _CF_CHALLENGE_TITLE_MARKERS = (
     "just a moment...",
     "attention required",
@@ -346,7 +392,9 @@ class BrowserResponse:
         self.content = content
         self.url = SXNG_URL(url)
         self.request = SimpleNamespace(method=method.upper(), url=url)
-        self.reason = reason if reason is not None else http.responses.get(status_code, "")
+        self.reason = (
+            reason if reason is not None else http.responses.get(status_code, "")
+        )
         self.cookies = dict(cookies or {})
         self.history = []
         self.http_version = "HTTP/2"
@@ -362,7 +410,9 @@ class BrowserResponse:
         content_type = self.headers.get("content-type", "")
         charset = None
         if "charset=" in content_type:
-            charset = content_type.split("charset=", 1)[1].split(";", 1)[0].strip().strip('"')
+            charset = (
+                content_type.split("charset=", 1)[1].split(";", 1)[0].strip().strip('"')
+            )
         try:
             if charset:
                 return self.content.decode(charset, errors="replace")
@@ -418,7 +468,9 @@ class BrowserFetchPool:
     coroutines and must run on that loop.
     """
 
-    def __init__(self, pool_size: int = 3, verify: bool = True, proxy: str | None = None):
+    def __init__(
+        self, pool_size: int = 3, verify: bool = True, proxy: str | None = None
+    ):
         self._pool_size = max(1, pool_size)
         self._verify = verify
         self._proxy = proxy
@@ -453,86 +505,97 @@ class BrowserFetchPool:
                     ", ".join(_CHROMIUM_CANDIDATE_PATHS),
                 )
 
-            display = await asyncio.get_running_loop().run_in_executor(None, _ensure_display)
+            display = await asyncio.get_running_loop().run_in_executor(
+                None, _ensure_display
+            )
             headed = display is not None
             env = dict(os.environ)
             if display:
                 env["DISPLAY"] = display
 
-            self._playwright = await async_playwright().start()
-            launch_kwargs = {
-                "headless": not headed,
-                "ignore_default_args": _OMIT_DEFAULT_ARGS,
-                "args": _LAUNCH_ARGS,
-                "env": env,
-            }
-            if executable_path:
-                launch_kwargs["executable_path"] = executable_path
-            if self._proxy:
-                launch_kwargs["proxy"] = {"server": self._proxy}
-            self._browser = await self._playwright.chromium.launch(**launch_kwargs)
+            try:
+                self._playwright = await async_playwright().start()
+                launch_kwargs = {
+                    "headless": not headed,
+                    "ignore_default_args": _OMIT_DEFAULT_ARGS,
+                    "args": _LAUNCH_ARGS,
+                    "env": env,
+                }
+                if executable_path:
+                    launch_kwargs["executable_path"] = executable_path
+                if self._proxy:
+                    launch_kwargs["proxy"] = {"server": self._proxy}
+                self._browser = await self._playwright.chromium.launch(**launch_kwargs)
 
-            chrome_full = self._browser.version  # e.g. "153.0.8010.52"
-            chrome_major = chrome_full.split(".", 1)[0]
-            user_agent = (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                f"(KHTML, like Gecko) Chrome/{chrome_major}.0.0.0 Safari/537.36"
-            )
-            sec_ch_ua = (
-                f'"Chromium";v="{chrome_major}", "Google Chrome";v="{chrome_major}", '
-                '"Not:A-Brand";v="24"'
-            )
-            extra_headers = {
-                "Accept": (
-                    "text/html,application/xhtml+xml,application/xml;q=0.9,"
-                    "image/avif,image/webp,image/apng,*/*;q=0.8,"
-                    "application/signed-exchange;v=b3;q=0.7"
-                ),
-                "Accept-Language": "en-US,en;q=0.9",
-                "Sec-Fetch-Dest": "document",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "none",
-                "Sec-Fetch-User": "?1",
-                "Sec-CH-UA": sec_ch_ua,
-                "Sec-CH-UA-Mobile": "?0",
-                "Sec-CH-UA-Platform": '"Windows"',
-            }
-            init_script = _stealth_init_script(chrome_major, chrome_full)
-
-            for _ in range(self._pool_size):
-                context = await self._browser.new_context(
-                    user_agent=user_agent,
-                    viewport={"width": 1440, "height": 900},
-                    locale="en-US",
-                    timezone_id="America/Los_Angeles",
-                    has_touch=False,
-                    java_script_enabled=True,
-                    color_scheme="light",
-                    ignore_https_errors=not self._verify,
-                    extra_http_headers=extra_headers,
+                chrome_full = self._browser.version  # e.g. "153.0.8010.52"
+                chrome_major = chrome_full.split(".", 1)[0]
+                user_agent = (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    f"(KHTML, like Gecko) Chrome/{chrome_major}.0.0.0 Safari/537.36"
                 )
-                await context.add_init_script(init_script)
-                self._lanes.append(_Lane(context))
-            self._lane_cycle = asyncio.Queue()
-            for lane in self._lanes:
-                self._lane_cycle.put_nowait(lane)
-            logger.info(
-                "Browser fetch pool up: %d lane(s), chromium=%s, headed=%s",
-                len(self._lanes),
-                chrome_full,
-                headed,
-            )
+                sec_ch_ua = (
+                    f'"Chromium";v="{chrome_major}", "Google Chrome";v="{chrome_major}", '
+                    '"Not:A-Brand";v="24"'
+                )
+                extra_headers = {
+                    "Accept": (
+                        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                        "image/avif,image/webp,image/apng,*/*;q=0.8,"
+                        "application/signed-exchange;v=b3;q=0.7"
+                    ),
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": "none",
+                    "Sec-Fetch-User": "?1",
+                    "Sec-CH-UA": sec_ch_ua,
+                    "Sec-CH-UA-Mobile": "?0",
+                    "Sec-CH-UA-Platform": '"Windows"',
+                }
+                init_script = _stealth_init_script(chrome_major, chrome_full)
 
-    async def close(self):
-        if self._closed:
-            return
-        self._closed = True
+                for _ in range(self._pool_size):
+                    context = await self._browser.new_context(
+                        user_agent=user_agent,
+                        viewport={"width": 1440, "height": 900},
+                        locale="en-US",
+                        timezone_id="America/Los_Angeles",
+                        has_touch=False,
+                        java_script_enabled=True,
+                        color_scheme="light",
+                        ignore_https_errors=not self._verify,
+                        extra_http_headers=extra_headers,
+                    )
+                    await context.add_init_script(init_script)
+                    self._lanes.append(_Lane(context))
+                self._lane_cycle = asyncio.Queue()
+                for lane in self._lanes:
+                    self._lane_cycle.put_nowait(lane)
+                logger.info(
+                    "Browser fetch pool up: %d lane(s), chromium=%s, headed=%s",
+                    len(self._lanes),
+                    chrome_full,
+                    headed,
+                )
+            except Exception as e:
+                # Stop playwright before re-raising: its node driver process
+                # keeps running otherwise, one ~130 MiB leak per failed start.
+                await self._shutdown_browser()
+                raise BrowserFetchError(f"browser pool init failed: {e}") from e
+
+    async def _shutdown_browser(self):
+        """Tear down lanes, browser and playwright, terminating the driver.
+
+        Called on close and after a failed launch; without the explicit
+        playwright stop the node driver process leaks (about 130 MiB each).
+        """
         for lane in self._lanes:
             try:
                 await lane.context.close()
             except Exception:  # pylint: disable=broad-except
                 pass
         self._lanes.clear()
+        self._lane_cycle = None
         if self._browser is not None:
             try:
                 await self._browser.close()
@@ -545,6 +608,28 @@ class BrowserFetchPool:
             except Exception:  # pylint: disable=broad-except
                 pass
             self._playwright = None
+
+    async def _ensure_browser_alive(self):
+        """Restart the browser after a crash instead of failing every fetch.
+
+        A dead browser process leaves the lane contexts unusable while
+        ``_lanes`` still looks initialized: without this check every fetch
+        keeps raising TargetClosedError until the container is restarted.
+        """
+        if self._browser is not None and self._browser.is_connected():
+            return
+        async with self._init_lock:
+            if self._browser is not None and self._browser.is_connected():
+                return
+            logger.warning("Browser process is gone; restarting the fetch pool")
+            await self._shutdown_browser()
+        await self._init()
+
+    async def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        await self._shutdown_browser()
 
     # pylint: disable=too-many-arguments, too-many-locals
     async def fetch(
@@ -563,6 +648,7 @@ class BrowserFetchPool:
         max_redirects: int = 30,
     ) -> BrowserResponse:
         await self._init()
+        await self._ensure_browser_alive()
         if params:
             query = urlencode({k: v for k, v in params.items() if v is not None})
             if query:
@@ -626,7 +712,9 @@ class BrowserFetchPool:
                     # form-encode dicts: the curl client sends dict data as
                     # application/x-www-form-urlencoded, match that here
                     request_kwargs["data"] = urlencode(data)
-                    request_headers.setdefault("content-type", "application/x-www-form-urlencoded")
+                    request_headers.setdefault(
+                        "content-type", "application/x-www-form-urlencoded"
+                    )
                 else:
                     request_kwargs["data"] = data
 
@@ -642,7 +730,9 @@ class BrowserFetchPool:
             elif method == "DELETE":
                 api_response = await request.delete(url, **request_kwargs)
             else:
-                raise BrowserFetchError(f"Unsupported method for browser fetch: {method}")
+                raise BrowserFetchError(
+                    f"Unsupported method for browser fetch: {method}"
+                )
         except BrowserFetchError:
             raise
         except Exception as e:
@@ -650,13 +740,17 @@ class BrowserFetchPool:
 
         body = await api_response.body()
         status = api_response.status
-        response_headers = {str(k).lower(): str(v) for k, v in api_response.headers.items()}
+        response_headers = {
+            str(k).lower(): str(v) for k, v in api_response.headers.items()
+        }
 
         needs_warm_up = _looks_like_bot_challenge(status, response_headers) or (
             _looks_like_unresolved_challenge_body(body)
         )
         if needs_warm_up:
-            logger.debug("bot challenge on %s (%s); rendering page and retrying", url, status)
+            logger.debug(
+                "bot challenge on %s (%s); rendering page and retrying", url, status
+            )
             warmed = await self._warm_up_and_retry(
                 lane, method, url, request_kwargs=request_kwargs
             )
@@ -723,7 +817,9 @@ class BrowserFetchPool:
             logger.warning("Render fallback failed for %s", url, exc_info=True)
             return None
 
-    async def _warm_up_and_retry(self, lane: _Lane, method: str, url: str, *, request_kwargs: dict):
+    async def _warm_up_and_retry(
+        self, lane: _Lane, method: str, url: str, *, request_kwargs: dict
+    ):
         """Navigate the challenge in a real page, then re-fetch fetch-style.
 
         The page visit lets the challenge JS run (and set clearance cookies
@@ -735,23 +831,31 @@ class BrowserFetchPool:
         try:
             page = await context.new_page()
             try:
-                response = await page.goto(url, timeout=_DEFAULT_TIMEOUT_S * 1000, wait_until="commit")
+                response = await page.goto(
+                    url, timeout=_DEFAULT_TIMEOUT_S * 1000, wait_until="commit"
+                )
                 status = response.status if response else None
                 if status is not None and status in (403, 429, 503):
                     await page.wait_for_timeout(_BOT_CHALLENGE_GRACE_MS)
                 try:
-                    await page.wait_for_load_state("networkidle", timeout=_BOT_CHALLENGE_GRACE_MS)
+                    await page.wait_for_load_state(
+                        "networkidle", timeout=_BOT_CHALLENGE_GRACE_MS
+                    )
                 except Exception:  # pylint: disable=broad-except
                     pass
             finally:
                 await page.close()
         except Exception:  # pylint: disable=broad-except
-            logger.warning("Challenge warm-up navigation failed for %s", url, exc_info=True)
+            logger.warning(
+                "Challenge warm-up navigation failed for %s", url, exc_info=True
+            )
             return None
 
         try:
             retry_kwargs = dict(request_kwargs)
-            retry_kwargs["max_redirects"] = max(retry_kwargs.get("max_redirects", 30), 1)
+            retry_kwargs["max_redirects"] = max(
+                retry_kwargs.get("max_redirects", 30), 1
+            )
             if method == "POST":
                 retry_response = await context.request.post(url, **retry_kwargs)
             else:
