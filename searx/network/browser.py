@@ -51,6 +51,7 @@ import http.client as http
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -407,6 +408,12 @@ def _is_api_url(url: str) -> bool:
         return True
     # duckduckgo's autocomplete endpoint
     return path == "/ac" or path.startswith("/ac/")
+
+
+def _is_challenge_url(url: str | None) -> bool:
+    """Is this URL a challenge / rate-limit interstitial?"""
+    lowered = (url or "").lower()
+    return "/sorry" in lowered or "unusual traffic" in lowered
 
 
 def _homepage_url_from_search_url(url: str) -> str:
@@ -1110,6 +1117,38 @@ class BrowserFetchPool:
             logger.warning("Render fallback failed for %s", url, exc_info=True)
             return None
 
+    async def _settle_after_search(self, page, timeout_s: float) -> None:
+        """Wait out the post-click navigation, solving challenges on the way.
+
+        The search click triggers a navigation that starts asynchronously:
+        a ``networkidle`` wait entered immediately still describes the old
+        page, and google may route a flagged search through ``/sorry`` a
+        moment later. Poll until the URL leaves the challenge interstitial
+        (clicking its checkbox with the real mouse when one appears), or
+        until the budget is spent -- the captured DOM then tells the engine
+        what happened.
+        """
+        # pylint: disable=import-outside-toplevel
+        from searx.network.human_input import human_solve_challenge
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(8.0, min(timeout_s, 30.0))
+        while loop.time() < deadline:
+            if not _is_challenge_url(page.url):
+                try:
+                    await page.wait_for_load_state(
+                        "networkidle", timeout=_BOT_CHALLENGE_GRACE_MS
+                    )
+                except Exception:  # pylint: disable=broad-except
+                    pass
+                if not _is_challenge_url(page.url):
+                    return
+            solved = await human_solve_challenge(
+                page, settle_ms=_BOT_CHALLENGE_GRACE_MS
+            )
+            if not solved:
+                await asyncio.sleep(random.uniform(0.6, 1.2))  # noqa: S311
+
     async def _fetch_via_human_search(self, lane: _Lane, url: str, timeout_s: float):
         """Serve a GET search by driving the provider like a human.
 
@@ -1167,22 +1206,7 @@ class BrowserFetchPool:
                         )
                     await human_solve_challenge(page)
                     if await human_search_on_page(page, query):
-                        try:
-                            await page.wait_for_load_state(
-                                "networkidle", timeout=_BOT_CHALLENGE_GRACE_MS
-                            )
-                        except Exception:  # pylint: disable=broad-except
-                            pass
-                        # the search may have landed on a challenge (google
-                        # redirects flagged searches to /sorry, whose
-                        # reCAPTCHA checkbox the real mouse can click)
-                        if await human_solve_challenge(page):
-                            try:
-                                await page.wait_for_load_state(
-                                    "networkidle", timeout=_BOT_CHALLENGE_GRACE_MS
-                                )
-                            except Exception:  # pylint: disable=broad-except
-                                pass
+                        await self._settle_after_search(page, timeout_s)
                     else:
                         # No usable search box: navigate the results URL so
                         # at least challenge JS runs in a real page.
