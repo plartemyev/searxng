@@ -347,6 +347,10 @@ _CF_CHALLENGE_BODY_MARKERS = (
     'id="cf-challenge-running"',
     'id="challenge-running"',
     'class="cf-turnstile"',
+    # google serves its CAPTCHA wall as HTTP 200: catch it so the human
+    # fallback runs instead of the engine parsing the sorry page
+    "unusual traffic from your computer network",
+    "/sorry/index",
 )
 _SCRIPT_BLOCK_RE = re.compile(r"<script\b.*?</script>", re.IGNORECASE | re.DOTALL)
 
@@ -883,18 +887,21 @@ class BrowserFetchPool:
             return None
 
     async def _fetch_via_human_search(self, lane: _Lane, url: str, timeout_s: float):
-        """Re-run a GET search through the provider's UI with human input.
+        """Serve a challenged GET search by driving the provider like a human.
 
-        The engine's endpoint returned a challenge or an interstitial.
-        Instead of fetching that endpoint again, open the provider's site,
-        type the query into its search box and click search with real X
-        input (see :py:mod:`searx.network.human_input`), then return the
-        rendered results page. A challenge met on the way (its checkbox
-        lives in a cross-origin iframe) is clicked through.
+        The engine's endpoint returned a challenge or an interstitial. Open
+        the provider's site, type the query into its search box and click
+        search with real X input (see :py:mod:`searx.network.human_input`),
+        solving any challenge checkbox met on the way. The interactive visit
+        earns trust cookies on the lane context; the engine endpoint is then
+        re-fetched fetch-style and returned, so the engine gets the response
+        format its parser expects (a rendered UI page would not parse
+        everywhere - google, for one, reads a legacy mobile layout). When
+        the re-fetch is still challenged, the rendered results page is
+        returned as a last resort.
 
-        Returns None when the flow is not applicable or failed; the caller
-        then falls back to the plain warm-up. Clearance cookies won on the
-        way stay in the lane context.
+        Returns None when the flow is not applicable or failed entirely; the
+        caller then falls back to the plain warm-up.
         """
         # pylint: disable=import-outside-toplevel
         from searx.network.human_input import (
@@ -915,6 +922,9 @@ class BrowserFetchPool:
         origin = f"{parts.scheme}://{parts.netloc}/"
         goto_timeout_ms = int(max(5.0, min(timeout_s, 20.0)) * 1000)
 
+        rendered_html: bytes | None = None
+        rendered_url = origin
+        refetched: BrowserResponse | None = None
         try:
             async with human_session():
                 page = await lane.context.new_page()
@@ -949,25 +959,67 @@ class BrowserFetchPool:
                         except Exception:  # pylint: disable=broad-except
                             pass
                     await page.wait_for_timeout(1500)
-                    html_content = await page.content()
-                    logger.info(
-                        "human search fallback: %d bytes for %s", len(html_content), url
-                    )
-                    return BrowserResponse(
-                        status_code=200,
-                        headers={"content-type": "text/html; charset=utf-8"},
-                        content=html_content.encode("utf-8", errors="replace"),
-                        url=page.url,
-                        method="GET",
+                    rendered_url = page.url
+                    rendered_html = (await page.content()).encode(
+                        "utf-8", errors="replace"
                     )
                 finally:
                     await page.close()
+
+                # Re-fetch the engine endpoint with the earned cookies.
+                try:
+                    retry_response = await lane.context.request.get(
+                        url, timeout=int(timeout_s * 1000), max_redirects=30
+                    )
+                    body = await retry_response.body()
+                    headers = {
+                        str(k).lower(): str(v)
+                        for k, v in retry_response.headers.items()
+                    }
+                    if not _looks_like_bot_challenge(
+                        retry_response.status, headers
+                    ) and not _looks_like_unresolved_challenge_body(body):
+                        refetched = BrowserResponse(
+                            status_code=retry_response.status,
+                            headers=headers,
+                            content=body,
+                            url=retry_response.url,
+                            method="GET",
+                        )
+                    else:
+                        logger.info(
+                            "human search: refetch of %s still challenged (%s)",
+                            url,
+                            retry_response.status,
+                        )
+                except Exception:  # pylint: disable=broad-except
+                    logger.warning(
+                        "human search: refetch of %s failed", url, exc_info=True
+                    )
         except Exception:  # pylint: disable=broad-except
             logger.warning("human search fallback failed for %s", url, exc_info=True)
             # the usual cause is a stale X connection: drop the cached
             # pyautogui so the next session rebinds to the display
             reset_input()
             return None
+
+        if refetched is not None:
+            logger.info("human search fallback: refetched %s (%s bytes)", url, len(refetched.content))
+            return refetched
+        if rendered_html:
+            logger.info(
+                "human search fallback: rendered page for %s (%s bytes)",
+                url,
+                len(rendered_html),
+            )
+            return BrowserResponse(
+                status_code=200,
+                headers={"content-type": "text/html; charset=utf-8"},
+                content=rendered_html,
+                url=rendered_url,
+                method="GET",
+            )
+        return None
 
     async def _warm_up_and_retry(
         self, lane: _Lane, method: str, url: str, *, request_kwargs: dict
