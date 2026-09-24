@@ -448,10 +448,17 @@ def _is_human_search_candidate(url: str) -> bool:
     """Can this request be served by driving the provider's search UI?
 
     Same criteria the human fallback enforces: an http(s) browser URL (not
-    a JSON API endpoint) whose search terms can be extracted, so the UI
+    a data endpoint) whose search terms can be extracted, so the UI
     visit can type the query the engine endpoint would have carried.
+
+    duckduckgo.com is exempt: it does not bot-wall fetch-style clients,
+    and its image engine bootstraps every search with a vqd token fetched
+    from the front page -- a full interactive session there would blow the
+    engine's short timeout for no stealth gain.
     """
     parts = urlsplit(url)
+    if (parts.hostname or "").lower() == "duckduckgo.com":
+        return False
     if parts.scheme not in ("http", "https") or not parts.netloc:
         return False
     if _is_api_url(url):

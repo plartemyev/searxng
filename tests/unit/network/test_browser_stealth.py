@@ -9,11 +9,11 @@ from searx.network.browser import (
     _homepage_url_from_search_url,
     _ip_locale_from_payload,
     _is_api_url,
+    _is_human_search_candidate,
 )
 
 
 # _is_api_url: data endpoints keep the fetch path, search UIs do not
-
 
 @pytest.mark.parametrize(
     'url',
@@ -41,6 +41,35 @@ def test_is_api_url_false_for_search_uis(url):
 )
 def test_is_api_url_true_for_data_endpoints(url):
     assert _is_api_url(url) is True
+
+
+# _is_human_search_candidate: who gets the interactive visit
+
+
+@pytest.mark.parametrize(
+    'url',
+    [
+        'https://www.google.com/search?q=test',
+        'https://search.brave.com/search?q=test',
+        'https://en.wikipedia.org/w/index.php?search=test',
+    ],
+)
+def test_is_human_search_candidate_true(url):
+    assert _is_human_search_candidate(url) is True
+
+
+@pytest.mark.parametrize(
+    'url',
+    [
+        # duckduckgo.com is exempt: not bot-walled, and its image engine
+        # bootstraps a vqd token from the front page within a short timeout
+        'https://duckduckgo.com/?q=test&iar=images&t=h_',
+        'https://duckduckgo.com/i.js?q=test&vqd=4',
+        'https://www.bing.com/images/async?q=test&first=0',
+    ],
+)
+def test_is_human_search_candidate_false(url):
+    assert _is_human_search_candidate(url) is False
 
 
 # _homepage_url_from_search_url: the human flow starts from the front page,
