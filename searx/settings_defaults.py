@@ -273,9 +273,11 @@ SCHEMA: dict[str, t.Any] = {
         # Maximum stealth mode: drive the provider's search UI like a human
         # for every supported request up front, not only as a challenge
         # fallback. Supported requests are search GETs the human flow can
-        # serve (browser URL, not an API endpoint, query extractable). Much
+        # serve (browser URL, not a data endpoint, query extractable). Much
         # slower per search, but the provider only ever sees interactive
-        # visits from the cookie-trained desktop browser.
+        # visits from the cookie-trained desktop browser: the response is
+        # the DOM captured from the live page, and a failed human visit
+        # fails the request instead of leaking a fetch-style replay.
         'browser_max_stealth': SettingsValue(bool, False),
         # Global per-provider send pacing (see searx/network/pacing.py):
         # requests to the same upstream host are spaced a random

@@ -21,10 +21,19 @@ cookie jar, no page render). On a bot challenge (Cloudflare interstitial,
 and clearance cookies land in the context, then the fetch is retried.
 
 ``outgoing.browser_max_stealth`` turns the masquerading around: supported
-search GETs (browser URL, not an API endpoint, query extractable) skip the
+search GETs (browser URL, not a data endpoint, query extractable) skip the
 fetch-style attempt entirely and are served by driving the provider's
-search UI with human-like input on every request, not only after a
-challenge.
+search UI with simulated mouse and keyboard on every request, not only
+after a challenge. The response handed to the engine parser is the DOM
+captured from the live page. Nothing is re-fetched fetch-style afterwards:
+a programmatic replay of the results URL is exactly the automation tell
+the interactive visit was meant to avoid, and a data shell served to it
+would shadow the good DOM. If the interactive flow fails, the request
+fails -- no fetch-style attempt slips out to the search engine.
+
+At pool start the instance's public IP is resolved to a locale (country,
+timezone, language) and every lane context is born with that identity, so
+the browser's claims agree with where its requests come from.
 
 The pool owns N browser contexts ("lanes"). Each lane serves one request at
 a time; cookies persist per lane, so solved challenges benefit later
@@ -380,12 +389,51 @@ def _search_query_from_url(url: str) -> str | None:
 
 
 def _is_api_url(url: str) -> bool:
-    """JSON API endpoints have no search UI to drive with human input."""
+    """Data endpoints have no search UI to drive with human input.
+
+    JSON endpoints, and the AJAX data routes image engines read (result
+    fragments and metadata carry no UI to type into): driving them like a
+    human is impossible, so they keep the fetch path through the
+    masqueraded browser.
+    """
     parts = urlsplit(url)
     host = parts.hostname or ""
     if host.startswith("api.") or host.startswith("apis."):
         return True
-    return parts.path.lower().endswith((".json", "api.php"))
+    path = parts.path.lower()
+    if path.endswith((".json", ".js", "api.php")):
+        return True
+    if any(marker in path for marker in ("/async", "/suggest", "/complete", "/autocomplete")):
+        return True
+    # duckduckgo's autocomplete endpoint
+    return path == "/ac" or path.startswith("/ac/")
+
+
+def _homepage_url_from_search_url(url: str) -> str:
+    """The provider front page, carrying the engine URL's locale parameters.
+
+    The human flow starts from the site's front page, like an address-bar
+    entry, and drives the search box from there. ``hl`` (interface
+    language) and ``gl`` (result country) from the engine request ride
+    along on the homepage: the provider renders its UI in the language the
+    search asked for, and its own search form submits those parameters
+    with the typed query. ``cr=countryXX`` from the engine URL is the
+    searxng spelling of ``gl``.
+    """
+    parts = urlsplit(url)
+    params = parse_qs(parts.query)
+    carried: list[tuple[str, str]] = []
+    for key in ("hl", "gl"):
+        values = params.get(key)
+        if values and values[0].strip():
+            carried.append((key, values[0].strip()))
+    cr_values = params.get("cr")
+    if cr_values and not any(key == "gl" for key, _ in carried):
+        cr = cr_values[0].strip()
+        if cr.lower().startswith("country") and len(cr) > len("country"):
+            carried.append(("gl", cr[len("country"):].upper()))
+    base = f"{parts.scheme}://{parts.netloc}/"
+    return base + ("?" + urlencode(carried) if carried else "")
 
 
 def _is_human_search_candidate(url: str) -> bool:
@@ -460,6 +508,116 @@ _IDENTITY_HEADERS = frozenset(
         "sec-fetch-user",
     }
 )
+
+# The lane identity must agree with where its requests come from: at pool
+# start the public IP is resolved to country / timezone / language and every
+# context is created with that locale. Playwright's en-US /
+# America/Los_Angeles defaults on a non-US datacenter IP are a classic
+# inconsistency search engines score.
+_GEO_SERVICES = ("https://ipapi.co/json/", "https://ipinfo.io/json")
+_GEO_FALLBACK: dict = {
+    "locale": "en-US",
+    "timezone": "America/Los_Angeles",
+    "accept_language": "en-US,en;q=0.9",
+    "geolocation": None,
+    "source": "fallback",
+}
+_ip_locale_cache: dict | None = None
+
+
+def _ip_locale_from_payload(data: dict) -> dict | None:
+    """Build the locale identity from one geo-IP service payload.
+
+    ipapi.co carries ``country_code``, ``timezone``, ``languages`` (e.g.
+    "de,de-DE") and coordinates; ipinfo.io carries ``country``,
+    ``timezone`` and a "lat,long" ``loc`` but no languages. Without a
+    language hint the identity stays English -- common enough for real
+    users -- while timezone, coordinates and country still match the IP.
+    """
+    country = str(data.get("country_code") or data.get("country") or "").strip().upper()
+    if len(country) != 2:
+        return None
+    codes = [
+        code.strip().replace("_", "-")
+        for code in str(data.get("languages") or "").split(",")
+        if code.strip()
+    ]
+    primary = codes[0] if codes else ""
+    if primary and "-" in primary:
+        locale = primary
+    elif primary:
+        locale = f"{primary}-{country}"
+    else:
+        locale = "en-US"
+    others = [code for code in codes if code != locale]
+    lang_parts = [locale]
+    if others:
+        lang_parts.append(f"{others[0]};q=0.9")
+        if not locale.startswith("en"):
+            lang_parts.append("en;q=0.7")
+    elif not locale.startswith("en"):
+        lang_parts.append("en;q=0.9")
+    else:
+        lang_parts.append("en;q=0.8")
+    accept_language = ",".join(lang_parts)
+    timezone = str(data.get("timezone") or "").strip() or "America/Los_Angeles"
+    latitude = data.get("latitude")
+    longitude = data.get("longitude")
+    if latitude is None or longitude is None:
+        loc_lat, _, loc_lon = str(data.get("loc") or "").partition(",")
+        latitude, longitude = loc_lat, loc_lon
+    try:
+        geolocation = {
+            "latitude": float(latitude),
+            "longitude": float(longitude),
+            "accuracy": 40.0,
+        }
+    except (TypeError, ValueError):
+        geolocation = None
+    return {
+        "locale": locale,
+        "timezone": timezone,
+        "accept_language": accept_language,
+        "geolocation": geolocation,
+    }
+
+
+def _detect_ip_locale() -> dict:
+    """Resolve the public IP to a locale identity (blocking, one-time).
+
+    Queried once per pool start and cached: the first search pays the
+    lookup, every later context (re)build reuses it.
+    """
+    global _ip_locale_cache  # pylint: disable=global-statement
+    if _ip_locale_cache is not None:
+        return _ip_locale_cache
+    # import inside the function: urllib pulls the SSL machinery and the
+    # pool module must stay importable without it (tests)
+    import urllib.request
+
+    detected: dict | None = None
+    source = _GEO_FALLBACK["source"]
+    for service in _GEO_SERVICES:
+        try:
+            with urllib.request.urlopen(service, timeout=8) as resp:  # noqa: S310
+                data = json.loads(resp.read().decode("utf-8", "replace"))
+        except Exception:  # pylint: disable=broad-except
+            continue
+        detected = _ip_locale_from_payload(data)
+        if detected is not None:
+            source = service
+            break
+    _ip_locale_cache = detected if detected is not None else dict(_GEO_FALLBACK)
+    logger.info(
+        "Browser pool identity: locale=%s timezone=%s accept-language=%s"
+        " geolocation=%s (via %s)",
+        _ip_locale_cache["locale"],
+        _ip_locale_cache["timezone"],
+        _ip_locale_cache["accept_language"],
+        bool(_ip_locale_cache["geolocation"]),
+        source,
+    )
+    return _ip_locale_cache
 
 
 class BrowserResponse:
@@ -651,19 +809,27 @@ class BrowserFetchPool:
                     "Sec-CH-UA-Platform": '"Windows"',
                 }
                 init_script = _stealth_init_script(chrome_major, chrome_full)
+                geo = await asyncio.get_running_loop().run_in_executor(
+                    None, _detect_ip_locale
+                )
+                extra_headers["Accept-Language"] = geo["accept_language"]
+
+                context_kwargs: dict = {
+                    "user_agent": user_agent,
+                    "viewport": {"width": 1440, "height": 900},
+                    "locale": geo["locale"],
+                    "timezone_id": geo["timezone"],
+                    "has_touch": False,
+                    "java_script_enabled": True,
+                    "color_scheme": "light",
+                    "ignore_https_errors": not self._verify,
+                    "extra_http_headers": extra_headers,
+                }
+                if geo["geolocation"]:
+                    context_kwargs["geolocation"] = geo["geolocation"]
 
                 for _ in range(self._pool_size):
-                    context = await self._browser.new_context(
-                        user_agent=user_agent,
-                        viewport={"width": 1440, "height": 900},
-                        locale="en-US",
-                        timezone_id="America/Los_Angeles",
-                        has_touch=False,
-                        java_script_enabled=True,
-                        color_scheme="light",
-                        ignore_https_errors=not self._verify,
-                        extra_http_headers=extra_headers,
-                    )
+                    context = await self._browser.new_context(**context_kwargs)
                     await context.add_init_script(init_script)
                     self._lanes.append(_Lane(context))
                 self._lane_cycle = asyncio.Queue()
@@ -761,12 +927,17 @@ class BrowserFetchPool:
             async with lane.lock:
                 if self._max_stealth and method.upper() == "GET":
                     # Maximum stealth mode: the interactive visit comes
-                    # first, not as a challenge fallback. Requests the human
-                    # flow cannot serve fall through to the fetch path.
+                    # first, not as a challenge fallback. When it fails, the
+                    # request fails: no fetch-style attempt may slip out to
+                    # the search engine behind a human visit.
                     if _is_human_search_candidate(url):
                         human = await self._fetch_via_human_search(lane, url, timeout_s)
                         if human is not None:
                             return human
+                        raise BrowserFetchError(
+                            "max stealth: human search failed for"
+                            f" {url}; refusing a fetch-style request"
+                        )
                 return await self._fetch_on_lane(
                     lane,
                     method.upper(),
@@ -944,24 +1115,26 @@ class BrowserFetchPool:
 
         Used as the challenge fallback for challenged/interstitial GETs and,
         in maximum stealth mode (``outgoing.browser_max_stealth``), up front
-        for every supported request. Open the provider's site, type the
-        query into its search box and click search with real X input (see
-        :py:mod:`searx.network.human_input`), solving any challenge
-        checkbox met on the way. The interactive visit earns trust cookies
-        on the lane context; the engine endpoint is then re-fetched
-        fetch-style and returned, so the engine gets the response format
-        its parser expects (a rendered UI page would not parse everywhere -
-        google, for one, reads a legacy mobile layout). When the re-fetch
-        is still challenged, the rendered results page is returned as a
-        last resort.
+        for every supported request. Open the provider's front page (like an
+        address-bar entry, carrying the request's ``hl``/``gl`` locale),
+        type the query into its search box and click search with real X
+        input (see :py:mod:`searx.network.human_input`), solving any
+        challenge checkbox met on the way, then read the results like a
+        human would.
 
-        Returns None when the flow is not applicable or failed entirely; the
-        caller then falls back to the plain warm-up.
+        The response returned to the engine parser is the DOM captured from
+        the live page (:py:meth:`playwright.page.Page.content`). Nothing is
+        re-fetched fetch-style afterwards: a programmatic replay of the
+        results URL is exactly the automation tell the interactive visit was
+        meant to avoid, and a data shell served to a replay would shadow
+        the good DOM.
+
+        Returns None when the flow is not applicable or failed entirely.
         """
         # pylint: disable=import-outside-toplevel
         from searx.network.human_input import (
+            human_read_results,
             human_search_on_page,
-            human_session,
             human_solve_challenge,
             reset_input,
         )
@@ -974,23 +1147,22 @@ class BrowserFetchPool:
         parts = urlsplit(url)
         if parts.scheme not in ("http", "https") or not parts.netloc:
             return None
-        origin = f"{parts.scheme}://{parts.netloc}/"
+        homepage = _homepage_url_from_search_url(url)
         goto_timeout_ms = int(max(5.0, min(timeout_s, 20.0)) * 1000)
 
         rendered_html: bytes | None = None
-        rendered_url = origin
-        refetched: BrowserResponse | None = None
+        rendered_url = homepage
         try:
             async with human_session():
                 page = await lane.context.new_page()
                 try:
                     try:
                         await page.goto(
-                            origin, timeout=goto_timeout_ms, wait_until="domcontentloaded"
+                            homepage, timeout=goto_timeout_ms, wait_until="domcontentloaded"
                         )
                     except Exception:  # pylint: disable=broad-except
                         logger.warning(
-                            "human search: homepage %s failed, trying results URL", origin
+                            "human search: homepage %s failed, trying results URL", homepage
                         )
                     await human_solve_challenge(page)
                     if await human_search_on_page(page, query):
@@ -1023,44 +1195,13 @@ class BrowserFetchPool:
                             )
                         except Exception:  # pylint: disable=broad-except
                             pass
-                    await page.wait_for_timeout(1500)
+                    await human_read_results(page)
                     rendered_url = page.url
                     rendered_html = (await page.content()).encode(
                         "utf-8", errors="replace"
                     )
                 finally:
                     await page.close()
-
-                # Re-fetch the engine endpoint with the earned cookies.
-                try:
-                    retry_response = await lane.context.request.get(
-                        url, timeout=int(timeout_s * 1000), max_redirects=30
-                    )
-                    body = await retry_response.body()
-                    headers = {
-                        str(k).lower(): str(v)
-                        for k, v in retry_response.headers.items()
-                    }
-                    if not _looks_like_bot_challenge(
-                        retry_response.status, headers
-                    ) and not _looks_like_unresolved_challenge_body(body):
-                        refetched = BrowserResponse(
-                            status_code=retry_response.status,
-                            headers=headers,
-                            content=body,
-                            url=retry_response.url,
-                            method="GET",
-                        )
-                    else:
-                        logger.info(
-                            "human search: refetch of %s still challenged (%s)",
-                            url,
-                            retry_response.status,
-                        )
-                except Exception:  # pylint: disable=broad-except
-                    logger.warning(
-                        "human search: refetch of %s failed", url, exc_info=True
-                    )
         except Exception:  # pylint: disable=broad-except
             logger.warning("human search fallback failed for %s", url, exc_info=True)
             # the usual cause is a stale X connection: drop the cached
@@ -1068,13 +1209,10 @@ class BrowserFetchPool:
             reset_input()
             return None
 
-        if refetched is not None:
-            logger.info("human search fallback: refetched %s (%s bytes)", url, len(refetched.content))
-            return refetched
         if rendered_html:
             logger.info(
-                "human search fallback: rendered page for %s (%s bytes)",
-                url,
+                "human search: captured rendered DOM for %s (%s bytes)",
+                rendered_url,
                 len(rendered_html),
             )
             return BrowserResponse(

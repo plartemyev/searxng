@@ -10,7 +10,8 @@ the headed browser runs under (Xvfb, see searx.network.browser):
 - the pointer travels a quadratic Bezier curve with a random control point
   and per-step jitter, emitted as real XTEST events via pyautogui
 - buttons are clicked after a human-scale hover pause and press duration
-- text is typed with random per-key intervals and the occasional pause
+- text is typed with human cadence: uneven keys, short fast bursts, and the
+  occasional mid-word hesitation
 
 Coordinate spaces: Playwright boxes are page (viewport) coordinates while
 pyautogui needs screen coordinates. The mapping reads the window origin
@@ -27,6 +28,7 @@ __all__ = [
     "HumanInputError",
     "human_session",
     "human_search_on_page",
+    "human_read_results",
     "human_solve_challenge",
 ]
 
@@ -199,14 +201,40 @@ async def _human_click(x: int, y: int) -> None:
     pyautogui.mouseUp(_pause=False)
 
 
-async def _human_type(text: str) -> None:
-    """Type ``text`` on the real keyboard with human cadence."""
+async def _human_type(page, text: str) -> None:
+    """Type ``text`` on the real keyboard with human cadence.
+
+    Fast typists alternate short bursts of quick keys with slower keys and
+    the occasional mid-word hesitation; a longer pause happens between
+    sentences or when hunting the next key.
+
+    The X keymap carries only basic Latin: a character outside it is sent
+    as a single page-level key event instead of aborting the session (the
+    page sees a normal trusted key event either way).
+    """
     pyautogui = _get_pyautogui()
+    burst = 0
     for ch in text:
-        pyautogui.write(ch, _pause=False)
-        await asyncio.sleep(random.uniform(0.02, 0.14))  # noqa: S311
-        if ch == ' ' and random.random() < 0.15:  # noqa: S311
-            await asyncio.sleep(random.uniform(0.1, 0.4))  # noqa: S311 -- pause
+        try:
+            pyautogui.write(ch, _pause=False)
+        except Exception:  # pylint: disable=broad-except
+            logger.debug('human search: %r not on the X keymap, page-level key', ch)
+            await page.keyboard.type(ch, delay=0)
+        if burst > 0:
+            # inside a burst: quick, slightly uneven keys
+            delay = random.uniform(0.04, 0.09)  # noqa: S311
+            burst -= 1
+        elif random.random() < 0.1:  # noqa: S311
+            # hesitate: think about the next word, hunt the next key
+            delay = random.uniform(0.2, 0.7)  # noqa: S311
+        else:
+            delay = random.uniform(0.06, 0.18)  # noqa: S311
+            if random.random() < 0.25:  # noqa: S311
+                # start a short burst of fast keys
+                burst = random.randint(2, 5)  # noqa: S311
+        await asyncio.sleep(delay)
+        if ch == ' ' and random.random() < 0.12:  # noqa: S311
+            await asyncio.sleep(random.uniform(0.15, 0.45))  # noqa: S311 -- pause
 
 
 async def _to_screen(page, x: float, y: float) -> tuple[int, int]:
@@ -264,12 +292,14 @@ async def human_session():
 async def human_search_on_page(page, query: str) -> bool:
     """Run a search on an already-open provider page like a human would.
 
-    Clicks the search box, types the query, then clicks the search button
-    (Enter as fallback). Returns False when the page has no visible search
-    box.
+    Scans the page for a moment, clicks the search box, types the query,
+    then clicks the search button (Enter as fallback). Returns False when
+    the page has no visible search box.
     """
     pyautogui = _get_pyautogui()
     await page.bring_to_front()
+    # orient: scan the page before reaching for the search box
+    await asyncio.sleep(random.uniform(0.4, 1.3))  # noqa: S311
     input_loc = await _find_visible(page, _SEARCH_INPUT_SELECTORS)
     if input_loc is None:
         logger.debug('human search: no search box found on %s', page.url)
@@ -282,25 +312,9 @@ async def human_search_on_page(page, query: str) -> bool:
     if not await _human_click_locator(input_loc):
         return False
 
-    # Clear prefilled text with the real keyboard before typing.
-    pyautogui.hotkey('ctrl', 'a', _pause=False)
-    await asyncio.sleep(random.uniform(0.05, 0.2))  # noqa: S311
-    pyautogui.press('delete', _pause=False)
-    await asyncio.sleep(random.uniform(0.1, 0.3))  # noqa: S311
-
-    await _human_type(query)
-    await asyncio.sleep(random.uniform(0.2, 0.6))  # noqa: S311
-
-    value = ''
-    try:
-        value = await input_loc.input_value()
-    except Exception:  # pylint: disable=broad-except
-        pass
-    if value != query:
-        # pyautogui typing is ASCII-only: anything else needs the programmatic
-        # path. Less human, but the alternative is a garbled query.
-        logger.debug('human search: typed value mismatch, filling directly')
-        await input_loc.fill(query)
+    await _human_type(page, query)
+    # proofread what was typed before firing the search
+    await asyncio.sleep(random.uniform(0.4, 1.4))  # noqa: S311
 
     button_loc = await _find_visible(page, _SEARCH_BUTTON_SELECTORS)
     if button_loc is not None:
@@ -308,6 +322,19 @@ async def human_search_on_page(page, query: str) -> bool:
     else:
         pyautogui.press('enter', _pause=False)
     return True
+
+
+async def human_read_results(page) -> None:
+    """Behave like a human scanning a fresh results page.
+
+    Dwell on the page, give the results list a small scroll with the real
+    mouse wheel, then settle. This is also the window in which the page
+    finishes loading lazy content before the DOM is captured.
+    """
+    pyautogui = _get_pyautogui()
+    await asyncio.sleep(random.uniform(1.2, 2.8))  # noqa: S311 -- first look
+    pyautogui.scroll(-random.randint(2, 4))  # noqa: S311 -- scan down a bit
+    await asyncio.sleep(random.uniform(0.5, 1.5))  # noqa: S311 -- settle
 
 
 async def human_solve_challenge(page, *, settle_ms: int = 6000) -> bool:
