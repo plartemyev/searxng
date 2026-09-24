@@ -266,6 +266,16 @@ SCHEMA: dict[str, t.Any] = {
         # fingerprints cannot (CAPTCHAs, wrong-results degradation, ...).
         'using_browser': SettingsValue(bool, False),
         'browser_pool_size': SettingsValue(int, 3),
+        # Global per-provider send pacing (see searx/network/pacing.py):
+        # requests to the same upstream host are spaced a random
+        # delay_min..delay_max seconds apart, whatever engine or search sent
+        # them. Different providers never block each other.
+        'pacing': {
+            'enabled': SettingsValue(bool, True),
+            'delay_min_seconds': SettingsValue(numbers.Real, 1.0),
+            'delay_max_seconds': SettingsValue(numbers.Real, 5.0),
+            'max_wait_seconds': SettingsValue(numbers.Real, 20.0),
+        },
         # Tor configuration
         'using_tor_proxy': SettingsValue(bool, False),
         'extra_proxy_timeout': SettingsValue(int, 0),

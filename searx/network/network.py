@@ -272,6 +272,11 @@ class Network:
         return True
 
     async def call_client(self, stream: bool, method: str, url: str, **kwargs: t.Any) -> SXNG_Response:
+        # global per-provider pacing: space sends to the same upstream host
+        # (stream requests are image proxying, not provider searches)
+        from searx.network.pacing import pace_request
+        if not stream:
+            await pace_request(url)
         if self.using_browser and not stream:
             # the browser fetch pool does not support streaming:
             # stream requests (image proxy) keep using the HTTP client
