@@ -945,6 +945,16 @@ class BrowserFetchPool:
                             )
                         except Exception:  # pylint: disable=broad-except
                             pass
+                        # the search may have landed on a challenge (google
+                        # redirects flagged searches to /sorry, whose
+                        # reCAPTCHA checkbox the real mouse can click)
+                        if await human_solve_challenge(page):
+                            try:
+                                await page.wait_for_load_state(
+                                    "networkidle", timeout=_BOT_CHALLENGE_GRACE_MS
+                                )
+                            except Exception:  # pylint: disable=broad-except
+                                pass
                     else:
                         # No usable search box: navigate the results URL so
                         # at least challenge JS runs in a real page.
