@@ -74,12 +74,27 @@ _CHALLENGE_FRAME_SELECTORS = (
     "iframe[src*='hcaptcha.com']",
     "iframe[src*='recaptcha']",
 )
+_CHALLENGE_FRAME_SELECTOR = ", ".join(_CHALLENGE_FRAME_SELECTORS)
 _CHALLENGE_BOX_SELECTORS = (
     "input[type='checkbox']",
     "#checkbox",
     ".check",
     ".recaptcha-checkbox-border",
     "[role='checkbox']",
+)
+
+# Markers that the CURRENT page is a challenge interstitial: only then is it
+# worth waiting the full settle window for the challenge iframe to mount
+# (google's /sorry mounts the reCAPTCHA anchor a couple of seconds after the
+# redirect; a plain page never grows one).
+_CHALLENGE_PAGE_MARKERS = (
+    "/sorry",
+    "unusual traffic",
+    "just a moment",
+    "attention required",
+    "checking your browser",
+    "verify you are human",
+    "cf-chl",
 )
 
 _HUMAN_LOCK = asyncio.Lock()
@@ -344,8 +359,21 @@ async def human_solve_challenge(page, *, settle_ms: int = 6000) -> bool:
     reCAPTCHA) for a checkbox-like element and clicks it with the real
     mouse, then waits for the challenge to clear. Returns False when no
     checkbox was found.
+
+    The challenge iframe mounts a moment AFTER the interstitial page loads,
+    so when the page looks like a challenge the frame wait uses the full
+    settle window; on a plain page the quick check keeps the search flowing.
     """
     await page.bring_to_front()
+    challenge_expected = await _page_looks_like_challenge(page)
+    try:
+        await page.wait_for_selector(
+            _CHALLENGE_FRAME_SELECTOR,
+            timeout=settle_ms if challenge_expected else 800,
+            state='attached',
+        )
+    except Exception:  # pylint: disable=broad-except
+        return False
     for frame_selector in _CHALLENGE_FRAME_SELECTORS:
         frame_loc = page.frame_locator(frame_selector)
         for box_selector in _CHALLENGE_BOX_SELECTORS:
@@ -363,3 +391,16 @@ async def human_solve_challenge(page, *, settle_ms: int = 6000) -> bool:
                     pass
                 return True
     return False
+
+
+async def _page_looks_like_challenge(page) -> bool:
+    """Heuristic: is the page showing a challenge / rate-limit interstitial?"""
+    markers = _CHALLENGE_PAGE_MARKERS
+    url = (page.url or '').lower()
+    if any(marker in url for marker in markers):
+        return True
+    try:
+        body = (await page.content())[:8192].lower()
+    except Exception:  # pylint: disable=broad-except
+        return False
+    return any(marker in body for marker in markers)

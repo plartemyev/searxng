@@ -1135,6 +1135,7 @@ class BrowserFetchPool:
         from searx.network.human_input import (
             human_read_results,
             human_search_on_page,
+            human_session,
             human_solve_challenge,
             reset_input,
         )
