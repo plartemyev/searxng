@@ -9,10 +9,18 @@ engines:
 - :ref:`google scholar engine`
 - :ref:`google autocomplete`
 
-This implementation uses Nokia user agents to request an XML layout from Google.
-The normal web version requires executing JavaScript to load the results and
-therefore is currently not used here.  See `Google discussion`_ for more
-information on that topic.
+When the engine's requests are served by the masqueraded browser pool
+(``outgoing.using_browser``), it asks for the regular desktop interface
+(``https://www.google.com/search``) -- the same interface the masquerading
+and cookie-earning flow uses -- and parses the desktop HTML layout.  There
+is no per-request user agent switch in this mode: the pool's stable desktop
+Chrome identity signs every request of a lane (switching the UA on a cookie
+jar is easily flagged).
+
+Otherwise it uses Nokia user agents to request a legacy XML layout from
+Google.  The normal web version requires executing JavaScript to load the
+results and therefore is currently not used there.  See `Google discussion`_
+for more information on that topic.
 
 .. _Google discussion: https://github.com/searxng/searxng/issues/6359
 """
@@ -47,7 +55,7 @@ about = {
     "official_api_documentation": "https://developers.google.com/custom-search/",
     "use_official_api": False,
     "require_api_key": False,
-    "results": "XML",
+    "results": "HTML",
 }
 
 # engine dependent config
@@ -295,6 +303,114 @@ def wml_dom(resp: "SXNG_Response"):
     return html.fromstring(text)
 
 
+# -- desktop interface -----------------------------------------------------
+#
+# The desktop HTML layout is parsed on structural anchors that have been
+# stable for years (and survive the class-name rotations): the result list
+# lives in ``div#rso`` / ``div#search`` and every organic result carries its
+# title in an ``h3`` inside the result link.  Snippets and suggestions use
+# class names as best-effort hints only.
+
+_desktop_result_xpath = "//div[@id='rso']//a[.//h3] | //div[@id='search']//a[.//h3]"
+
+_desktop_snippet_xpaths = (
+    ".//div[contains(concat(' ', normalize-space(@class), ' '), ' VwiC3b ')]",
+    ".//*[@data-sncf]",
+)
+
+_desktop_block_xpath = (
+    "ancestor::div["
+    " contains(concat(' ', normalize-space(@class), ' '), ' g ')"
+    " or contains(concat(' ', normalize-space(@class), ' '), ' MjjYud ')"
+    " or contains(concat(' ', normalize-space(@class), ' '), ' N54PNb ')"
+    "]"
+    " | ancestor::div[parent::div[@id='rso']]"
+)
+
+_desktop_suggestion_xpaths = (
+    # 'Did you mean' / 'Showing results for' in the results header
+    "//div[@id='topstuff']//a[contains(@href, '/search')]",
+    # 'Related searches' chips at the end of the result list
+    "//a[contains(concat(' ', normalize-space(@class), ' '), ' k8XOCe ')]",
+)
+
+
+def desktop_dom(resp: "SXNG_Response"):
+    """Parse a desktop-interface response, None when it is not one."""
+    detect_google_sorry(resp)
+    text = resp.text
+    if text.lstrip().startswith("<?xml"):
+        # XML declaration: this is the legacy WML layout, parsed by wml_dom
+        return None
+    dom = html.fromstring(text)
+    for xpath in ("//div[@id='rso']", "//div[@id='search']"):
+        if dom.xpath(xpath):
+            return dom
+    return None
+
+
+def _desktop_snippet(link) -> str:
+    """Best-effort snippet text around a desktop result's title link."""
+    blocks = link.xpath(_desktop_block_xpath)
+    block = blocks[0] if blocks else link.getparent() or link
+    for xpath in _desktop_snippet_xpaths:
+        nodes = block.xpath(xpath)
+        if nodes:
+            return extract_text(nodes[0]) or ""
+    return ""
+
+
+def _parse_desktop_dom(dom) -> EngineResults:
+    """Parse the results of the desktop HTML layout."""
+    results = EngineResults()
+    seen_urls: set[str] = set()
+
+    for link in dom.xpath(_desktop_result_xpath):
+        raw_url = link.get("href") or ""
+        url = unwrap_google_url(raw_url)
+        if not url.startswith(("http://", "https://")):
+            # internal navigation (policies, accounts, pagination, ...)
+            continue
+        if "google.com/search" in url:
+            continue
+        if url in seen_urls:
+            continue
+        title = extract_text(link.xpath(".//h3"))
+        if not title:
+            continue
+        seen_urls.add(url)
+        results.add(
+            results.types.MainResult(
+                url=url,
+                title=title,
+                content=_desktop_snippet(link),
+            )
+        )
+
+    seen_suggestions: set[str] = set()
+    for xpath in _desktop_suggestion_xpaths:
+        for node in dom.xpath(xpath):
+            suggestion = extract_text(node)
+            if suggestion and suggestion not in seen_suggestions:
+                seen_suggestions.add(suggestion)
+                results.add(results.types.LegacyResult(suggestion=suggestion))
+
+    return results
+
+
+def _browser_serves_requests() -> bool:
+    """True when the engine's requests are served by the browser pool.
+
+    The online processor pins the engine's network in a thread-local before
+    ``request`` runs (see :py:func:`searx.network.get_context_network`).
+    """
+    # pylint: disable=import-outside-toplevel
+    from searx.network import get_context_network
+
+    network = get_context_network()
+    return bool(network is not None and network.using_browser)
+
+
 def google_request(
     query: str,
     params: "OnlineParams",
@@ -305,6 +421,7 @@ def google_request(
     use_safesearch: bool = True,
     safesearch_map: dict[int, str] | None = None,
     use_locales: bool = True,
+    desktop_interface: bool = False,
 ) -> None:
     google_info = get_google_info(params, eng_traits or traits)
     if not use_locales:
@@ -325,17 +442,34 @@ def google_request(
     if use_safesearch and params["safesearch"]:
         args["safe"] = (safesearch_map or filter_mapping)[params["safesearch"]]
 
+    if desktop_interface and _browser_serves_requests():
+        # Regular desktop interface, the same one the masquerading and
+        # cookie-earning flow drives: the pool owns the identity (a stable
+        # desktop Chrome UA and Client Hints), so neither a user agent nor
+        # an impersonation target is set here.  response() parses the
+        # desktop HTML layout.
+        params["url"] = f"https://www.google.com/search?{urlencode(args)}"
+        return
+
     params["url"] = f"https://www.google.com/wml/search?{urlencode(args)}"
     params["headers"]["User-Agent"] = random.choice(nokia_useragents)
     params["impersonate"] = "chrome99_android"
 
 
 def request(query: str, params: "OnlineParams") -> None:
-    google_request(query, params)
+    google_request(query, params, desktop_interface=True)
 
 
 def response(resp: "SXNG_Response") -> EngineResults:
     results = EngineResults()
+
+    # The browser pool (and the human fallback's rendered page last resort)
+    # serves the desktop interface: parse it when the body is one, fall
+    # back to the legacy WML layout otherwise.
+    dom = desktop_dom(resp)
+    if dom is not None:
+        return _parse_desktop_dom(dom)
+
     dom = wml_dom(resp)
 
     # parse results
