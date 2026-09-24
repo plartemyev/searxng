@@ -265,7 +265,7 @@ SCHEMA: dict[str, t.Any] = {
         # Slower per request, but defeats engine bot detection that curl
         # fingerprints cannot (CAPTCHAs, wrong-results degradation, ...).
         'using_browser': SettingsValue(bool, False),
-        'browser_pool_size': SettingsValue(int, 3),
+        'browser_pool_size': SettingsValue(int, 6),
         # On a bot challenge, fall back to driving the provider's search UI
         # like a human: XTEST mouse (Bezier curve with jitter), typing and a
         # natural click on the search button (see searx/network/human_input.py).
