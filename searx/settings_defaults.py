@@ -270,6 +270,13 @@ SCHEMA: dict[str, t.Any] = {
         # like a human: XTEST mouse (Bezier curve with jitter), typing and a
         # natural click on the search button (see searx/network/human_input.py).
         'browser_human_fallback': SettingsValue(bool, True),
+        # Maximum stealth mode: drive the provider's search UI like a human
+        # for every supported request up front, not only as a challenge
+        # fallback. Supported requests are search GETs the human flow can
+        # serve (browser URL, not an API endpoint, query extractable). Much
+        # slower per search, but the provider only ever sees interactive
+        # visits from the cookie-trained desktop browser.
+        'browser_max_stealth': SettingsValue(bool, False),
         # Global per-provider send pacing (see searx/network/pacing.py):
         # requests to the same upstream host are spaced a random
         # delay_min..delay_max seconds apart, whatever engine or search sent

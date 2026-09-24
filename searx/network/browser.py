@@ -20,6 +20,12 @@ cookie jar, no page render). On a bot challenge (Cloudflare interstitial,
 403/429) the URL is first navigated in a real page so challenge JS resolves
 and clearance cookies land in the context, then the fetch is retried.
 
+``outgoing.browser_max_stealth`` turns the masquerading around: supported
+search GETs (browser URL, not an API endpoint, query extractable) skip the
+fetch-style attempt entirely and are served by driving the provider's
+search UI with human-like input on every request, not only after a
+challenge.
+
 The pool owns N browser contexts ("lanes"). Each lane serves one request at
 a time; cookies persist per lane, so solved challenges benefit later
 requests on the same lane.
@@ -382,6 +388,21 @@ def _is_api_url(url: str) -> bool:
     return parts.path.lower().endswith((".json", "api.php"))
 
 
+def _is_human_search_candidate(url: str) -> bool:
+    """Can this request be served by driving the provider's search UI?
+
+    Same criteria the human fallback enforces: an http(s) browser URL (not
+    a JSON API endpoint) whose search terms can be extracted, so the UI
+    visit can type the query the engine endpoint would have carried.
+    """
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        return False
+    if _is_api_url(url):
+        return False
+    return bool(_search_query_from_url(url))
+
+
 def _looks_like_bot_challenge(status_code, headers) -> bool:
     """Heuristic: does this response look like a challenge / rate limit?"""
     if headers.get("cf-ray") is not None:
@@ -526,12 +547,13 @@ class BrowserFetchPool:
 
     def __init__(
         self, pool_size: int = 3, verify: bool = True, proxy: str | None = None,
-        human_fallback: bool = True,
+        human_fallback: bool = True, max_stealth: bool = False,
     ):
         self._pool_size = max(1, pool_size)
         self._verify = verify
         self._proxy = proxy
         self._human_fallback = human_fallback
+        self._max_stealth = max_stealth
         self._lanes: list[_Lane] = []
         self._lane_cycle: asyncio.Queue | None = None
         self._init_lock = asyncio.Lock()
@@ -718,6 +740,14 @@ class BrowserFetchPool:
         lane = await self._lane_cycle.get()
         try:
             async with lane.lock:
+                if self._max_stealth and method.upper() == "GET":
+                    # Maximum stealth mode: the interactive visit comes
+                    # first, not as a challenge fallback. Requests the human
+                    # flow cannot serve fall through to the fetch path.
+                    if _is_human_search_candidate(url):
+                        human = await self._fetch_via_human_search(lane, url, timeout_s)
+                        if human is not None:
+                            return human
                 return await self._fetch_on_lane(
                     lane,
                     method.upper(),
@@ -887,18 +917,20 @@ class BrowserFetchPool:
             return None
 
     async def _fetch_via_human_search(self, lane: _Lane, url: str, timeout_s: float):
-        """Serve a challenged GET search by driving the provider like a human.
+        """Serve a GET search by driving the provider like a human.
 
-        The engine's endpoint returned a challenge or an interstitial. Open
-        the provider's site, type the query into its search box and click
-        search with real X input (see :py:mod:`searx.network.human_input`),
-        solving any challenge checkbox met on the way. The interactive visit
-        earns trust cookies on the lane context; the engine endpoint is then
-        re-fetched fetch-style and returned, so the engine gets the response
-        format its parser expects (a rendered UI page would not parse
-        everywhere - google, for one, reads a legacy mobile layout). When
-        the re-fetch is still challenged, the rendered results page is
-        returned as a last resort.
+        Used as the challenge fallback for challenged/interstitial GETs and,
+        in maximum stealth mode (``outgoing.browser_max_stealth``), up front
+        for every supported request. Open the provider's site, type the
+        query into its search box and click search with real X input (see
+        :py:mod:`searx.network.human_input`), solving any challenge
+        checkbox met on the way. The interactive visit earns trust cookies
+        on the lane context; the engine endpoint is then re-fetched
+        fetch-style and returned, so the engine gets the response format
+        its parser expects (a rendered UI page would not parse everywhere -
+        google, for one, reads a legacy mobile layout). When the re-fetch
+        is still challenged, the rendered results page is returned as a
+        last resort.
 
         Returns None when the flow is not applicable or failed entirely; the
         caller then falls back to the plain warm-up.
@@ -1113,6 +1145,7 @@ def get_browser_fetch_pool() -> BrowserFetchPool:
             verify=get_setting("outgoing.verify", True),
             proxy=_proxy_from_proxies_setting(get_setting("outgoing.proxies", None)),
             human_fallback=get_setting("outgoing.browser_human_fallback", True),
+            max_stealth=get_setting("outgoing.browser_max_stealth", False),
         )
     return _POOL
 
