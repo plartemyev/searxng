@@ -176,6 +176,11 @@ class OnlineProcessor(EngineProcessor):
             if params.get(key) is not None:
                 request_args[key] = params[key]
 
+        # browser fetch pool only: engines whose layout depends on their own
+        # UA (legacy endpoints) opt out of the pool's identity headers
+        if getattr(self.engine, "browser_keep_identity_headers", False):
+            request_args["browser_identity_headers"] = True
+
         verify = params.get("verify")
         if verify is not None:
             request_args["verify"] = verify

@@ -28,6 +28,10 @@ about = {
 
 # engine dependent config
 categories = ["news"]
+# The legacy WML endpoint (see searx.engines.google) answers to the Nokia
+# user agent: keep the engine's identity headers when the masqueraded
+# browser pool serves the request.
+browser_keep_identity_headers = True
 paging = True
 max_page = 50
 """Google supports up to 50 pages of results, see the `Google max_page discussion`_.

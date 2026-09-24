@@ -444,6 +444,24 @@ def _looks_like_js_interstitial(body: bytes) -> bool:
     return any(marker in body_wo_scripts.lower() for marker in _JS_INTERSTITIAL_MARKERS)
 
 
+# Identity headers the masqueraded browser owns. Engine-supplied values are
+# dropped from fetch requests unless the engine opted out: a Chromium lane
+# whose TLS stack, Client Hints and JS surface say Windows Chrome must not
+# introduce itself with a per-request engine UA on the same cookie jar.
+_IDENTITY_HEADERS = frozenset(
+    {
+        "user-agent",
+        "sec-ch-ua",
+        "sec-ch-ua-mobile",
+        "sec-ch-ua-platform",
+        "sec-fetch-dest",
+        "sec-fetch-mode",
+        "sec-fetch-site",
+        "sec-fetch-user",
+    }
+)
+
+
 class BrowserResponse:
     """Duck-typed replacement for :class:`SXNG_Response` (curl_cffi).
 
@@ -726,6 +744,7 @@ class BrowserFetchPool:
         timeout: float | None = None,
         allow_redirects: bool = True,
         max_redirects: int = 30,
+        keep_identity_headers: bool = False,
     ) -> BrowserResponse:
         await self._init()
         await self._ensure_browser_alive()
@@ -760,6 +779,7 @@ class BrowserFetchPool:
                     timeout_s=timeout_s,
                     allow_redirects=allow_redirects,
                     max_redirects=max_redirects,
+                    keep_identity_headers=keep_identity_headers,
                 )
         finally:
             self._lane_cycle.put_nowait(lane)
@@ -778,9 +798,12 @@ class BrowserFetchPool:
         timeout_s: float = _DEFAULT_TIMEOUT_S,
         allow_redirects: bool = True,
         max_redirects: int = 30,
+        keep_identity_headers: bool = False,
     ) -> BrowserResponse:
         timeout_ms = int(timeout_s * 1000)
-        request_headers = self._build_request_headers(headers, cookies)
+        request_headers = self._build_request_headers(
+            headers, cookies, keep_identity_headers
+        )
         context = lane.context
         request = context.request
         request_kwargs = {
@@ -1113,14 +1136,25 @@ class BrowserFetchPool:
             return None
 
     @staticmethod
-    def _build_request_headers(headers: dict | None, cookies: dict | None) -> dict:
+    def _build_request_headers(
+        headers: dict | None, cookies: dict | None, keep_identity_headers: bool = False
+    ) -> dict:
         """Merge masquerade defaults with engine-provided headers.
 
         Engine headers win for the keys they set. Hop-by-hop and
         transport-managed headers are dropped: the browser stack computes
         them itself and stale values are a fingerprint signal.
+
+        By default identity headers (User-Agent, Client Hints, Sec-Fetch-*)
+        are dropped as well: the masqueraded browser owns the identity its
+        cookies were earned with, and an engine-supplied UA switches the
+        identity per request on the same cookie jar -- an easy detector
+        flag. Engines that need their own UA to get a parseable layout opt
+        out with the module attribute ``browser_keep_identity_headers``.
         """
         dropped = {"host", "content-length", "connection", "accept-encoding", "cookie"}
+        if not keep_identity_headers:
+            dropped = dropped | _IDENTITY_HEADERS
         merged: dict[str, str] = {}
         for key, value in (headers or {}).items():
             if str(key).lower() in dropped:

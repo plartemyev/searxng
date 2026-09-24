@@ -277,10 +277,14 @@ class Network:
         from searx.network.pacing import pace_request
         if not stream:
             await pace_request(url)
+        # browser-only option: must never leak into the curl client kwargs
+        keep_identity_headers = bool(kwargs.pop('browser_identity_headers', False))
         if self.using_browser and not stream:
             # the browser fetch pool does not support streaming:
             # stream requests (image proxy) keep using the HTTP client
-            return await self.call_browser(method, url, **kwargs)
+            return await self.call_browser(
+                method, url, keep_identity_headers=keep_identity_headers, **kwargs
+            )
         return await self.call_curl_client(stream, method, url, **kwargs)
 
     async def call_curl_client(self, stream: bool, method: str, url: str, **kwargs: t.Any) -> SXNG_Response:
@@ -316,7 +320,9 @@ class Network:
                     raise e
             retries -= 1
 
-    async def call_browser(self, method: str, url: str, **kwargs: t.Any) -> SXNG_Response:
+    async def call_browser(
+        self, method: str, url: str, keep_identity_headers: bool = False, **kwargs: t.Any
+    ) -> SXNG_Response:
         """Serve a request through the masqueraded Chromium fetch pool.
 
         Mirrors the retry/raise logic of :py:meth:`call_curl_client`. Engine
@@ -346,6 +352,7 @@ class Network:
                     timeout=kwargs.get('timeout'),
                     allow_redirects=allow_redirects,
                     max_redirects=self.max_redirects,
+                    keep_identity_headers=keep_identity_headers,
                 )
             except (SearxEngineAccessDeniedException, SearxEngineTooManyRequestsException):
                 # engine-level errors: report as-is so the engine gets suspended

@@ -25,6 +25,10 @@ about = {
 
 # engine dependent config
 categories = ["images", "web"]
+# The legacy WML endpoint (see searx.engines.google) answers to the Nokia
+# user agent: keep the engine's identity headers when the masqueraded
+# browser pool serves the request.
+browser_keep_identity_headers = True
 paging = True
 enable_http3 = True
 max_page = 50
