@@ -266,6 +266,10 @@ SCHEMA: dict[str, t.Any] = {
         # fingerprints cannot (CAPTCHAs, wrong-results degradation, ...).
         'using_browser': SettingsValue(bool, False),
         'browser_pool_size': SettingsValue(int, 3),
+        # On a bot challenge, fall back to driving the provider's search UI
+        # like a human: XTEST mouse (Bezier curve with jitter), typing and a
+        # natural click on the search button (see searx/network/human_input.py).
+        'browser_human_fallback': SettingsValue(bool, True),
         # Global per-provider send pacing (see searx/network/pacing.py):
         # requests to the same upstream host are spaced a random
         # delay_min..delay_max seconds apart, whatever engine or search sent

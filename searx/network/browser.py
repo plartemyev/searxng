@@ -28,7 +28,7 @@ requests on the same lane.
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # pylint: disable=too-many-instance-attributes
 
-__all__ = ["BrowserFetchPool", "get_browser_fetch_pool", "BrowserFetchError"]
+__all__ = ["BrowserFetchPool", "get_browser_fetch_pool", "ensure_display", "BrowserFetchError"]
 
 import asyncio
 import atexit
@@ -50,6 +50,7 @@ from searx.exceptions import (
     SearxEngineTooManyRequestsException,
 )
 from searx.extended_types import SXNG_URL
+from urllib.parse import parse_qs, urlsplit
 
 logger = logging.getLogger("searx.network.browser")
 
@@ -110,7 +111,30 @@ def _cleanup_stale_x_locks():
             logger.warning("Could not remove stale X server file %s", path)
 
 
-def _ensure_display():
+def _bootstrap_xauth():
+    """Make the Xvfb display connectable for python-xlib clients.
+
+    Xvfb runs without access control, but python-xlib (pyautogui) still
+    tries to read an authority file and hard-fails when ``~/.Xauthority``
+    does not exist. An empty file satisfies it.
+    """
+    os.environ.setdefault("HOME", "/tmp")
+    home = os.environ["HOME"]
+    try:
+        os.makedirs(home, exist_ok=True)
+    except OSError:
+        return
+    xauth_path = os.environ.get("XAUTHORITY") or os.path.join(home, ".Xauthority")
+    try:
+        if not os.path.exists(xauth_path):
+            with open(xauth_path, "ab"):
+                pass
+        os.environ["XAUTHORITY"] = xauth_path
+    except OSError:
+        logger.warning("Could not create an empty Xauthority file at %s", xauth_path)
+
+
+def ensure_display():
     """Return an X display for a headed browser, starting Xvfb if needed.
 
     Returns None when headed mode is impossible, in which case the caller
@@ -156,6 +180,7 @@ def _ensure_display():
                 logger.info(
                     "Started Xvfb on %s for masqueraded browser fetches", _XVFB_DISPLAY
                 )
+                _bootstrap_xauth()
                 return _XVFB_DISPLAY
             time.sleep(0.1)
         logger.warning(
@@ -325,6 +350,33 @@ _CF_CHALLENGE_BODY_MARKERS = (
 )
 _SCRIPT_BLOCK_RE = re.compile(r"<script\b.*?</script>", re.IGNORECASE | re.DOTALL)
 
+# Query parameter names engines use to carry the search terms. The human
+# fallback re-runs the search through the provider's UI, which needs the raw
+# query rather than the engine endpoint's URL.
+_QUERY_PARAM_KEYS = ("q", "p", "query", "text", "s", "search", "wd", "k")
+
+
+def _search_query_from_url(url: str) -> str | None:
+    """Extract the search terms from an engine request URL, if any."""
+    try:
+        params = parse_qs(urlsplit(url).query)
+    except ValueError:
+        return None
+    for key in _QUERY_PARAM_KEYS:
+        values = params.get(key)
+        if values and values[0].strip():
+            return values[0].strip()
+    return None
+
+
+def _is_api_url(url: str) -> bool:
+    """JSON API endpoints have no search UI to drive with human input."""
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    if host.startswith("api.") or host.startswith("apis."):
+        return True
+    return parts.path.lower().endswith((".json", "api.php"))
+
 
 def _looks_like_bot_challenge(status_code, headers) -> bool:
     """Heuristic: does this response look like a challenge / rate limit?"""
@@ -469,11 +521,13 @@ class BrowserFetchPool:
     """
 
     def __init__(
-        self, pool_size: int = 3, verify: bool = True, proxy: str | None = None
+        self, pool_size: int = 3, verify: bool = True, proxy: str | None = None,
+        human_fallback: bool = True,
     ):
         self._pool_size = max(1, pool_size)
         self._verify = verify
         self._proxy = proxy
+        self._human_fallback = human_fallback
         self._lanes: list[_Lane] = []
         self._lane_cycle: asyncio.Queue | None = None
         self._init_lock = asyncio.Lock()
@@ -506,7 +560,7 @@ class BrowserFetchPool:
                 )
 
             display = await asyncio.get_running_loop().run_in_executor(
-                None, _ensure_display
+                None, ensure_display
             )
             headed = display is not None
             env = dict(os.environ)
@@ -751,6 +805,13 @@ class BrowserFetchPool:
             logger.debug(
                 "bot challenge on %s (%s); rendering page and retrying", url, status
             )
+            if self._human_fallback and method == "GET":
+                # Drive the provider's search UI like a human: often the only
+                # thing that passes, and cheaper than a doomed warm-up plus
+                # a suspended engine.
+                human = await self._fetch_via_human_search(lane, url, timeout_s)
+                if human is not None:
+                    return human
             warmed = await self._warm_up_and_retry(
                 lane, method, url, request_kwargs=request_kwargs
             )
@@ -760,6 +821,10 @@ class BrowserFetchPool:
         if status == 200 and _looks_like_js_interstitial(body):
             # a JS redirect gate: render the page with the real JS engine,
             # the browser follows the redirect and lands on the content
+            if self._human_fallback and method == "GET":
+                human = await self._fetch_via_human_search(lane, url, timeout_s)
+                if human is not None:
+                    return human
             rendered = await self._render_page(lane, url, timeout_s)
             if rendered is not None:
                 return rendered
@@ -815,6 +880,93 @@ class BrowserFetchPool:
                 await page.close()
         except Exception:  # pylint: disable=broad-except
             logger.warning("Render fallback failed for %s", url, exc_info=True)
+            return None
+
+    async def _fetch_via_human_search(self, lane: _Lane, url: str, timeout_s: float):
+        """Re-run a GET search through the provider's UI with human input.
+
+        The engine's endpoint returned a challenge or an interstitial.
+        Instead of fetching that endpoint again, open the provider's site,
+        type the query into its search box and click search with real X
+        input (see :py:mod:`searx.network.human_input`), then return the
+        rendered results page. A challenge met on the way (its checkbox
+        lives in a cross-origin iframe) is clicked through.
+
+        Returns None when the flow is not applicable or failed; the caller
+        then falls back to the plain warm-up. Clearance cookies won on the
+        way stay in the lane context.
+        """
+        # pylint: disable=import-outside-toplevel
+        from searx.network.human_input import (
+            human_search_on_page,
+            human_session,
+            human_solve_challenge,
+            reset_input,
+        )
+
+        if _is_api_url(url):
+            return None
+        query = _search_query_from_url(url)
+        if not query:
+            return None
+        parts = urlsplit(url)
+        if parts.scheme not in ("http", "https") or not parts.netloc:
+            return None
+        origin = f"{parts.scheme}://{parts.netloc}/"
+        goto_timeout_ms = int(max(5.0, min(timeout_s, 20.0)) * 1000)
+
+        try:
+            async with human_session():
+                page = await lane.context.new_page()
+                try:
+                    try:
+                        await page.goto(
+                            origin, timeout=goto_timeout_ms, wait_until="domcontentloaded"
+                        )
+                    except Exception:  # pylint: disable=broad-except
+                        logger.warning(
+                            "human search: homepage %s failed, trying results URL", origin
+                        )
+                    await human_solve_challenge(page)
+                    if await human_search_on_page(page, query):
+                        try:
+                            await page.wait_for_load_state(
+                                "networkidle", timeout=_BOT_CHALLENGE_GRACE_MS
+                            )
+                        except Exception:  # pylint: disable=broad-except
+                            pass
+                    else:
+                        # No usable search box: navigate the results URL so
+                        # at least challenge JS runs in a real page.
+                        await page.goto(
+                            url, timeout=goto_timeout_ms, wait_until="domcontentloaded"
+                        )
+                        await human_solve_challenge(page)
+                        try:
+                            await page.wait_for_load_state(
+                                "networkidle", timeout=_BOT_CHALLENGE_GRACE_MS
+                            )
+                        except Exception:  # pylint: disable=broad-except
+                            pass
+                    await page.wait_for_timeout(1500)
+                    html_content = await page.content()
+                    logger.info(
+                        "human search fallback: %d bytes for %s", len(html_content), url
+                    )
+                    return BrowserResponse(
+                        status_code=200,
+                        headers={"content-type": "text/html; charset=utf-8"},
+                        content=html_content.encode("utf-8", errors="replace"),
+                        url=page.url,
+                        method="GET",
+                    )
+                finally:
+                    await page.close()
+        except Exception:  # pylint: disable=broad-except
+            logger.warning("human search fallback failed for %s", url, exc_info=True)
+            # the usual cause is a stale X connection: drop the cached
+            # pyautogui so the next session rebinds to the display
+            reset_input()
             return None
 
     async def _warm_up_and_retry(
@@ -898,6 +1050,7 @@ def get_browser_fetch_pool() -> BrowserFetchPool:
             pool_size=get_setting("outgoing.browser_pool_size", 3),
             verify=get_setting("outgoing.verify", True),
             proxy=_proxy_from_proxies_setting(get_setting("outgoing.proxies", None)),
+            human_fallback=get_setting("outgoing.browser_human_fallback", True),
         )
     return _POOL
 

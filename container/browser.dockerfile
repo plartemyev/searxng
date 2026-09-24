@@ -4,7 +4,7 @@
 FROM docker.io/library/python:3.13-slim
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends chromium xvfb ca-certificates \
+    && apt-get install -y --no-install-recommends chromium xvfb ca-certificates python3-tk \
     && rm -rf /var/lib/apt/lists/*
 
 # same paths / user convention as the official image
@@ -16,8 +16,11 @@ RUN groupadd -g 977 searxng \
     && chown -R searxng:searxng /etc/searxng /var/cache/searxng /tmp/.X11-unix
 
 WORKDIR /usr/local/searxng
+# pip: playwright drives the pool's Chromium; pyautogui emits the real
+# XTEST mouse/keyboard events for the human-like input fallback
+# (searx/network/human_input.py) on the Xvfb display.
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt playwright granian
+RUN pip install --no-cache-dir -r requirements.txt playwright pyautogui granian
 
 COPY searx/ ./searx/
 # freeze the version: searx/version.py shells out to git (absent in the
