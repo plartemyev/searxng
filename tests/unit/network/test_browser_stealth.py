@@ -73,6 +73,14 @@ def test_homepage_keeps_host_and_scheme():
     assert _homepage_url_from_search_url(url) == 'https://search.brave.com/?hl=de'
 
 
+def test_homepage_carries_bing_locale_params():
+    url = 'https://www.bing.com/search?q=test&mkt=de-DE&setlang=de&form=QBLH'
+    assert (
+        _homepage_url_from_search_url(url)
+        == 'https://www.bing.com/?mkt=de-DE&setlang=de'
+    )
+
+
 # _ip_locale_from_payload: the lane identity must match the public IP
 
 

@@ -420,17 +420,18 @@ def _homepage_url_from_search_url(url: str) -> str:
     """The provider front page, carrying the engine URL's locale parameters.
 
     The human flow starts from the site's front page, like an address-bar
-    entry, and drives the search box from there. ``hl`` (interface
-    language) and ``gl`` (result country) from the engine request ride
-    along on the homepage: the provider renders its UI in the language the
-    search asked for, and its own search form submits those parameters
-    with the typed query. ``cr=countryXX`` from the engine URL is the
-    searxng spelling of ``gl``.
+    entry, and drives the search box from there. The engine URL's locale
+    parameters ride along on the homepage -- google's ``hl``/``gl``
+    (interface language / result country), bing's ``mkt``/``setlang`` -- so
+    the provider renders its UI in the language the search asked for, and
+    its own search form submits those parameters with the typed query.
+    ``cr=countryXX`` from the engine URL is the searxng spelling of
+    ``gl``.
     """
     parts = urlsplit(url)
     params = parse_qs(parts.query)
     carried: list[tuple[str, str]] = []
-    for key in ("hl", "gl"):
+    for key in ("hl", "gl", "mkt", "setlang"):
         values = params.get(key)
         if values and values[0].strip():
             carried.append((key, values[0].strip()))
@@ -1120,20 +1121,38 @@ class BrowserFetchPool:
     async def _settle_after_search(self, page, timeout_s: float) -> None:
         """Wait out the post-click navigation, solving challenges on the way.
 
-        The search click triggers a navigation that starts asynchronously:
-        a ``networkidle`` wait entered immediately still describes the old
-        page, and google may route a flagged search through ``/sorry`` a
-        moment later. Poll until the URL leaves the challenge interstitial
-        (clicking its checkbox with the real mouse when one appears), or
-        until the budget is spent -- the captured DOM then tells the engine
-        what happened.
+        The search submit navigates asynchronously: a ``networkidle`` or URL
+        check entered immediately still describes the search page. First
+        wait for the URL to actually leave the search page, then poll until
+        it leaves the challenge interstitial (clicking its checkbox with the
+        real mouse when one appears), or until the budget is spent -- the
+        captured DOM then tells the engine what happened.
         """
         # pylint: disable=import-outside-toplevel
         from searx.network.human_input import human_solve_challenge
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + max(8.0, min(timeout_s, 30.0))
+        start_url = page.url
+
+        # phase 1: the submission must navigate somewhere
+        while loop.time() < deadline and page.url == start_url:
+            try:
+                await page.wait_for_url(
+                    lambda url: url != start_url, timeout=2000
+                )
+            except Exception:  # pylint: disable=broad-except
+                pass
+        if page.url == start_url:
+            logger.warning(
+                "human search: submission never navigated away from %s", start_url
+            )
+            return
+
+        # phase 2: challenges on the arrival page
+        iterations = 0
         while loop.time() < deadline:
+            iterations += 1
             if not _is_challenge_url(page.url):
                 try:
                     await page.wait_for_load_state(
@@ -1221,6 +1240,11 @@ class BrowserFetchPool:
                         except Exception:  # pylint: disable=broad-except
                             pass
                     await human_read_results(page)
+                    if _is_challenge_url(page.url):
+                        # a flagged search can be routed to /sorry late, after
+                        # the results already rendered
+                        await self._settle_after_search(page, timeout_s)
+                        await human_read_results(page)
                     rendered_url = page.url
                     rendered_html = (await page.content()).encode(
                         "utf-8", errors="replace"
