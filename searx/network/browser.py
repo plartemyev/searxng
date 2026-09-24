@@ -797,24 +797,13 @@ class BrowserFetchPool:
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     f"(KHTML, like Gecko) Chrome/{chrome_major}.0.0.0 Safari/537.36"
                 )
-                sec_ch_ua = (
-                    f'"Chromium";v="{chrome_major}", "Google Chrome";v="{chrome_major}", '
-                    '"Not:A-Brand";v="24"'
-                )
                 extra_headers = {
-                    "Accept": (
-                        "text/html,application/xhtml+xml,application/xml;q=0.9,"
-                        "image/avif,image/webp,image/apng,*/*;q=0.8,"
-                        "application/signed-exchange;v=b3;q=0.7"
-                    ),
+                    # Accept-Language only: Chromium sets Accept and the
+                    # Sec-Fetch-* headers per request itself. Forcing
+                    # navigation headers at context level stamps
+                    # "Sec-Fetch-Dest: document" onto every script and XHR,
+                    # which is an egregious automation fingerprint.
                     "Accept-Language": "en-US,en;q=0.9",
-                    "Sec-Fetch-Dest": "document",
-                    "Sec-Fetch-Mode": "navigate",
-                    "Sec-Fetch-Site": "none",
-                    "Sec-Fetch-User": "?1",
-                    "Sec-CH-UA": sec_ch_ua,
-                    "Sec-CH-UA-Mobile": "?0",
-                    "Sec-CH-UA-Platform": '"Windows"',
                 }
                 init_script = _stealth_init_script(chrome_major, chrome_full)
                 geo = await asyncio.get_running_loop().run_in_executor(
