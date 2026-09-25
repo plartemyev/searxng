@@ -785,10 +785,13 @@ async def _run_image_rounds(page, pointer, solver, max_rounds: int, found) -> bo
     solved = False
     for round_index in range(1, max_rounds + 1):
         if round_index > 1:
-            # a person reads the new image set before acting on it
+            # a person reads the new image set before acting on it; the
+            # next grid mounts after the verify round trip, so this probe
+            # uses the full window -- a quick probe here would give up
+            # before round two ever appears
             await asyncio.sleep(random.uniform(1.0, 2.2))  # noqa: S311
             try:
-                found = await _wait_for_image_grid(page, challenge_expected=False)
+                found = await _wait_for_image_grid(page, challenge_expected=True)
             except Exception:  # pylint: disable=broad-except
                 found = None
             if found is None:
