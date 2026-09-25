@@ -8,7 +8,8 @@ paths. This module drives the browser with OS-level input on the X display
 the headed browser runs under (Xvfb, see searx.network.browser):
 
 - the pointer travels a quadratic Bezier curve with a random control point
-  and per-step jitter, emitted as real XTEST events via pyautogui
+  and per-step jitter, emitted as real X input (pointer warps and XTEST
+  events on the lane's own display)
 - buttons are clicked after a human-scale hover pause and press duration
 - text is typed with human cadence: uneven keys, short fast bursts, and the
   occasional mid-word hesitation
@@ -16,12 +17,14 @@ the headed browser runs under (Xvfb, see searx.network.browser):
   making small idle drifts instead of freezing the pointer
 
 Coordinate spaces: Playwright boxes are page (viewport) coordinates while
-pyautogui needs screen coordinates. The mapping reads the window origin
-from JS (``window.screenX/screenY``, outer vs inner sizes), which is exact
-per window including the browser chrome.
+the input layer needs screen coordinates. The mapping reads the window
+origin from JS (``window.screenX/screenY``, outer vs inner sizes), which is
+exact per window including the browser chrome.
 
-There is one X pointer per display, so a process-wide asyncio lock
-(:py:func:`human_session`) serialises human sessions across pool lanes.
+Every pool lane runs its browser on its own X display, and each session
+connects to exactly its lane's display: the pointers are independent, so
+sessions on different lanes run concurrently -- there is no process-wide
+lock, and a lane's simulated click can never land in another lane's window.
 """
 
 from __future__ import annotations
@@ -35,9 +38,7 @@ __all__ = [
 ]
 
 import asyncio
-import os
 import random
-import sys
 import time
 from contextlib import asynccontextmanager
 
@@ -103,59 +104,152 @@ _CHALLENGE_PAGE_MARKERS = (
     "cf-chl",
 )
 
-_HUMAN_LOCK = asyncio.Lock()
-_pyautogui = None
-
 
 class HumanInputError(Exception):
     """Raised when OS-level input cannot be delivered to the browser."""
 
 
-def _get_pyautogui():
-    """Return the pyautogui module bound to the browser's X display.
+class _XPointer:
+    """OS-level pointer and keyboard on ONE explicit X display.
 
-    Imported lazily: importing before the display exists fails hard, and
-    the module is expensive to import. On X errors the cache is dropped
-    (:py:func:`_reset_pyautogui`) so the next call rebinds to the display.
+    Replaces pyautogui, whose X connection is process-global: it binds to
+    ``$DISPLAY`` at import time, so one process can drive exactly one
+    display. Pool lanes run one browser each on its own display and need
+    independent, concurrent input channels. python-xlib connects to an
+    explicit display string, so every session owns its connection and no
+    process state is mutated.
+
+    Clicks and keys go through the XTEST extension (the same fake-input
+    path pyautogui and xdotool use); pointer moves are warps on the
+    session's own display.
     """
-    global _pyautogui  # pylint: disable=global-statement
-    if _pyautogui is not None:
-        return _pyautogui
-    from searx.network.browser import ensure_display
 
-    display = ensure_display()
-    if display is None:
-        raise HumanInputError('no X display for human input (Xvfb unavailable)')
-    os.environ['DISPLAY'] = display
-    try:
-        import pyautogui
-    except Exception as e:
-        raise HumanInputError(f'pyautogui unavailable: {e}') from e
-    # The pool owns the pointer; a jittered move must never hit a corner
-    # and raise FailSafeException.
-    pyautogui.FAILSAFE = False
-    pyautogui.PAUSE = 0
-    _pyautogui = pyautogui
-    return _pyautogui
+    _SHIFT_KEYSYM = 0xFFE1  # XK_Shift_L
+
+    # named keys the flows use; keysyms are Latin-1 code points otherwise
+    _NAMED_KEYSYMS = {
+        'enter': 0xFF0D,
+        'return': 0xFF0D,
+        'tab': 0xFF09,
+        'esc': 0xFF1B,
+        'escape': 0xFF1B,
+    }
+
+    def __init__(self, display: str):
+        try:
+            from Xlib import X  # pylint: disable=import-outside-toplevel
+            from Xlib.ext import xtest  # pylint: disable=import-outside-toplevel
+            from Xlib.display import Display  # pylint: disable=import-outside-toplevel
+        except ImportError as e:
+            raise HumanInputError(f'python-xlib unavailable: {e}') from e
+        self._X = X
+        self._xtest = xtest
+        try:
+            self._display = Display(display)
+            self._root = self._display.screen().root
+            self._display.sync()
+        except Exception as e:
+            raise HumanInputError(
+                f'cannot connect to X display {display}: {e}'
+            ) from e
+        self._keymap = self._build_keymap()
+
+    def _build_keymap(self) -> dict[int, tuple[int, bool]]:
+        """Map keysym -> (keycode, shift required), from the server keymap.
+
+        A keycode carries an unshifted and a shifted keysym (columns 1 and
+        2); the first keycode claiming a keysym wins.
+        """
+        info = self._display.display.info
+        rows = self._display.get_keyboard_mapping(
+            info.min_keycode, info.max_keycode - info.min_keycode + 1
+        )
+        keymap: dict[int, tuple[int, bool]] = {}
+        for offset, syms in enumerate(rows):
+            keycode = info.min_keycode + offset
+            for column, keysym in enumerate(syms):
+                if keysym and keysym not in keymap:
+                    keymap[keysym] = (keycode, column == 1)
+        return keymap
+
+    # -- pointer ---------------------------------------------------------
+
+    def size(self) -> tuple[int, int]:
+        geometry = self._root.get_geometry()
+        return int(geometry.width), int(geometry.height)
+
+    def position(self) -> tuple[int, int]:
+        pointer = self._root.query_pointer()
+        return int(pointer.root_x), int(pointer.root_y)
+
+    def move_to(self, x: int, y: int) -> None:
+        self._root.warp_pointer(int(x), int(y))
+        self._display.sync()
+
+    def mouse_down(self) -> None:
+        self._xtest.fake_input(self._display, self._X.ButtonPress, 1)
+        self._display.sync()
+
+    def mouse_up(self) -> None:
+        self._xtest.fake_input(self._display, self._X.ButtonRelease, 1)
+        self._display.sync()
+
+    def scroll(self, clicks: int) -> None:
+        """Scroll ``clicks`` wheel notches (pyautogui sign: negative is down)."""
+        button = self._X.Button4 if clicks > 0 else self._X.Button5
+        for _ in range(abs(int(clicks))):
+            self._xtest.fake_input(self._display, self._X.ButtonPress, button)
+            self._xtest.fake_input(self._display, self._X.ButtonRelease, button)
+            self._display.sync()
+
+    # -- keyboard ----------------------------------------------------------
+
+    def _key_entry(self, ch: str) -> tuple[int, bool] | None:
+        """Keymap entry for a character, or None when not typable.
+
+        X keysyms for Latin-1 printable characters equal their Unicode code
+        points (XK_a == 0x61, XK_exclam == 0x21), so ``ord`` is the keysym;
+        anything outside the range needs the server's keysym database and
+        is left to the page-level fallback.
+        """
+        if len(ch) != 1:
+            return None
+        code = ord(ch)
+        if not 0x20 <= code <= 0xFF:
+            return None
+        return self._keymap.get(code)
+
+    def write(self, ch: str) -> None:
+        """Type one character; HumanInputError when it is not on the keymap."""
+        entry = self._key_entry(ch)
+        if entry is None:
+            raise HumanInputError(f'{ch!r} is not on the X keymap')
+        keycode, shift = entry
+        self._press_keycode(keycode, shift=shift)
+
+    def press(self, name: str) -> None:
+        """Press a named key (e.g. 'enter')."""
+        keysym = self._NAMED_KEYSYMS.get(name.lower())
+        entry = self._keymap.get(keysym) if keysym else None
+        if entry is None:
+            raise HumanInputError(f'key {name!r} is not on the X keymap')
+        self._press_keycode(entry[0])
+
+    def _press_keycode(self, keycode: int, *, shift: bool = False) -> None:
+        shift_keycode = self._keymap.get(self._SHIFT_KEYSYM, (None, False))[0]
+        if shift and shift_keycode is None:
+            raise HumanInputError('no Shift key on the X keymap')
+        if shift:
+            self._xtest.fake_input(self._display, self._X.KeyPress, shift_keycode)
+        self._xtest.fake_input(self._display, self._X.KeyPress, keycode)
+        self._xtest.fake_input(self._display, self._X.KeyRelease, keycode)
+        if shift:
+            self._xtest.fake_input(self._display, self._X.KeyRelease, shift_keycode)
+        self._display.sync()
 
 
-def _reset_pyautogui():
-    """Drop the cached pyautogui (stale after an Xvfb restart)."""
-    global _pyautogui  # pylint: disable=global-statement
-    _pyautogui = None
-    for name in list(sys.modules):
-        if name == 'pyautogui' or name.startswith(('pymouse', 'mouseinfo', 'pyautogui.')):
-            del sys.modules[name]
-
-
-def _screen_size() -> tuple[int, int]:
-    pyautogui = _get_pyautogui()
-    size = pyautogui.size()
-    return int(size.width), int(size.height)
-
-
-def _clamp(x: float, y: float) -> tuple[int, int]:
-    width, height = _screen_size()
+def _clamp(pointer: _XPointer, x: float, y: float) -> tuple[int, int]:
+    width, height = pointer.size()
     return int(max(0, min(x, width - 1))), int(max(0, min(y, height - 1)))
 
 
@@ -170,7 +264,10 @@ def quadratic_bezier(
 
 
 async def human_like_real_mouse_move(
-    start: tuple[int, int], end: tuple[int, int], steps: int = 0
+    pointer: _XPointer,
+    start: tuple[int, int],
+    end: tuple[int, int],
+    steps: int = 0,
 ) -> tuple[int, int]:
     """Move the real X pointer from ``start`` to ``end`` like a human hand.
 
@@ -178,7 +275,6 @@ async def human_like_real_mouse_move(
     per-step jitter, 1-5ms between steps (the await lets the event loop
     breathe while the pointer moves).
     """
-    pyautogui = _get_pyautogui()
     start_ts = time.monotonic()
     if not steps:
         steps = random.randint(30, 200)  # noqa: S311
@@ -191,25 +287,23 @@ async def human_like_real_mouse_move(
         t = i / steps
         x, y = quadratic_bezier(start, control, end, t)
         # Add some jitter for realism.
-        final_x, final_y = _clamp(x + random.uniform(-1, 1), y + random.uniform(-1, 1))  # noqa: S311
-        pyautogui.moveTo(final_x, final_y, _pause=False)
+        final_x, final_y = _clamp(
+            pointer, x + random.uniform(-1, 1), y + random.uniform(-1, 1)  # noqa: S311
+        )
+        pointer.move_to(final_x, final_y)
         await asyncio.sleep(random.uniform(0.001, 0.005))  # noqa: S311
     end_ts = time.monotonic()
     logger.debug('Took %f seconds for %d steps', end_ts - start_ts, steps)
     return final_x, final_y
 
 
-def reset_input():
-    """Drop the cached pyautogui binding.
-
-    Called when a human session failed: the usual cause is a stale X
-    connection (Xvfb was restarted), and the next session must rebind to
-    the display instead of failing forever on the cached module.
-    """
-    _reset_pyautogui()
-
-
-async def _human_idle(seconds: float, *, radius_x: int = 90, radius_y: int = 60) -> None:
+async def _human_idle(
+    pointer: _XPointer,
+    seconds: float,
+    *,
+    radius_x: int = 90,
+    radius_y: int = 60,
+) -> None:
     """Linger like a human: idle micro-movements instead of a frozen pointer.
 
     Real hands keep making small corrections while the eyes read; a
@@ -217,9 +311,7 @@ async def _human_idle(seconds: float, *, radius_x: int = 90, radius_y: int = 60)
     own tell. Splits the pause into short Bezier drifts around the
     current position with still gaps between them.
     """
-    pyautogui = _get_pyautogui()
-    pos = pyautogui.position()
-    anchor = (int(pos.x), int(pos.y))
+    anchor = pointer.position()
     deadline = time.monotonic() + max(0.0, seconds)
     while True:
         remaining = deadline - time.monotonic()
@@ -233,23 +325,21 @@ async def _human_idle(seconds: float, *, radius_x: int = 90, radius_y: int = 60)
             anchor[1] + random.randint(-radius_y, radius_y),  # noqa: S311
         )
         steps = random.randint(8, 25)  # noqa: S311 -- short drift
-        await human_like_real_mouse_move(anchor, target, steps=steps)
+        await human_like_real_mouse_move(pointer, anchor, target, steps=steps)
 
 
-async def _human_click(x: int, y: int) -> None:
+async def _human_click(pointer: _XPointer, x: int, y: int) -> None:
     """Bezier-move the pointer to (x, y), hover, then press and release."""
-    pyautogui = _get_pyautogui()
-    start = pyautogui.position()
-    start = (int(start.x), int(start.y))
+    start = pointer.position()
     if start != (x, y):
-        await human_like_real_mouse_move(start, (x, y))
+        await human_like_real_mouse_move(pointer, start, (x, y))
     await asyncio.sleep(random.uniform(0.08, 0.3))  # noqa: S311 -- hover
-    pyautogui.mouseDown(_pause=False)
+    pointer.mouse_down()
     await asyncio.sleep(random.uniform(0.04, 0.12))  # noqa: S311 -- press
-    pyautogui.mouseUp(_pause=False)
+    pointer.mouse_up()
 
 
-async def _human_type(page, text: str) -> None:
+async def _human_type(page, text: str, pointer: _XPointer) -> None:
     """Type ``text`` on the real keyboard with human cadence.
 
     Fast typists alternate short bursts of quick keys with slower keys and
@@ -260,11 +350,10 @@ async def _human_type(page, text: str) -> None:
     as a single page-level key event instead of aborting the session (the
     page sees a normal trusted key event either way).
     """
-    pyautogui = _get_pyautogui()
     burst = 0
     for ch in text:
         try:
-            pyautogui.write(ch, _pause=False)
+            pointer.write(ch)
         except Exception:  # pylint: disable=broad-except
             logger.debug('human search: %r not on the X keymap, page-level key', ch)
             await page.keyboard.type(ch, delay=0)
@@ -285,7 +374,9 @@ async def _human_type(page, text: str) -> None:
             await asyncio.sleep(random.uniform(0.15, 0.45))  # noqa: S311 -- pause
 
 
-async def _to_screen(page, x: float, y: float) -> tuple[int, int]:
+async def _to_screen(
+    page, pointer: _XPointer, x: float, y: float
+) -> tuple[int, int]:
     """Map page (viewport) coordinates to screen coordinates.
 
     Reads the window's screen origin and chrome size from JS, so the math
@@ -298,10 +389,10 @@ async def _to_screen(page, x: float, y: float) -> tuple[int, int]:
     )
     vx = geo['sx'] + (geo['ow'] - geo['iw']) // 2
     vy = geo['sy'] + (geo['oh'] - geo['ih'])
-    return _clamp(vx + x, vy + y)
+    return _clamp(pointer, vx + x, vy + y)
 
 
-async def _human_click_locator(locator) -> bool:
+async def _human_click_locator(locator, pointer: _XPointer) -> bool:
     """Click a Playwright locator with the real mouse. False if invisible."""
     try:
         box = await locator.bounding_box()
@@ -311,10 +402,11 @@ async def _human_click_locator(locator) -> bool:
         return False
     x, y = await _to_screen(
         locator.page,
+        pointer,
         box['x'] + box['width'] / 2 + random.uniform(-2, 2),  # noqa: S311
         box['y'] + box['height'] / 2 + random.uniform(-2, 2),  # noqa: S311
     )
-    await _human_click(x, y)
+    await _human_click(pointer, x, y)
     return True
 
 
@@ -331,24 +423,30 @@ async def _find_visible(page, selectors: tuple[str, ...]):
 
 
 @asynccontextmanager
-async def human_session():
-    """Serialize human input across the browser pool (one X pointer)."""
-    async with _HUMAN_LOCK:
-        yield
+async def human_session(display: str | None):
+    """Bind a human input session to the lane's X display, as ``pointer``.
+
+    Every lane has its own display and pointer: sessions on different
+    lanes run concurrently and cannot interfere, so there is no lock.
+    Raises :py:class:`HumanInputError` when the lane is headless or its
+    display refuses the connection.
+    """
+    if not display:
+        raise HumanInputError('no X display for human input (headless lane)')
+    yield _XPointer(display)
 
 
-async def human_search_on_page(page, query: str) -> bool:
+async def human_search_on_page(page, query: str, pointer: _XPointer) -> bool:
     """Run a search on an already-open provider page like a human would.
 
     Scans the page for a moment, clicks the search box, types the query,
     then clicks the search button (Enter as fallback). Returns False when
     the page has no visible search box.
     """
-    pyautogui = _get_pyautogui()
     await page.bring_to_front()
     # orient: scan the page, hand drifting near the mouse, before reaching
     # for the search box
-    await _human_idle(random.uniform(0.4, 1.3))  # noqa: S311
+    await _human_idle(pointer, random.uniform(0.4, 1.3))  # noqa: S311
     input_loc = await _find_visible(page, _SEARCH_INPUT_SELECTORS)
     if input_loc is None:
         logger.debug('human search: no search box found on %s', page.url)
@@ -358,23 +456,25 @@ async def human_search_on_page(page, query: str) -> bool:
     except Exception:  # pylint: disable=broad-except
         pass
 
-    if not await _human_click_locator(input_loc):
+    if not await _human_click_locator(input_loc, pointer):
         return False
 
-    await _human_type(page, query)
+    await _human_type(page, query, pointer)
     # proofread what was typed before firing the search; the hand rests
     # near the box, so the drift stays tight
-    await _human_idle(random.uniform(0.4, 1.4), radius_x=40, radius_y=25)  # noqa: S311
+    await _human_idle(
+        pointer, random.uniform(0.4, 1.4), radius_x=40, radius_y=25  # noqa: S311
+    )
 
     button_loc = await _find_visible(page, _SEARCH_BUTTON_SELECTORS)
     if button_loc is not None:
-        await _human_click_locator(button_loc)
+        await _human_click_locator(button_loc, pointer)
     else:
-        pyautogui.press('enter', _pause=False)
+        pointer.press('enter')
     return True
 
 
-async def human_read_results(page) -> None:
+async def human_read_results(page, pointer: _XPointer) -> None:
     """Behave like a human scanning a fresh results page.
 
     Dwell on the page with idle hand drift, give the results list a small
@@ -382,18 +482,19 @@ async def human_read_results(page) -> None:
     downward, then settle. This is also the window in which the page
     finishes loading lazy content before the DOM is captured.
     """
-    pyautogui = _get_pyautogui()
-    await _human_idle(random.uniform(1.2, 2.8))  # noqa: S311 -- first look
-    pyautogui.scroll(-random.randint(2, 4))  # noqa: S311 -- scan down a bit
-    pos = pyautogui.position()
-    follow_y = int(pos.y) + random.randint(60, 160)  # noqa: S311 -- eyes follow
+    await _human_idle(pointer, random.uniform(1.2, 2.8))  # noqa: S311 -- first look
+    pointer.scroll(-random.randint(2, 4))  # noqa: S311 -- scan down a bit
+    pos_x, pos_y = pointer.position()
+    follow_y = pos_y + random.randint(60, 160)  # noqa: S311 -- eyes follow
     await human_like_real_mouse_move(
-        (int(pos.x), int(pos.y)), (int(pos.x), follow_y), steps=random.randint(10, 30)  # noqa: S311
+        pointer, (pos_x, pos_y), (pos_x, follow_y), steps=random.randint(10, 30)  # noqa: S311
     )
-    await _human_idle(random.uniform(0.5, 1.5))  # noqa: S311 -- settle
+    await _human_idle(pointer, random.uniform(0.5, 1.5))  # noqa: S311 -- settle
 
 
-async def human_solve_challenge(page, *, settle_ms: int = 6000) -> bool:
+async def human_solve_challenge(
+    page, pointer: _XPointer, *, settle_ms: int = 6000
+) -> bool:
     """Try to solve a challenge interstitial by clicking its checkbox.
 
     Looks into the known challenge iframes (Cloudflare Turnstile, hCaptcha,
@@ -425,7 +526,7 @@ async def human_solve_challenge(page, *, settle_ms: int = 6000) -> bool:
             except Exception:  # pylint: disable=broad-except
                 continue
             logger.info('human input: clicking challenge checkbox (%s)', frame_selector)
-            if await _human_click_locator(locator):
+            if await _human_click_locator(locator, pointer):
                 try:
                     await page.wait_for_load_state('networkidle', timeout=settle_ms)
                 except Exception:  # pylint: disable=broad-except

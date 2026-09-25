@@ -9,7 +9,7 @@ curl_cffi client. The browser is tuned to look like a user-started browser
 - a distro-packaged Chromium binary (not Playwright's bundled fork, which
   ships automation-friendly defaults detectors fingerprint)
 - Playwright's automation-flavored default launch args stripped
-- headed under an auto-started Xvfb display when possible (headless is a
+- headed under auto-started Xvfb displays, one per lane (headless is a
   strong bot signal even in "new" headless mode)
 - UA and Client Hints derived from the real binary version, and a page-side
   init script aligning ``navigator.platform``, WebGL vendor/renderer,
@@ -84,10 +84,14 @@ _CHROMIUM_CANDIDATE_PATHS = (
     "/usr/bin/google-chrome",
 )
 
-_XVFB_DISPLAY = ":99"
+_XVFB_BASE_DISPLAY = 99
 _XVFB_GEOMETRY = "1440x900x24"
 
-_xvfb_process = None
+# One Xvfb per pool lane. Lanes on separate displays have separate X
+# pointers: a lane's simulated clicks can never land in another lane's
+# window, which is exactly what happens when headed windows stack on one
+# display with no window manager (the topmost window gets the click).
+_xvfb_processes: dict[str, subprocess.Popen] = {}
 _xvfb_lock = threading.Lock()
 
 
@@ -106,14 +110,18 @@ def _discover_chromium():
     return None
 
 
-def _cleanup_stale_x_locks():
+def _lane_display_number(lane_index: int) -> int:
+    """X display number assigned to a pool lane (:99, :100, ...)."""
+    return _XVFB_BASE_DISPLAY + max(0, lane_index)
+
+
+def _cleanup_stale_x_locks(display_number: int) -> None:
     """Remove X lock/socket leftovers from a previous container run.
 
     The container filesystem survives restarts while processes do not: a
     stale lock for the display makes a freshly started Xvfb exit at once,
     and a stale socket then looks like a working display.
     """
-    display_number = _XVFB_DISPLAY.lstrip(":")
     stale_paths = (
         f"/tmp/.X{display_number}-lock",  # noqa: S108
         f"/tmp/.X11-unix/X{display_number}",  # noqa: S108
@@ -130,7 +138,8 @@ def _cleanup_stale_x_locks():
 def _bootstrap_xauth():
     """Make the Xvfb display connectable for python-xlib clients.
 
-    Xvfb runs without access control, but python-xlib (pyautogui) still
+    Xvfb runs without access control, but python-xlib (the human input
+    layer) still
     tries to read an authority file and hard-fails when ``~/.Xauthority``
     does not exist. An empty file satisfies it.
     """
@@ -150,29 +159,36 @@ def _bootstrap_xauth():
         logger.warning("Could not create an empty Xauthority file at %s", xauth_path)
 
 
-def ensure_display():
-    """Return an X display for a headed browser, starting Xvfb if needed.
+def ensure_display(lane_index: int = 0):
+    """Return the X display for pool lane ``lane_index``, starting Xvfb.
+
+    Every lane gets its own display (:99, :100, ...), started on first use
+    and reused while it lives. A display provided by the operator via
+    ``$DISPLAY`` (e.g. a dev desktop) serves lane 0 only: the pool needs
+    one display per lane and may not steal the operator's.
 
     Returns None when headed mode is impossible, in which case the caller
     falls back to headless.
     """
-    global _xvfb_process
-    existing_display = os.environ.get("DISPLAY")
-    if existing_display:
-        return existing_display
+    if lane_index == 0:
+        existing_display = os.environ.get("DISPLAY")
+        if existing_display:
+            return existing_display
+    display = f":{_lane_display_number(lane_index)}"
     with _xvfb_lock:
-        if _xvfb_process is not None and _xvfb_process.poll() is None:
-            return _XVFB_DISPLAY
+        process = _xvfb_processes.get(display)
+        if process is not None and process.poll() is None:
+            return display
         xvfb = shutil.which("Xvfb")
         if xvfb is None:
             return None
         try:
             os.makedirs("/tmp/.X11-unix", exist_ok=True)  # noqa: S108
-            _cleanup_stale_x_locks()
-            _xvfb_process = subprocess.Popen(  # pylint: disable=consider-using-with
+            _cleanup_stale_x_locks(_lane_display_number(lane_index))
+            process = subprocess.Popen(  # pylint: disable=consider-using-with
                 [
                     xvfb,
-                    _XVFB_DISPLAY,
+                    display,
                     "-screen",
                     "0",
                     _XVFB_GEOMETRY,
@@ -187,27 +203,28 @@ def ensure_display():
             return None
         # Wait for a live process AND a fresh socket: a leftover socket from
         # a stopped X server must not count as a working display.
-        socket_path = f"/tmp/.X11-unix/X{_XVFB_DISPLAY.lstrip(':')}"  # noqa: S108
+        socket_path = f"/tmp/.X11-unix/X{display.lstrip(':')}"  # noqa: S108
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
-            if _xvfb_process.poll() is not None:
+            if process.poll() is not None:
                 break
             if os.path.exists(socket_path):
                 logger.info(
-                    "Started Xvfb on %s for masqueraded browser fetches", _XVFB_DISPLAY
+                    "Started Xvfb on %s for lane %d", display, lane_index
                 )
                 _bootstrap_xauth()
-                return _XVFB_DISPLAY
+                _xvfb_processes[display] = process
+                return display
             time.sleep(0.1)
         logger.warning(
             "Xvfb on %s did not come up; falling back to headless browser",
-            _XVFB_DISPLAY,
+            display,
         )
         try:
-            _xvfb_process.kill()
+            process.kill()
         except OSError:
             pass
-        _xvfb_process = None
+        _xvfb_processes.pop(display, None)
         return None
 
 
@@ -814,10 +831,17 @@ class BrowserResponse:
 
 
 class _Lane:
-    """One browser context serving one request at a time."""
+    """One browser process on its own X display, serving one request.
 
-    def __init__(self, context):
+    One browser per lane (not one browser with N contexts) is what makes
+    per-lane displays possible: a Chromium process binds a single display.
+    In exchange, a lane crash takes down only its own lane.
+    """
+
+    def __init__(self, browser, context, display: str | None):
+        self.browser = browser
         self.context = context
+        self.display = display
         self.lock = asyncio.Lock()
 
 
@@ -842,7 +866,6 @@ class BrowserFetchPool:
         self._lane_cycle: asyncio.Queue | None = None
         self._init_lock = asyncio.Lock()
         self._playwright = None
-        self._browser = None
         self._closed = False
 
     async def _init(self):
@@ -869,74 +892,20 @@ class BrowserFetchPool:
                     ", ".join(_CHROMIUM_CANDIDATE_PATHS),
                 )
 
-            display = await asyncio.get_running_loop().run_in_executor(
-                None, ensure_display
-            )
-            headed = display is not None
-            env = dict(os.environ)
-            if display:
-                env["DISPLAY"] = display
-
             try:
                 self._playwright = await async_playwright().start()
-                launch_kwargs = {
-                    "headless": not headed,
-                    "ignore_default_args": _OMIT_DEFAULT_ARGS,
-                    "args": _LAUNCH_ARGS,
-                    "env": env,
-                }
-                if executable_path:
-                    launch_kwargs["executable_path"] = executable_path
-                if self._proxy:
-                    launch_kwargs["proxy"] = {"server": self._proxy}
-                self._browser = await self._playwright.chromium.launch(**launch_kwargs)
-
-                chrome_full = self._browser.version  # e.g. "153.0.8010.52"
-                chrome_major = chrome_full.split(".", 1)[0]
-                user_agent = (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                    f"(KHTML, like Gecko) Chrome/{chrome_major}.0.0.0 Safari/537.36"
-                )
-                extra_headers = {
-                    # Accept-Language only: Chromium sets Accept and the
-                    # Sec-Fetch-* headers per request itself. Forcing
-                    # navigation headers at context level stamps
-                    # "Sec-Fetch-Dest: document" onto every script and XHR,
-                    # which is an egregious automation fingerprint.
-                    "Accept-Language": "en-US,en;q=0.9",
-                }
-                init_script = _stealth_init_script(chrome_major, chrome_full)
-                geo = await asyncio.get_running_loop().run_in_executor(
-                    None, _detect_ip_locale
-                )
-                extra_headers["Accept-Language"] = geo["accept_language"]
-
-                context_kwargs: dict = {
-                    "user_agent": user_agent,
-                    "viewport": {"width": 1440, "height": 900},
-                    "locale": geo["locale"],
-                    "timezone_id": geo["timezone"],
-                    "has_touch": False,
-                    "java_script_enabled": True,
-                    "color_scheme": "light",
-                    "ignore_https_errors": not self._verify,
-                    "extra_http_headers": extra_headers,
-                }
-                if geo["geolocation"]:
-                    context_kwargs["geolocation"] = geo["geolocation"]
-
-                for _ in range(self._pool_size):
-                    context = await self._browser.new_context(**context_kwargs)
-                    await context.add_init_script(init_script)
-                    self._lanes.append(_Lane(context))
+                for lane_index in range(self._pool_size):
+                    self._lanes.append(
+                        await self._launch_lane(lane_index, executable_path)
+                    )
                 self._lane_cycle = asyncio.Queue()
                 for lane in self._lanes:
                     self._lane_cycle.put_nowait(lane)
                 logger.info(
-                    "Browser fetch pool up: %d lane(s), chromium=%s, headed=%s",
+                    "Browser fetch pool up: %d lane(s) on displays %s, chromium=%s",
                     len(self._lanes),
-                    chrome_full,
-                    headed,
+                    ",".join(lane.display or "headless" for lane in self._lanes),
+                    self._lanes[0].browser.version,
                 )
             except Exception as e:
                 # Stop playwright before re-raising: its node driver process
@@ -944,8 +913,64 @@ class BrowserFetchPool:
                 await self._shutdown_browser()
                 raise BrowserFetchError(f"browser pool init failed: {e}") from e
 
+    async def _launch_lane(self, lane_index: int, executable_path: str | None) -> _Lane:
+        """Launch one lane: its own browser process on its own X display."""
+        loop = asyncio.get_running_loop()
+        display = await loop.run_in_executor(None, ensure_display, lane_index)
+        env = dict(os.environ)
+        if display:
+            env["DISPLAY"] = display
+        launch_kwargs = {
+            "headless": display is None,
+            "ignore_default_args": _OMIT_DEFAULT_ARGS,
+            "args": _LAUNCH_ARGS,
+            "env": env,
+        }
+        if executable_path:
+            launch_kwargs["executable_path"] = executable_path
+        if self._proxy:
+            launch_kwargs["proxy"] = {"server": self._proxy}
+        browser = await self._playwright.chromium.launch(**launch_kwargs)
+        geo = await loop.run_in_executor(None, _detect_ip_locale)
+        chrome_full = browser.version  # e.g. "153.0.8010.52"
+        chrome_major = chrome_full.split(".", 1)[0]
+        context = await browser.new_context(
+            **self._context_kwargs(geo, chrome_major)
+        )
+        await context.add_init_script(_stealth_init_script(chrome_major, chrome_full))
+        return _Lane(browser, context, display)
+
+    def _context_kwargs(self, geo: dict, chrome_major: str) -> dict:
+        """Context options matching the IP-derived identity and binary."""
+        user_agent = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            f"(KHTML, like Gecko) Chrome/{chrome_major}.0.0.0 Safari/537.36"
+        )
+        extra_headers = {
+            # Accept-Language only: Chromium sets Accept and the
+            # Sec-Fetch-* headers per request itself. Forcing
+            # navigation headers at context level stamps
+            # "Sec-Fetch-Dest: document" onto every script and XHR,
+            # which is an egregious automation fingerprint.
+            "Accept-Language": geo["accept_language"],
+        }
+        context_kwargs: dict = {
+            "user_agent": user_agent,
+            "viewport": {"width": 1440, "height": 900},
+            "locale": geo["locale"],
+            "timezone_id": geo["timezone"],
+            "has_touch": False,
+            "java_script_enabled": True,
+            "color_scheme": "light",
+            "ignore_https_errors": not self._verify,
+            "extra_http_headers": extra_headers,
+        }
+        if geo["geolocation"]:
+            context_kwargs["geolocation"] = geo["geolocation"]
+        return context_kwargs
+
     async def _shutdown_browser(self):
-        """Tear down lanes, browser and playwright, terminating the driver.
+        """Tear down lanes, browsers and playwright, terminating the driver.
 
         Called on close and after a failed launch; without the explicit
         playwright stop the node driver process leaks (about 130 MiB each).
@@ -955,14 +980,12 @@ class BrowserFetchPool:
                 await lane.context.close()
             except Exception:  # pylint: disable=broad-except
                 pass
-        self._lanes.clear()
-        self._lane_cycle = None
-        if self._browser is not None:
             try:
-                await self._browser.close()
+                await lane.browser.close()
             except Exception:  # pylint: disable=broad-except
                 pass
-            self._browser = None
+        self._lanes.clear()
+        self._lane_cycle = None
         if self._playwright is not None:
             try:
                 await self._playwright.stop()
@@ -971,20 +994,42 @@ class BrowserFetchPool:
             self._playwright = None
 
     async def _ensure_browser_alive(self):
-        """Restart the browser after a crash instead of failing every fetch.
+        """Restart lanes whose browser process died after a crash.
 
-        A dead browser process leaves the lane contexts unusable while
-        ``_lanes`` still looks initialized: without this check every fetch
+        A dead browser process leaves its lane unusable while ``_lanes``
+        still looks initialized: without this check every fetch on the lane
         keeps raising TargetClosedError until the container is restarted.
+        Only affected lanes restart -- one crashed lane must not take down
+        the whole pool.
         """
-        if self._browser is not None and self._browser.is_connected():
+        if all(self._lane_is_alive(lane) for lane in self._lanes):
             return
         async with self._init_lock:
-            if self._browser is not None and self._browser.is_connected():
-                return
-            logger.warning("Browser process is gone; restarting the fetch pool")
-            await self._shutdown_browser()
-        await self._init()
+            for lane in self._lanes:
+                if self._lane_is_alive(lane):
+                    continue
+                logger.warning("Lane's browser process is gone; restarting the lane")
+                await self._restart_lane(lane)
+
+    @staticmethod
+    def _lane_is_alive(lane: _Lane) -> bool:
+        return lane.browser is not None and lane.browser.is_connected()
+
+    async def _restart_lane(self, lane: _Lane) -> None:
+        """Rebuild a lane in place: the lane cycle queue holds this object."""
+        lane_index = self._lanes.index(lane)
+        try:
+            await lane.context.close()
+        except Exception:  # pylint: disable=broad-except
+            pass
+        try:
+            await lane.browser.close()
+        except Exception:  # pylint: disable=broad-except
+            pass
+        replacement = await self._launch_lane(lane_index, _discover_chromium())
+        lane.browser = replacement.browser
+        lane.context = replacement.context
+        lane.display = replacement.display
 
     async def close(self):
         if self._closed:
@@ -1207,7 +1252,9 @@ class BrowserFetchPool:
             logger.warning("Render fallback failed for %s", url, exc_info=True)
             return None
 
-    async def _settle_after_search(self, page, timeout_s: float) -> None:
+    async def _settle_after_search(
+        self, page, pointer, timeout_s: float
+    ) -> None:
         """Wait out the post-click navigation, solving challenges on the way.
 
         The search submit navigates asynchronously: a ``networkidle`` or URL
@@ -1252,7 +1299,7 @@ class BrowserFetchPool:
                 if not _is_challenge_url(page.url):
                     return
             solved = await human_solve_challenge(
-                page, settle_ms=_BOT_CHALLENGE_GRACE_MS
+                page, pointer, settle_ms=_BOT_CHALLENGE_GRACE_MS
             )
             if not solved:
                 await asyncio.sleep(random.uniform(0.6, 1.2))  # noqa: S311
@@ -1284,7 +1331,6 @@ class BrowserFetchPool:
             human_search_on_page,
             human_session,
             human_solve_challenge,
-            reset_input,
         )
 
         if _is_api_url(url):
@@ -1301,7 +1347,10 @@ class BrowserFetchPool:
         rendered_html: bytes | None = None
         rendered_url = homepage
         try:
-            async with human_session():
+            # Each lane runs on its own X display with its own pointer, so
+            # human sessions on different lanes run concurrently -- no
+            # process-wide lock, no cross-window click theft.
+            async with human_session(lane.display) as pointer:
                 page = await lane.context.new_page()
                 try:
                     try:
@@ -1312,28 +1361,28 @@ class BrowserFetchPool:
                         logger.warning(
                             "human search: homepage %s failed, trying results URL", homepage
                         )
-                    await human_solve_challenge(page)
-                    if await human_search_on_page(page, query):
-                        await self._settle_after_search(page, timeout_s)
+                    await human_solve_challenge(page, pointer)
+                    if await human_search_on_page(page, query, pointer):
+                        await self._settle_after_search(page, pointer, timeout_s)
                     else:
                         # No usable search box: navigate the results URL so
                         # at least challenge JS runs in a real page.
                         await page.goto(
                             url, timeout=goto_timeout_ms, wait_until="domcontentloaded"
                         )
-                        await human_solve_challenge(page)
+                        await human_solve_challenge(page, pointer)
                         try:
                             await page.wait_for_load_state(
                                 "networkidle", timeout=_BOT_CHALLENGE_GRACE_MS
                             )
                         except Exception:  # pylint: disable=broad-except
                             pass
-                    await human_read_results(page)
+                    await human_read_results(page, pointer)
                     if _is_challenge_url(page.url):
                         # a flagged search can be routed to /sorry late, after
                         # the results already rendered
-                        await self._settle_after_search(page, timeout_s)
-                        await human_read_results(page)
+                        await self._settle_after_search(page, pointer, timeout_s)
+                        await human_read_results(page, pointer)
                     rendered_url = page.url
                     rendered_html = (await page.content()).encode(
                         "utf-8", errors="replace"
@@ -1342,9 +1391,6 @@ class BrowserFetchPool:
                     await page.close()
         except Exception:  # pylint: disable=broad-except
             logger.warning("human search fallback failed for %s", url, exc_info=True)
-            # the usual cause is a stale X connection: drop the cached
-            # pyautogui so the next session rebinds to the display
-            reset_input()
             return None
 
         if rendered_html:

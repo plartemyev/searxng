@@ -3,12 +3,14 @@
 
 # pylint: disable=missing-module-docstring
 
+import asyncio
 import json
 import time
 
 import pytest
 
 from searx.network import browser as browser_module
+from searx.network import human_input as human_input_module
 from searx.network.browser import (
     _geo_cache_read,
     _geo_cache_write,
@@ -247,3 +249,51 @@ def test_detect_ip_locale_uses_disk_cache_without_network(tmp_path, monkeypatch)
     assert locale['locale'] == 'th-TH'
     assert 'cache' in locale['source']
     assert browser_module._ip_locale_cache is locale
+
+
+# per-lane Xvfb displays: one pointer per lane, no cross-window click theft
+
+
+def test_lane_display_number_assigns_one_display_per_lane():
+    assert browser_module._lane_display_number(0) == 99
+    assert browser_module._lane_display_number(1) == 100
+    assert browser_module._lane_display_number(5) == 104
+
+
+def test_lane_display_number_never_negative():
+    assert browser_module._lane_display_number(-3) == 99
+
+
+def test_xpointer_key_entry_maps_latin1_through_the_keymap():
+    # no X server here: build the object without __init__ and feed a
+    # minimal keymap (keysym -> (keycode, shift required))
+    pointer = human_input_module._XPointer.__new__(human_input_module._XPointer)
+    pointer._keymap = {
+        0x61: (38, False),  # 'a'
+        0x41: (38, True),  # 'A' (shifted column of the same key)
+        0x21: (10, True),  # '!'
+        0x20: (65, False),  # space
+    }
+    assert pointer._key_entry('a') == (38, False)
+    assert pointer._key_entry('A') == (38, True)
+    assert pointer._key_entry('!') == (10, True)
+    assert pointer._key_entry(' ') == (65, False)
+
+
+def test_xpointer_key_entry_rejects_off_keymap_characters():
+    pointer = human_input_module._XPointer.__new__(human_input_module._XPointer)
+    pointer._keymap = {}
+    # non-Latin-1 (Thai) and multi-character input are not typable: the
+    # caller falls back to page-level key events
+    assert pointer._key_entry('\u0e01') is None
+    assert pointer._key_entry('ab') is None
+    assert pointer._key_entry('') is None
+
+
+def test_human_session_requires_a_display():
+    async def check():
+        with pytest.raises(human_input_module.HumanInputError):
+            async with human_input_module.human_session(None):
+                pass
+
+    asyncio.run(check())
