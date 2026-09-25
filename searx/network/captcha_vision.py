@@ -113,14 +113,16 @@ def grid_prompt(instruction: str, tile_count: int, rows: int, cols: int) -> str:
     """The prompt sent with a grid screenshot. Kept strict and small: local
     vision models follow short contracts far better than long ones."""
     return (
-        "You are solving an image CAPTCHA challenge.\n"
-        f"Instruction shown to the user: {instruction}\n"
+        "You are helping a person pass an image CAPTCHA challenge.\n"
+        f"Instruction shown to the user (may be in ANY language, often not English): {instruction}\n"
         f"The image shows a grid of {tile_count} tiles ({rows} rows x {cols} columns), "
         "numbered left-to-right, top-to-bottom starting at 0.\n"
-        "Select every tile that matches the instruction. Answer with strict JSON only, "
-        'no other text: {"tiles": [..], "action": "submit"}\n'
-        'Use "action": "skip" instead of "submit" when the instruction says there '
-        "might be none and no tile matches."
+        "Work out what object the instruction asks for, then select every tile that "
+        "contains that object. Look at each tile individually; a partly visible object "
+        "still counts. Answer with strict JSON only, no other text: "
+        '{"tiles": [..], "action": "submit"}\n'
+        'Use "action": "skip" only when the instruction says to click skip when none '
+        "are left AND no tile contains the object."
     )
 
 
