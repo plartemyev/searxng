@@ -890,6 +890,14 @@ async def _run_image_rounds(page, pointer, solver, max_rounds: int, found) -> bo
         if not clicked:
             logger.warning('human input: no VERIFY/SKIP button found in %s challenge', profile.name)
             return False
+        # TEMPORARY: post-selection state -- selected tiles show overlays
+        try:
+            post_png = await _iframe_screenshot(page, profile)
+            if post_png:
+                _debug_dump(profile.name + '_post', round_index, post_png, page.url)
+        except Exception:  # pylint: disable=broad-except
+            pass
+        logger.info('human input: pressed VERIFY for round %s, page %s', round_index, page.url)
 
         # wait out the round trip: the next image set replaces this one, or
         # the browser leaves the challenge page entirely
