@@ -12,6 +12,8 @@ the headed browser runs under (Xvfb, see searx.network.browser):
 - buttons are clicked after a human-scale hover pause and press duration
 - text is typed with human cadence: uneven keys, short fast bursts, and the
   occasional mid-word hesitation
+- lingering is not stillness: pauses and result reading keep the hand
+  making small idle drifts instead of freezing the pointer
 
 Coordinate spaces: Playwright boxes are page (viewport) coordinates while
 pyautogui needs screen coordinates. The mapping reads the window origin
@@ -207,6 +209,33 @@ def reset_input():
     _reset_pyautogui()
 
 
+async def _human_idle(seconds: float, *, radius_x: int = 90, radius_y: int = 60) -> None:
+    """Linger like a human: idle micro-movements instead of a frozen pointer.
+
+    Real hands keep making small corrections while the eyes read; a
+    pointer that freezes for whole seconds during an active page is its
+    own tell. Splits the pause into short Bezier drifts around the
+    current position with still gaps between them.
+    """
+    pyautogui = _get_pyautogui()
+    pos = pyautogui.position()
+    anchor = (int(pos.x), int(pos.y))
+    deadline = time.monotonic() + max(0.0, seconds)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.05:
+            return
+        if random.random() < 0.35:  # noqa: S311 -- stillness is human too
+            await asyncio.sleep(min(remaining, random.uniform(0.15, 0.5)))  # noqa: S311
+            continue
+        target = (
+            anchor[0] + random.randint(-radius_x, radius_x),  # noqa: S311
+            anchor[1] + random.randint(-radius_y, radius_y),  # noqa: S311
+        )
+        steps = random.randint(8, 25)  # noqa: S311 -- short drift
+        await human_like_real_mouse_move(anchor, target, steps=steps)
+
+
 async def _human_click(x: int, y: int) -> None:
     """Bezier-move the pointer to (x, y), hover, then press and release."""
     pyautogui = _get_pyautogui()
@@ -317,8 +346,9 @@ async def human_search_on_page(page, query: str) -> bool:
     """
     pyautogui = _get_pyautogui()
     await page.bring_to_front()
-    # orient: scan the page before reaching for the search box
-    await asyncio.sleep(random.uniform(0.4, 1.3))  # noqa: S311
+    # orient: scan the page, hand drifting near the mouse, before reaching
+    # for the search box
+    await _human_idle(random.uniform(0.4, 1.3))  # noqa: S311
     input_loc = await _find_visible(page, _SEARCH_INPUT_SELECTORS)
     if input_loc is None:
         logger.debug('human search: no search box found on %s', page.url)
@@ -332,8 +362,9 @@ async def human_search_on_page(page, query: str) -> bool:
         return False
 
     await _human_type(page, query)
-    # proofread what was typed before firing the search
-    await asyncio.sleep(random.uniform(0.4, 1.4))  # noqa: S311
+    # proofread what was typed before firing the search; the hand rests
+    # near the box, so the drift stays tight
+    await _human_idle(random.uniform(0.4, 1.4), radius_x=40, radius_y=25)  # noqa: S311
 
     button_loc = await _find_visible(page, _SEARCH_BUTTON_SELECTORS)
     if button_loc is not None:
@@ -346,14 +377,20 @@ async def human_search_on_page(page, query: str) -> bool:
 async def human_read_results(page) -> None:
     """Behave like a human scanning a fresh results page.
 
-    Dwell on the page, give the results list a small scroll with the real
-    mouse wheel, then settle. This is also the window in which the page
+    Dwell on the page with idle hand drift, give the results list a small
+    scroll with the real mouse wheel while the pointer follows the content
+    downward, then settle. This is also the window in which the page
     finishes loading lazy content before the DOM is captured.
     """
     pyautogui = _get_pyautogui()
-    await asyncio.sleep(random.uniform(1.2, 2.8))  # noqa: S311 -- first look
+    await _human_idle(random.uniform(1.2, 2.8))  # noqa: S311 -- first look
     pyautogui.scroll(-random.randint(2, 4))  # noqa: S311 -- scan down a bit
-    await asyncio.sleep(random.uniform(0.5, 1.5))  # noqa: S311 -- settle
+    pos = pyautogui.position()
+    follow_y = int(pos.y) + random.randint(60, 160)  # noqa: S311 -- eyes follow
+    await human_like_real_mouse_move(
+        (int(pos.x), int(pos.y)), (int(pos.x), follow_y), steps=random.randint(10, 30)  # noqa: S311
+    )
+    await _human_idle(random.uniform(0.5, 1.5))  # noqa: S311 -- settle
 
 
 async def human_solve_challenge(page, *, settle_ms: int = 6000) -> bool:
