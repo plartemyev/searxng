@@ -598,7 +598,9 @@ _IMAGE_GRID_PROFILES = (
         # the challenge photos are <img> elements streamed in per tile
         tile_img_selector="img[class*='rc-image-tile']",
         verify_selectors=('#recaptcha-verify-button',),
-        skip_selectors=('button:has-text("Skip")',),
+        # the verify button relabels itself (Verify / Skip in the UI
+        # language); an empty selection pressed on it acts as the skip
+        skip_selectors=(),
     ),
     _ImageGridProfile(
         name='hcaptcha',
@@ -715,6 +717,24 @@ async def _iframe_screenshot(page, profile: _ImageGridProfile) -> bytes | None:
     return None
 
 
+async def _tile_rects(frame_loc, profile: _ImageGridProfile, tile_count: int) -> list[list[int]] | None:
+    """The tiles' rectangles in iframe-viewport coordinates (the same space
+    as the widget screenshot), DOM order = row-major. None on any failure."""
+    tiles = frame_loc.locator(profile.tile_selector)
+    rects: list[list[int]] = []
+    for i in range(min(tile_count, 16)):
+        try:
+            rect = await tiles.nth(i).evaluate(
+                'el => (r => [r.x, r.y, r.width, r.height])(el.getBoundingClientRect())'
+            )
+        except Exception:  # pylint: disable=broad-except
+            return None
+        if not isinstance(rect, list) or len(rect) != 4 or rect[2] <= 1 or rect[3] <= 1:
+            return None
+        rects.append([int(rect[0]), int(rect[1]), int(rect[2]), int(rect[3])])
+    return rects
+
+
 async def _click_first_visible(frame_loc, selectors: tuple[str, ...], pointer) -> bool:
     """Click the first visible button among ``selectors`` with the real mouse."""
     for selector in selectors:
@@ -803,10 +823,29 @@ async def _run_image_rounds(page, pointer, solver, max_rounds: int, found) -> bo
             solver.describe(),
         )
         _debug_dump(profile.name, round_index, png, instruction, await _frame_html(frame_loc))
+        # presentation is decided by the tiles' own geometry: uniform grids
+        # of any dimension become row strips, irregular ones fall back to
+        # per-cell images, and DOM failures to the whole widget screenshot
+        rows, cols = _grid_shape(tile_count)
+        grid_images = None
+        try:
+            rects = await _tile_rects(frame_loc, profile, tile_count)
+            if rects:
+                # pylint: disable=import-outside-toplevel
+                from searx.network.captcha_vision import build_row_strips, crop_cells, derive_grid_layout
+
+                layout = derive_grid_layout(rects)
+                if layout is not None:
+                    rows, cols = layout
+                    grid_images = ("rows", build_row_strips(png, rects, cols))
+                else:
+                    grid_images = ("cells", crop_cells(png, rects))
+        except Exception:  # pylint: disable=broad-except
+            grid_images = None
         try:
             # blocking HTTP stays off the lane's event loop
             solution = await asyncio.to_thread(
-                solver.solve_image_grid, png, instruction, tile_count, rows, cols
+                solver.solve_grid, png, grid_images, instruction, tile_count, rows, cols
             )
         except Exception:  # pylint: disable=broad-except
             logger.warning(

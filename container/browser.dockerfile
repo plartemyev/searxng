@@ -5,7 +5,11 @@ FROM docker.io/library/python:3.13-slim
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends chromium xvfb ca-certificates python3-tk \
+       fonts-thai-tlwg \
     && rm -rf /var/lib/apt/lists/*
+# fonts-thai-tlwg: the pool's geo identity is th-TH, and challenge widgets
+# (reCAPTCHA /sorry) render their instruction in the interface language --
+# without Thai glyphs the widget screenshot shows tofu boxes instead of text
 
 # same paths / user convention as the official image
 ENV __SEARXNG_CONFIG_PATH=/etc/searxng \

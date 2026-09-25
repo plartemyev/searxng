@@ -305,6 +305,11 @@ SCHEMA: dict[str, t.Any] = {
             # Image sets solved per challenge before giving up (reCAPTCHA
             # often asks for two or three rounds in a row).
             'max_rounds': SettingsValue(int, 5),
+            # Samples per round decided by per-tile strict-majority quorum.
+            # Local vision models localize the right region reliably but
+            # flicker on single tiles between samples; more votes cost time
+            # (each is one model call) and buy click precision.
+            'votes': SettingsValue(int, 1),
             'temperature': SettingsValue(numbers.Real, 0.0),
             # generous ceiling: reasoning models spend tokens thinking before
             # writing the JSON answer, and truncation loses it entirely

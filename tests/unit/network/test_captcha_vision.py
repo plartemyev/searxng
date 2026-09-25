@@ -18,7 +18,7 @@ from searx.network.captcha_vision import (
     OpenAICompatVisionSolver,
     VisionSolverConfig,
     VisionSolverError,
-    grid_prompt,
+    widget_prompt,
 )
 
 # --------------------------------------------------------------------------
@@ -90,11 +90,11 @@ def test_chat_vision_falls_back_to_reasoning_field(fake_transport):
     fake_transport.responses = [
         {"choices": [{"message": {"content": "", "reasoning": 'thinking... {"tiles": [3], "action": "submit"}'}}]}
     ]
-    assert solver().chat_vision("p", b"img") == 'thinking... {"tiles": [3], "action": "submit"}'
+    assert solver().chat_vision("p", [b"img"]) == 'thinking... {"tiles": [3], "action": "submit"}'
 
 
-def test_grid_prompt_carries_instruction_and_contract():
-    prompt = grid_prompt("Select all squares with traffic lights", 9, 3, 3)
+def test_widget_prompt_carries_instruction_and_contract():
+    prompt = widget_prompt("Select all squares with traffic lights", 9, 3, 3)
     assert "traffic lights" in prompt
     assert "9 tiles (3 rows x 3 columns)" in prompt
     assert '"action"' in prompt and '"tiles"' in prompt
@@ -197,7 +197,7 @@ def solver(**overrides):
 
 
 def test_chat_vision_request_shape(fake_transport):
-    answer = solver(api_key="secret-key").chat_vision("find the red tiles", b"fakepng")
+    answer = solver(api_key="secret-key").chat_vision("find the red tiles", [b"fakepng"])
     assert answer == '{"tiles": [0], "action": "submit"}'
 
     post = FakeRequests.posts[-1]
@@ -220,7 +220,7 @@ def test_chat_vision_request_shape(fake_transport):
 def test_chat_vision_omits_empty_auth_and_context(fake_transport):
     fake_transport.responses = [completion("hi")]
     cfg = VisionSolverConfig(endpoint="http://x", model="m")
-    OpenAICompatVisionSolver(cfg).chat_vision("p", b"img")
+    OpenAICompatVisionSolver(cfg).chat_vision("p", [b"img"])
     payload = FakeRequests.posts[-1]["json"]
     assert "Authorization" not in FakeRequests.posts[-1]["headers"]
     assert "options" not in payload
@@ -229,7 +229,7 @@ def test_chat_vision_omits_empty_auth_and_context(fake_transport):
 def test_chat_vision_retries_once_then_succeeds(fake_transport, monkeypatch):
     monkeypatch.setattr(captcha_vision.time, "sleep", lambda s: None)
     fake_transport.responses = [RequestException("lan hiccup"), completion("ok")]
-    assert solver().chat_vision("p", b"img") == "ok"
+    assert solver().chat_vision("p", [b"img"]) == "ok"
     assert len(FakeRequests.posts) == 2
 
 
@@ -237,12 +237,12 @@ def test_chat_vision_raises_vision_error_when_endpoint_down(fake_transport, monk
     monkeypatch.setattr(captcha_vision.time, "sleep", lambda s: None)
     fake_transport.responses = [RequestException("down"), RequestException("down")]
     with pytest.raises(VisionSolverError):
-        solver().chat_vision("p", b"img")
+        solver().chat_vision("p", [b"img"])
 
 
 def test_solve_image_grid_parses_model_answer(fake_transport):
     fake_transport.responses = [completion('```json\n{"tiles": [0, 4, 8], "action": "submit"}\n```')]
-    solution = solver().solve_image_grid(b"gridpng", "select red", 9, 3, 3)
+    solution = solver().solve_grid(b"gridpng", None, "select red", 9, 3, 3)
     assert solution.tiles == (0, 4, 8)
     # the prompt the model saw describes the grid layout
     sent_prompt = FakeRequests.posts[-1]["json"]["messages"][0]["content"][0]["text"]
@@ -348,6 +348,10 @@ class FakeLocator:
 
     async def evaluate(self, script):
         # tile paint check: every polled img reports loaded
+        if "getBoundingClientRect" in script:
+            index = self.index or 0
+            col, row = index % 3, index // 3
+            return [40 + col * 70, 120 + row * 70, 60, 60]
         return True
 
     # Playwright-only interaction methods are deliberately ABSENT: if the
@@ -362,7 +366,8 @@ class FakeIframeLocator(FakeLocator):
         return self.page.world.grid_visible
 
     async def screenshot(self):
-        return b"fake-widget-png"
+        # a real (blank) PNG: the solver cuts row strips out of this image
+        return captcha_vision._png_encode(400, 580, 3, b"\x00" * (400 * 580 * 3))
 
 
 class FakeFrameLocator:
@@ -374,8 +379,6 @@ class FakeFrameLocator:
 
 
 class FakePage:
-    skip_verify = None  # wired only by the skip-button test
-
     def __init__(self, world):
         self.world = world
         self.evaluate_calls = 0
@@ -446,21 +449,6 @@ class ClickThroughLocator(FakeLocator):
         return await self._inner.count()
 
 
-def skip_click(world):
-    world.skip_clicks += 1
-    world.challenge = False
-    world.grid_visible = False
-    world.url = "https://www.google.com/search?q=test"
-
-
-class SkipFrameLocator(FakeFrameLocator):
-    def locator(self, css):
-        locator = super().locator(css)
-        if css == 'button:has-text("Skip")':
-            return ClickThroughLocator(locator, lambda: skip_click(self.page.world))
-        return locator
-
-
 class StubSolver:
     def __init__(self, solutions):
         self._solutions = list(solutions)
@@ -470,8 +458,17 @@ class StubSolver:
     def describe(self):
         return "stub @ http://stub"
 
-    def solve_image_grid(self, png, instruction, tile_count, rows, cols):
-        self.calls.append({"png": png, "instruction": instruction, "tile_count": tile_count, "rows": rows, "cols": cols})
+    def solve_grid(self, widget_png, grid_images, instruction, tile_count, rows, cols):
+        self.calls.append(
+            {
+                "widget_png": widget_png,
+                "grid_images": grid_images,
+                "instruction": instruction,
+                "tile_count": tile_count,
+                "rows": rows,
+                "cols": cols,
+            }
+        )
         solution = self._solutions.pop(0) if len(self._solutions) > 1 else self._solutions[0]
         if isinstance(solution, Exception):
             raise solution
@@ -510,6 +507,9 @@ def test_round_loop_clicks_tiles_and_submits_with_real_mouse(verifying_page, fas
         assert stub.calls[0]["tile_count"] == 9
         assert stub.calls[0]["rows"] == 3 and stub.calls[0]["cols"] == 3
         assert "traffic lights" in stub.calls[0]["instruction"]
+        # row strips were cut from the widget screenshot for the model
+        mode, strips = stub.calls[0]["grid_images"]
+        assert mode == "rows" and len(strips) == 3
 
     return asyncio.run(run())
 
@@ -538,19 +538,19 @@ def test_rounds_exhausted_returns_false(fast_pacing):
     return asyncio.run(run())
 
 
-def test_skip_action_presses_skip_button(fast_pacing):
+def test_empty_selection_presses_verify_as_skip(fast_pacing):
     async def run():
+        # reCAPTCHA has no separate skip button: the verify button relabels
+        # itself, and an empty selection pressed on it acts as the skip
         world = FakeWorld(rounds=1)
         page = FakePage(world)
-        page.skip_verify = lambda: skip_click(world)
-        page.frame_locator = lambda selector: SkipFrameLocator(page)  # type: ignore[method-assign]
+        page.frame_locator = lambda selector: VerifyingFrameLocator(page)  # type: ignore[method-assign]
         stub = StubSolver([captcha_vision.GridSolution(tiles=(), action="skip")])
         pointer = RecorderPointer()
         solved = await human_input.human_solve_image_challenge(page, pointer, solver=stub, max_rounds=3)
         assert solved is True
-        assert pointer.presses == 1  # only the SKIP press, no tile clicks
-        assert world.skip_clicks == 1
-        assert world.verify_clicks == 0
+        assert pointer.presses == 1  # only the VERIFY (= skip) press
+        assert world.verify_clicks == 1
 
     return asyncio.run(run())
 
@@ -598,6 +598,239 @@ def test_clear_challenge_false_on_plain_page(page_without_grid, fast_pacing):
         assert pointer.presses == 0
 
     return asyncio.run(run())
+
+
+# --------------------------------------------------------------------------
+# PNG cropping and row strips
+
+
+def _solid_png(width, height, bpp=3, seed=17):
+    pixels = bytearray()
+    for y in range(height):
+        for x in range(width):
+            if bpp == 4:
+                pixels += bytes(((x * 7 + seed) % 256, (y * 5 + seed) % 256, 30, 255))
+            else:
+                pixels += bytes(((x * 7 + seed) % 256, (y * 5 + seed) % 256, 30))
+    return captcha_vision._png_encode(width, height, bpp, bytes(pixels))
+
+
+def test_png_crop_roundtrip():
+    src = _solid_png(40, 30)
+    cropped = captcha_vision.crop_png(src, 10, 5, 20, 12)
+    w, h, bpp, pixels = captcha_vision._png_decode(cropped)
+    assert (w, h, bpp) == (20, 12, 3)
+    # corner pixel must match the source at (10, 5)
+    src_w, _, _, src_px = captcha_vision._png_decode(src)
+    assert pixels[0:3] == src_px[(5 * src_w + 10) * 3:(5 * src_w + 10) * 3 + 3]
+
+
+def test_png_crop_clamps_and_rejects_bad_input():
+    src = _solid_png(40, 30)
+    assert captcha_vision.crop_png(src, 35, 28, 100, 100) is not None
+    with pytest.raises(captcha_vision.VisionSolverError):
+        captcha_vision.crop_png(src, 45, 10, 10, 10)
+    with pytest.raises(captcha_vision.VisionSolverError):
+        captcha_vision._png_decode(b"not a png")
+
+
+def test_png_roundtrip_survives_paeth_filters():
+    # a gradient image filtered with paeth per row must decode back exactly:
+    # the test applies the filter (the encoder in the module writes filter 0)
+    def chunk(tag, data):
+        body = tag + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+
+    pixels = bytearray()
+    for y in range(24):
+        for x in range(32):
+            pixels += bytes(((x * y) % 256, (x + y) % 256, (x ^ y) % 256))
+    stride = 32 * 3
+    rows = bytearray()
+    previous = bytes(stride)
+    for y in range(24):
+        line = pixels[y * stride:(y + 1) * stride]
+        filtered = bytearray()
+        for i in range(stride):
+            a = line[i - 3] if i >= 3 else 0
+            b = previous[i]
+            c = previous[i - 3] if i >= 3 else 0
+            p = a + b - c
+            pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+            predictor = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+            filtered.append((line[i] - predictor) & 0xFF)
+        rows += b"\x04" + bytes(filtered)
+        previous = line
+    header = struct.pack(">IIBBBBB", 32, 24, 8, 2, 0, 0, 0)
+    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header)
+           + chunk(b"IDAT", zlib.compress(bytes(rows), 0)) + chunk(b"IEND", b""))
+    w, h, _, out = captcha_vision._png_decode(png)
+    assert (w, h) == (32, 24)
+    assert out == bytes(pixels)
+
+
+def test_stitch_horizontal():
+    left, right = _solid_png(10, 8, seed=1), _solid_png(10, 8, seed=200)
+    strip = captcha_vision.stitch_horizontal([left, right])
+    w, h, _, pixels = captcha_vision._png_decode(strip)
+    assert (w, h) == (20, 8)
+    _, _, _, left_px = captcha_vision._png_decode(left)
+    _, _, _, right_px = captcha_vision._png_decode(right)
+    assert pixels[0:3] == left_px[0:3]
+    assert pixels[(0 * w + 10) * 3:(0 * w + 10) * 3 + 3] == right_px[0:3]
+
+
+def test_build_row_strips_layout():
+    # 2x2 grid of 30x20 tiles starting at (5, 5) on a bigger widget
+    widget = _solid_png(90, 70, seed=9)
+    rects = [
+        [5, 5, 30, 20], [35, 5, 30, 20],
+        [5, 25, 30, 20], [35, 25, 30, 20],
+    ]
+    strips = captcha_vision.build_row_strips(widget, rects, cols=2)
+    assert len(strips) == 2
+    w, h, _, _ = captcha_vision._png_decode(strips[0])
+    # each strip is one row: two tiles side by side (inset 3 trims 6px total)
+    assert w == 2 * (30 - 6)
+    assert h == 20 - 6
+    with pytest.raises(captcha_vision.VisionSolverError):
+        captcha_vision.build_row_strips(widget, rects[:-1], cols=2)
+
+
+# --------------------------------------------------------------------------
+# adaptive grid layout: any reasonable dimension, from the tiles' geometry
+
+
+def test_derive_grid_layout_recognizes_common_dimensions():
+    def rects_for(rows, cols, tile=70, origin=40):
+        return [
+            [origin + c * tile, origin + r * tile, tile - 10, tile - 10]
+            for r in range(rows)
+            for c in range(cols)
+        ]
+
+    assert captcha_vision.derive_grid_layout(rects_for(3, 3)) == (3, 3)
+    assert captcha_vision.derive_grid_layout(rects_for(4, 4)) == (4, 4)
+    assert captcha_vision.derive_grid_layout(rects_for(2, 2)) == (2, 2)
+    assert captcha_vision.derive_grid_layout(rects_for(3, 4)) == (3, 4)
+    assert captcha_vision.derive_grid_layout(rects_for(5, 5)) == (5, 5)
+
+
+def test_derive_grid_layout_rejects_irregular_layouts():
+    # a missing tile breaks the uniform grid
+    rects_3x3 = [[40 + c * 70, 40 + r * 70, 60, 60] for r in range(3) for c in range(3)]
+    assert captcha_vision.derive_grid_layout(rects_3x3[:-1]) is None
+    assert captcha_vision.derive_grid_layout([]) is None
+
+
+def test_cells_fallback_for_irregular_layouts():
+    # an L-shaped layout (5 tiles) cannot form a uniform grid: per-cell images
+    widget = _solid_png(300, 300, seed=3)
+    rects = [[10, 10, 60, 60], [80, 10, 60, 60], [10, 80, 60, 60], [80, 80, 60, 60], [150, 10, 60, 60]]
+    assert captcha_vision.derive_grid_layout(rects) is None
+    cells = captcha_vision.crop_cells(widget, rects)
+    assert len(cells) == 5
+    w, h, _, _ = captcha_vision._png_decode(cells[0])
+    assert (w, h) == (54, 54)
+
+
+def test_cells_mode_quorum(fake_transport, monkeypatch):
+    cfg = VisionSolverConfig(endpoint="http://x", model="m", votes=3)
+    solver_cells = OpenAICompatVisionSolver(cfg)
+    answers = ['{"tiles": [0, 4]}', '{"tiles": [4]}', '{"tiles": [4, 8]}']
+    monkeypatch.setattr(solver_cells, "chat_vision", lambda p, i, temperature=None: answers.pop(0))
+    cells = [f"cell{i}".encode() for i in range(9)]
+    solution = solver_cells.solve_grid(b"widget", ("cells", cells), "select bike", 9, 3, 3)
+    # tile 4 reaches 3/3; tile 0 and 8 stay at 1/3 (below the 2-vote quorum)
+    assert solution.tiles == (4,)
+    assert solution.action == "submit"
+
+
+# --------------------------------------------------------------------------
+# strip answer parsing and the quorum
+
+
+def test_parse_strip_solution_rows_to_indices():
+    solution = OpenAICompatVisionSolver.parse_strip_solution('{"rows": [[2], [], [0, 1], []]}', 4, 4)
+    assert solution.tiles == (2, 8, 9)
+    assert solution.action == "submit"
+
+
+def test_parse_strip_solution_drops_out_of_range_positions():
+    solution = OpenAICompatVisionSolver.parse_strip_solution('{"rows": [[0, 4], [0, 99], []]}', 3, 3)
+    assert solution.tiles == (0, 3)
+
+
+def test_parse_strip_solution_empty_means_skip():
+    solution = OpenAICompatVisionSolver.parse_strip_solution('{"rows": [[], [], []]}', 3, 3)
+    assert solution.tiles == ()
+    assert solution.action == "skip"
+
+
+def test_parse_strip_solution_flat_tiles_fallback():
+    solution = OpenAICompatVisionSolver.parse_strip_solution('{"tiles": [4, 5]}', 3, 3)
+    assert solution.tiles == (4, 5)
+
+
+def test_parse_strip_solution_no_json_raises():
+    with pytest.raises(captcha_vision.VisionSolverError):
+        OpenAICompatVisionSolver.parse_strip_solution("I see a motorcycle somewhere", 3, 3)
+
+
+def test_quorum_keeps_majority_tiles(fake_transport, monkeypatch):
+    cfg = VisionSolverConfig(endpoint="http://x", model="m", votes=5)
+    solver_votes = OpenAICompatVisionSolver(cfg)
+    answers = [
+        '{"rows": [[1, 2], [], []]}',
+        '{"rows": [[1, 2], [], []]}',
+        '{"rows": [[1], [], []]}',
+        '{"rows": [[2], [], []]}',
+        '{"rows": [[1, 2], [], []]}',
+    ]
+    calls = {"n": 0}
+
+    def fake_chat(prompt, images, temperature=None):
+        answer = answers[calls["n"]]
+        calls["n"] += 1
+        # votes must sample at rising temperatures after the first
+        if calls["n"] == 1:
+            assert temperature is None or temperature == 0.0
+        else:
+            assert temperature >= 0.25
+        return answer
+
+    monkeypatch.setattr(solver_votes, "chat_vision", fake_chat)
+    strips = [b"row0", b"row1", b"row2"]
+    solution = solver_votes.solve_grid(b"widget", ("rows", strips), "select bike", 9, 3, 3)
+    assert calls["n"] == 5
+    # tile 1: 4 votes, tile 2: 4 votes -> strict majority; nothing else
+    assert solution.tiles == (1, 2)
+    assert solution.action == "submit"
+
+
+def test_quorum_all_disagreement_becomes_skip(fake_transport, monkeypatch):
+    cfg = VisionSolverConfig(endpoint="http://x", model="m", votes=3)
+    solver_votes = OpenAICompatVisionSolver(cfg)
+    answers = ['{"rows": [[0], [], []]}', '{"rows": [[1], [], []]}', '{"rows": [[2], [], []]}']
+    monkeypatch.setattr(solver_votes, "chat_vision", lambda p, i, temperature=None: answers.pop(0))
+    solution = solver_votes.solve_grid(b"widget", ("rows", [b"r0", b"r1", b"r2"]), "select", 9, 3, 3)
+    assert solution.tiles == ()
+    assert solution.action == "skip"
+
+
+def test_quorum_skips_unusable_votes(fake_transport, monkeypatch):
+    cfg = VisionSolverConfig(endpoint="http://x", model="m", votes=4)
+    solver_votes = OpenAICompatVisionSolver(cfg)
+    answers = [
+        "complete nonsense without any json",
+        '{"rows": [[0, 2], [], []]}',
+        "also unusable",
+        '{"rows": [[0, 2], [], []]}',
+    ]
+    monkeypatch.setattr(solver_votes, "chat_vision", lambda p, i, temperature=None: answers.pop(0))
+    solution = solver_votes.solve_grid(b"widget", ("rows", [b"r0", b"r1", b"r2"]), "select", 9, 3, 3)
+    # threshold is a majority of the 2 usable votes
+    assert solution.tiles == (0, 2)
 
 
 # --------------------------------------------------------------------------
@@ -650,8 +883,10 @@ def test_live_endpoint_solves_synthetic_grid():
         timeout=360.0,
     )
     solver_live = OpenAICompatVisionSolver(cfg)
-    solution = solver_live.solve_image_grid(
-        _synthetic_grid_png(), "Select all squares with red color", 9, 3, 3
+    widget = _synthetic_grid_png()
+    cells = [captcha_vision.crop_png(widget, 2 + col * 64, 2 + row * 64, 60, 60) for row in range(3) for col in range(3)]
+    solution = solver_live.solve_grid(
+        widget, ("cells", cells), "Select all squares with red color", 9, 3, 3
     )
     assert solution.tiles, "model returned no tiles"
     assert all(0 <= t < 9 for t in solution.tiles)
