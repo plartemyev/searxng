@@ -26,6 +26,7 @@ import datetime
 import re
 import sqlite3
 import sys
+import time
 import threading
 import uuid
 
@@ -229,13 +230,21 @@ class SQLiteAppl(abc.ABC):
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.Connection(self.db_url, **self.SQLITE_CONNECT_ARGS)  # type: ignore
-        try:
-            with conn:
-                conn.execute(f"PRAGMA journal_mode={self.SQLITE_JOURNAL_MODE}")
-        except sqlite3.OperationalError:
-            # when database is locked, the journal_mode is already set by
-            # different but concurrent process (no need to set it once more)
-            pass
+        # Setting the journal mode is a write on first setup: concurrent
+        # first-touch (several threads booting at once) can hold the lock,
+        # so retry briefly on a busy DB.  Giving up would leave the DB in
+        # its old journal mode; a lock held by a concurrent process that
+        # already set the mode is the benign case this must tolerate.
+        for attempt in range(3):
+            try:
+                with conn:
+                    conn.execute(f"PRAGMA journal_mode={self.SQLITE_JOURNAL_MODE}")
+                break
+            except sqlite3.OperationalError as err:
+                msg = str(err).lower()
+                if ("locked" not in msg and "busy" not in msg) or attempt >= 2:
+                    break
+                time.sleep(0.1 * (attempt + 1))
         self.register_functions(conn)
         return conn
 

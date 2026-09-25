@@ -387,6 +387,40 @@ class ExpireCacheSQLite(sqlitedb.SQLiteAppl, ExpireCache):
         opt_list: list[CacheRowType],
         ctx: str | None = None,
     ) -> tuple[int, list[str]]:
+        # Engines write in parallel now that the fetch pool serves
+        # concurrent lanes: SQLite serializes writers and one of them can
+        # hit the busy timeout while another lane holds the write lock.
+        # Every step below (maintenance, create_table, the upsert) is
+        # idempotent, so a short retry absorbs a transient lock instead of
+        # failing the engine request.
+        attempts = 3
+        for attempt in range(attempts):
+            try:
+                return self._setmany_once(opt_list=opt_list, ctx=ctx)
+            except sqlite3.OperationalError as err:
+                if attempt + 1 >= attempts or not self._is_busy_error(err):
+                    raise
+                log.debug(
+                    "%s -- %s: DB busy (%s), retry %s/%s",
+                    self.cfg.name,
+                    ctx,
+                    err,
+                    attempt + 1,
+                    attempts - 1,
+                )
+                time.sleep(0.25 * (attempt + 1))
+
+    @staticmethod
+    def _is_busy_error(err: sqlite3.OperationalError) -> bool:
+        """True for the transient lock errors a retry can resolve."""
+        msg = str(err).lower()
+        return "locked" in msg or "busy" in msg
+
+    def _setmany_once(
+        self,
+        opt_list: list[CacheRowType],
+        ctx: str | None = None,
+    ) -> tuple[int, list[str]]:
 
         table = ctx
         self.maintenance()
