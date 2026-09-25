@@ -569,7 +569,7 @@ class _ImageGridProfile:
         ready_selector: str,
         instruction_selector: str,
         tile_selector: str,
-        grid_selectors: tuple[str, ...],
+        tile_img_selector: str | None,
         verify_selectors: tuple[str, ...],
         skip_selectors: tuple[str, ...],
     ):
@@ -578,7 +578,7 @@ class _ImageGridProfile:
         self.ready_selector = ready_selector
         self.instruction_selector = instruction_selector
         self.tile_selector = tile_selector
-        self.grid_selectors = grid_selectors
+        self.tile_img_selector = tile_img_selector
         self.verify_selectors = verify_selectors
         self.skip_selectors = skip_selectors
 
@@ -595,7 +595,8 @@ _IMAGE_GRID_PROFILES = (
         ready_selector='.rc-imageselect-instructions',
         instruction_selector='.rc-imageselect-desc-wrapper',
         tile_selector='.rc-imageselect-tile',
-        grid_selectors=('.rc-imageselect-target',),
+        # the challenge photos are <img> elements streamed in per tile
+        tile_img_selector="img[class*='rc-image-tile']",
         verify_selectors=('#recaptcha-verify-button',),
         skip_selectors=('button:has-text("Skip")',),
     ),
@@ -605,7 +606,8 @@ _IMAGE_GRID_PROFILES = (
         ready_selector='.challenge-view .task-image',
         instruction_selector='.prompt-text',
         tile_selector='.task-image',
-        grid_selectors=('.task-grid', '.challenge-view'),
+        # hCaptcha paints its photos as background images, no <img> to poll
+        tile_img_selector=None,
         verify_selectors=('.challenge-button', '.button-submit'),
         skip_selectors=('button:has-text("Skip")', '.challenge-button-text'),
     ),
@@ -652,6 +654,13 @@ async def _frame_text(frame_loc, selector: str) -> str:
     return ' '.join((text or '').split())
 
 
+async def _frame_html(frame_loc) -> str:
+    try:
+        return await frame_loc.locator('body').evaluate('el => el.outerHTML')
+    except Exception:  # pylint: disable=broad-except
+        return ''
+
+
 async def _element_count(locator) -> int:
     try:
         return await locator.count()
@@ -659,14 +668,46 @@ async def _element_count(locator) -> int:
         return 0
 
 
-async def _grid_screenshot(frame_loc, profile: _ImageGridProfile) -> bytes | None:
-    """Screenshot the challenge grid (passive observation, never input)."""
-    for selector in (*profile.grid_selectors, profile.tile_selector):
-        locator = frame_loc.locator(selector).first
+async def _wait_tiles_painted(frame_loc, profile: _ImageGridProfile, tile_count: int) -> None:
+    """Give the challenge photos a moment to render before the screenshot.
+
+    reCAPTCHA streams each tile's image separately; a screenshot taken too
+    early captures transparent tiles (the model then sees the page behind
+    the widget and answers nonsense). hCaptcha has no <img> to poll.
+    """
+    if not profile.tile_img_selector:
+        return
+    img = frame_loc.locator(profile.tile_img_selector)
+    deadline = time.monotonic() + 6.0
+    while time.monotonic() < deadline:
         try:
-            if not await locator.is_visible():
+            flags = []
+            for i in range(min(tile_count, 16)):
+                flags.append(
+                    await img.nth(i).evaluate('el => el.complete && el.naturalWidth > 0')
+                )
+            if flags and all(flags):
+                return
+        except Exception:  # pylint: disable=broad-except
+            return  # DOM shape differs from the expectation: don't wait
+        await asyncio.sleep(0.25)
+
+
+async def _iframe_screenshot(page, profile: _ImageGridProfile) -> bytes | None:
+    """Screenshot the challenge widget.
+
+    The screenshot targets the IFRAME element in the parent page, not an
+    element inside the frame: a cross-frame element screenshot of the grid
+    table rendered parent-page content through unpainted tiles, while the
+    iframe element (a plain parent-frame element) captures exactly the
+    rendered widget, instruction text included.
+    """
+    for frame_selector in profile.frame_selectors:
+        iframe_loc = page.locator(frame_selector).first
+        try:
+            if not await iframe_loc.is_visible():
                 continue
-            png = await locator.screenshot()
+            png = await iframe_loc.screenshot()
             if png:
                 return png
         except Exception:  # pylint: disable=broad-except
@@ -690,7 +731,7 @@ async def _click_first_visible(frame_loc, selectors: tuple[str, ...], pointer) -
 
 # TEMPORARY (2026-09-26): dump what the vision model actually receives, for
 # diagnosing wrong tile answers. Active only while /tmp/captcha_debug exists.
-def _debug_dump(profile_name: str, round_index: int, png: bytes, instruction: str) -> None:
+def _debug_dump(profile_name: str, round_index: int, png: bytes, instruction: str, html: str = '') -> None:
     import os
 
     dump_dir = '/tmp/captcha_debug'
@@ -706,6 +747,11 @@ def _debug_dump(profile_name: str, round_index: int, png: bytes, instruction: st
             os.path.join(dump_dir, f'{profile_name}_r{round_index}_{stamp}.txt'), 'w', encoding='utf-8'
         ) as handle:
             handle.write(instruction)
+        if html:
+            with open(
+                os.path.join(dump_dir, f'{profile_name}_r{round_index}_{stamp}.html'), 'w', encoding='utf-8'
+            ) as handle:
+                handle.write(html)
     except OSError:
         pass
 
@@ -737,7 +783,8 @@ async def _run_image_rounds(page, pointer, solver, max_rounds: int, found) -> bo
             if tile_count <= 0:
                 solved = not await _page_looks_like_challenge(page)
                 break
-            png = await _grid_screenshot(frame_loc, profile)
+            await _wait_tiles_painted(frame_loc, profile, tile_count)
+            png = await _iframe_screenshot(page, profile)
             if png is None:
                 solved = not await _page_looks_like_challenge(page)
                 break
@@ -755,7 +802,7 @@ async def _run_image_rounds(page, pointer, solver, max_rounds: int, found) -> bo
             tile_count,
             solver.describe(),
         )
-        _debug_dump(profile.name, round_index, png, instruction)
+        _debug_dump(profile.name, round_index, png, instruction, await _frame_html(frame_loc))
         try:
             # blocking HTTP stays off the lane's event loop
             solution = await asyncio.to_thread(

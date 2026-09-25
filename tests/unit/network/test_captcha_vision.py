@@ -346,9 +346,23 @@ class FakeLocator:
     async def screenshot(self):
         return b"fake-grid-png"
 
+    async def evaluate(self, script):
+        # tile paint check: every polled img reports loaded
+        return True
+
     # Playwright-only interaction methods are deliberately ABSENT: if the
     # solver ever calls locator.click() instead of the pointer, these tests
     # fail with AttributeError instead of silently passing.
+
+
+class FakeIframeLocator(FakeLocator):
+    """The challenge iframe element as seen from the parent page."""
+
+    async def is_visible(self):
+        return self.page.world.grid_visible
+
+    async def screenshot(self):
+        return b"fake-widget-png"
 
 
 class FakeFrameLocator:
@@ -375,6 +389,9 @@ class FakePage:
 
     def frame_locator(self, selector):
         return FakeFrameLocator(self)
+
+    def locator(self, selector):
+        return FakeIframeLocator(self, selector)
 
     async def evaluate(self, script):
         self.evaluate_calls += 1
