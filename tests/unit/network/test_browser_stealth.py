@@ -228,3 +228,22 @@ def test_geo_cache_ignores_corrupt_payload(tmp_path, monkeypatch):
 def test_geo_cache_missing_file(tmp_path, monkeypatch):
     monkeypatch.setattr(browser_module, '_GEO_CACHE_PATH', str(tmp_path / 'nope.json'))
     assert _geo_cache_read() is None
+
+
+def test_detect_ip_locale_uses_disk_cache_without_network(tmp_path, monkeypatch):
+    # regression: the cached path used to raise on the identity log line
+    # (undefined `source`), which failed the first fetch after a restart
+    monkeypatch.setattr(browser_module, '_GEO_CACHE_PATH', str(tmp_path / 'ip_locale.json'))
+    _geo_cache_write({'country_code': 'TH', 'timezone': 'Asia/Bangkok'})
+    monkeypatch.setattr(browser_module, '_ip_locale_cache', None)
+
+    import urllib.request
+
+    def no_network(*args, **kwargs):
+        raise AssertionError('a fresh cache must not trigger a geo lookup')
+
+    monkeypatch.setattr(urllib.request, 'urlopen', no_network)
+    locale = browser_module._detect_ip_locale()
+    assert locale['locale'] == 'th-TH'
+    assert 'cache' in locale['source']
+    assert browser_module._ip_locale_cache is locale

@@ -699,8 +699,8 @@ def _detect_ip_locale() -> dict:
         import urllib.request
 
         detected: dict | None = None
-        raw_data: dict | None = None
         source = _GEO_FALLBACK["source"]
+        raw_data: dict | None = None
         for service in _GEO_SERVICES:
             try:
                 with urllib.request.urlopen(service, timeout=8) as resp:  # noqa: S310
@@ -713,6 +713,7 @@ def _detect_ip_locale() -> dict:
                 raw_data = data
                 break
         if detected is not None:
+            detected["source"] = source
             _geo_cache_write(raw_data or {})
         _ip_locale_cache = detected if detected is not None else dict(_GEO_FALLBACK)
     logger.info(
@@ -722,7 +723,7 @@ def _detect_ip_locale() -> dict:
         _ip_locale_cache["timezone"],
         _ip_locale_cache["accept_language"],
         bool(_ip_locale_cache["geolocation"]),
-        source,
+        _ip_locale_cache["source"],
     )
     return _ip_locale_cache
 
