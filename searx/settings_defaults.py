@@ -279,6 +279,37 @@ SCHEMA: dict[str, t.Any] = {
         # the DOM captured from the live page, and a failed human visit
         # fails the request instead of leaking a fetch-style replay.
         'browser_max_stealth': SettingsValue(bool, False),
+        # Vision-assisted image-challenge solving (see
+        # searx/network/captcha_vision.py): when a challenge escalates to an
+        # image grid (reCAPTCHA image select, hCaptcha task grid), the grid
+        # screenshot and its instruction are sent to a vision-capable model
+        # behind a standard OpenAI-compatible endpoint, and the answer is
+        # clicked by the human input layer. Without a configured solver the
+        # flow gives up at the grid, like before. The HTTP call itself is
+        # passive observation; every click remains real X input.
+        'captcha_vision': {
+            'enabled': SettingsValue(bool, False),
+            # Base URL of any OpenAI-compatible server (Ollama example:
+            # http://host:11434); the client appends /v1/chat/completions.
+            'endpoint': SettingsValue(str, ''),
+            # Optional Bearer token for servers that want one.
+            'api_key': SettingsValue(str, ''),
+            # A vision-capable model name on that server.
+            'model': SettingsValue(str, ''),
+            # Context window hint for backends that accept one (Ollama's
+            # num_ctx); ignored by servers that drop unknown fields.
+            'context_size': SettingsValue(int, 0),
+            # Seconds allowed for one vision call (local models can be slow
+            # on their first, cold request).
+            'timeout': SettingsValue(numbers.Real, 360.0),
+            # Image sets solved per challenge before giving up (reCAPTCHA
+            # often asks for two or three rounds in a row).
+            'max_rounds': SettingsValue(int, 5),
+            'temperature': SettingsValue(numbers.Real, 0.0),
+            # generous ceiling: reasoning models spend tokens thinking before
+            # writing the JSON answer, and truncation loses it entirely
+            'max_tokens': SettingsValue(int, 2048),
+        },
         # Global per-provider send pacing (see searx/network/pacing.py):
         # requests to the same upstream host are spaced a random
         # delay_min..delay_max seconds apart, whatever engine or search sent

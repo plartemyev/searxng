@@ -35,6 +35,8 @@ __all__ = [
     "human_search_on_page",
     "human_read_results",
     "human_solve_challenge",
+    "human_solve_image_challenge",
+    "human_clear_challenge",
 ]
 
 import asyncio
@@ -546,3 +548,279 @@ async def _page_looks_like_challenge(page) -> bool:
     except Exception:  # pylint: disable=broad-except
         return False
     return any(marker in body for marker in markers)
+
+
+# --------------------------------------------------------------------------
+# Image-grid challenges (reCAPTCHA image select, hCaptcha task grid)
+#
+# When a checkbox click escalates to an image grid, the vision solver
+# (searx.network.captcha_vision) decides which tiles match the instruction.
+# Only the DECISION comes from the model: every click is a real mouse event
+# on the lane's X display, at human pace, exactly like the checkbox flow.
+# --------------------------------------------------------------------------
+
+class _ImageGridProfile:
+    """Selectors describing one provider's image-grid challenge DOM."""
+
+    def __init__(
+        self,
+        name: str,
+        frame_selectors: tuple[str, ...],
+        ready_selector: str,
+        instruction_selector: str,
+        tile_selector: str,
+        grid_selectors: tuple[str, ...],
+        verify_selectors: tuple[str, ...],
+        skip_selectors: tuple[str, ...],
+    ):
+        self.name = name
+        self.frame_selectors = frame_selectors
+        self.ready_selector = ready_selector
+        self.instruction_selector = instruction_selector
+        self.tile_selector = tile_selector
+        self.grid_selectors = grid_selectors
+        self.verify_selectors = verify_selectors
+        self.skip_selectors = skip_selectors
+
+
+_IMAGE_GRID_PROFILES = (
+    _ImageGridProfile(
+        name='recaptcha',
+        # bframe carries the image challenge; anchor frames match too
+        # broadly and never hold tiles
+        frame_selectors=(
+            "iframe[src*='recaptcha/api2/bframe']",
+            "iframe[src*='recaptcha/enterprise/bframe']",
+        ),
+        ready_selector='.rc-imageselect-instructions',
+        instruction_selector='.rc-imageselect-desc-wrapper',
+        tile_selector='.rc-imageselect-tile',
+        grid_selectors=('.rc-imageselect-target',),
+        verify_selectors=('#recaptcha-verify-button',),
+        skip_selectors=('button:has-text("Skip")',),
+    ),
+    _ImageGridProfile(
+        name='hcaptcha',
+        frame_selectors=("iframe[src*='hcaptcha.com']",),
+        ready_selector='.challenge-view .task-image',
+        instruction_selector='.prompt-text',
+        tile_selector='.task-image',
+        grid_selectors=('.task-grid', '.challenge-view'),
+        verify_selectors=('.challenge-button', '.button-submit'),
+        skip_selectors=('button:has-text("Skip")', '.challenge-button-text'),
+    ),
+)
+
+# a mounted grid is waited for longer only when the page already smells like
+# a challenge; on a plain page the quick probe keeps searches flowing
+_IMAGE_GRID_QUICK_MS = 800
+_IMAGE_GRID_FULL_MS = 7000
+
+# reCAPTCHA grid sizes: 3x3, 4x4 and the 2x2 "select one region" variant
+_GRID_SHAPES = {4: (2, 2), 9: (3, 3), 16: (4, 4)}
+
+
+def _grid_shape(tile_count: int) -> tuple[int, int]:
+    """(rows, cols) for a tile count, best effort for unknown layouts."""
+    return _GRID_SHAPES.get(tile_count, (tile_count, 1))
+
+
+async def _wait_for_image_grid(page, *, challenge_expected: bool):
+    """Find a mounted, visible image grid. Returns (profile, frame) or None."""
+    timeout_s = (_IMAGE_GRID_FULL_MS if challenge_expected else _IMAGE_GRID_QUICK_MS) / 1000
+    deadline = time.monotonic() + timeout_s
+    while True:
+        for profile in _IMAGE_GRID_PROFILES:
+            for frame_selector in profile.frame_selectors:
+                frame_loc = page.frame_locator(frame_selector)
+                ready = frame_loc.locator(profile.ready_selector).first
+                try:
+                    if await ready.is_visible():
+                        return profile, frame_loc
+                except Exception:  # pylint: disable=broad-except
+                    continue
+        if time.monotonic() >= deadline:
+            return None
+        await asyncio.sleep(0.25)
+
+
+async def _frame_text(frame_loc, selector: str) -> str:
+    try:
+        text = await frame_loc.locator(selector).first.inner_text()
+    except Exception:  # pylint: disable=broad-except
+        return ''
+    return ' '.join((text or '').split())
+
+
+async def _element_count(locator) -> int:
+    try:
+        return await locator.count()
+    except Exception:  # pylint: disable=broad-except
+        return 0
+
+
+async def _grid_screenshot(frame_loc, profile: _ImageGridProfile) -> bytes | None:
+    """Screenshot the challenge grid (passive observation, never input)."""
+    for selector in (*profile.grid_selectors, profile.tile_selector):
+        locator = frame_loc.locator(selector).first
+        try:
+            if not await locator.is_visible():
+                continue
+            png = await locator.screenshot()
+            if png:
+                return png
+        except Exception:  # pylint: disable=broad-except
+            continue
+    return None
+
+
+async def _click_first_visible(frame_loc, selectors: tuple[str, ...], pointer) -> bool:
+    """Click the first visible button among ``selectors`` with the real mouse."""
+    for selector in selectors:
+        locator = frame_loc.locator(selector).first
+        try:
+            if await locator.count() == 0:
+                continue
+        except Exception:  # pylint: disable=broad-except
+            continue
+        if await _human_click_locator(locator, pointer):
+            return True
+    return False
+
+
+async def _run_image_rounds(page, pointer, solver, max_rounds: int, found) -> bool:
+    """Solve a mounted image grid, one vision round per image set.
+
+    Between rounds the pointer waits like a person reading the next
+    instruction; success is the browser leaving the challenge page.
+    """
+    solved = False
+    for round_index in range(1, max_rounds + 1):
+        if round_index > 1:
+            # a person reads the new image set before acting on it
+            await asyncio.sleep(random.uniform(1.0, 2.2))  # noqa: S311
+            try:
+                found = await _wait_for_image_grid(page, challenge_expected=False)
+            except Exception:  # pylint: disable=broad-except
+                found = None
+            if found is None:
+                solved = not await _page_looks_like_challenge(page)
+                break
+        profile, frame_loc = found
+
+        try:
+            instruction = await _frame_text(frame_loc, profile.instruction_selector)
+            tiles = frame_loc.locator(profile.tile_selector)
+            tile_count = await _element_count(tiles)
+            if tile_count <= 0:
+                solved = not await _page_looks_like_challenge(page)
+                break
+            png = await _grid_screenshot(frame_loc, profile)
+            if png is None:
+                solved = not await _page_looks_like_challenge(page)
+                break
+        except Exception:  # pylint: disable=broad-except
+            # the frame can detach when the challenge clears mid-round
+            solved = not await _page_looks_like_challenge(page)
+            break
+
+        rows, cols = _grid_shape(tile_count)
+        logger.info(
+            'human input: %s image challenge round %s/%s: %s tiles, asking %s',
+            profile.name,
+            round_index,
+            max_rounds,
+            tile_count,
+            solver.describe(),
+        )
+        try:
+            # blocking HTTP stays off the lane's event loop
+            solution = await asyncio.to_thread(
+                solver.solve_image_grid, png, instruction, tile_count, rows, cols
+            )
+        except Exception:  # pylint: disable=broad-except
+            logger.warning(
+                'human input: vision solver failed on %s image challenge',
+                profile.name,
+                exc_info=True,
+            )
+            return False
+        logger.info(
+            'human input: vision says tiles=%s action=%s (instruction %r)',
+            list(solution.tiles),
+            solution.action,
+            instruction,
+        )
+
+        # look over the grid, then click the matching tiles like a person:
+        # uneven gaps between clicks, an occasional longer double-take
+        await asyncio.sleep(random.uniform(0.5, 1.2))  # noqa: S311
+        clicked_tiles = 0
+        for tile_index in solution.tiles:
+            tile_loc = tiles.nth(tile_index)
+            if await _human_click_locator(tile_loc, pointer):
+                clicked_tiles += 1
+            else:
+                logger.warning('human input: tile %s not clickable', tile_index)
+            if random.random() < 0.25:  # noqa: S311
+                await asyncio.sleep(random.uniform(0.8, 1.8))  # noqa: S311
+            else:
+                await asyncio.sleep(random.uniform(0.35, 0.95))  # noqa: S311
+
+        # hover the button a moment before pressing it
+        await asyncio.sleep(random.uniform(0.6, 1.4))  # noqa: S311
+        if solution.action == 'skip' and clicked_tiles == 0:
+            clicked = await _click_first_visible(frame_loc, profile.skip_selectors, pointer)
+            if not clicked:
+                clicked = await _click_first_visible(frame_loc, profile.verify_selectors, pointer)
+        else:
+            clicked = await _click_first_visible(frame_loc, profile.verify_selectors, pointer)
+        if not clicked:
+            logger.warning('human input: no VERIFY/SKIP button found in %s challenge', profile.name)
+            return False
+
+        # wait out the round trip: the next image set replaces this one, or
+        # the browser leaves the challenge page entirely
+        await asyncio.sleep(random.uniform(2.0, 3.5))  # noqa: S311
+
+    if not solved:
+        logger.warning('human input: image challenge not solved after %s round(s)', max_rounds)
+    return solved
+
+
+async def human_solve_image_challenge(page, pointer, *, solver=None, max_rounds: int | None = None) -> bool:
+    """Solve an escalated image-grid challenge with vision assistance.
+
+    Returns False immediately when no vision solver is configured or no grid
+    is mounted; otherwise runs up to ``max_rounds`` vision rounds. Every
+    interaction is real X input (see :py:func:`_run_image_rounds`); only
+    screenshots and text reads are programmatic, which the provider cannot
+    distinguish from accessibility tooling.
+    """
+    if solver is None:
+        # pylint: disable=import-outside-toplevel
+        from searx.network.captcha_vision import get_vision_solver
+
+        solver = get_vision_solver()
+    if solver is None:
+        return False
+    if max_rounds is None:
+        max_rounds = max(1, solver.cfg.max_rounds)
+
+    found = await _wait_for_image_grid(page, challenge_expected=False)
+    if found is None:
+        return False
+    return await _run_image_rounds(page, pointer, solver, max_rounds, found)
+
+
+async def human_clear_challenge(page, pointer, *, settle_ms: int = 6000) -> bool:
+    """Clear a challenge interstitial, checkbox first, vision second.
+
+    Wraps :py:func:`human_solve_challenge` (the checkbox click) and
+    :py:func:`human_solve_image_challenge` (the grid escalation the click
+    often triggers). Both are always evaluated: a clicked checkbox and a
+    subsequently mounted grid belong to the same challenge.
+    """
+    clicked = await human_solve_challenge(page, pointer, settle_ms=settle_ms)
+    vision_solved = await human_solve_image_challenge(page, pointer)
+    return clicked or vision_solved

@@ -1265,7 +1265,7 @@ class BrowserFetchPool:
         captured DOM then tells the engine what happened.
         """
         # pylint: disable=import-outside-toplevel
-        from searx.network.human_input import human_solve_challenge
+        from searx.network.human_input import human_clear_challenge
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + max(8.0, min(timeout_s, 30.0))
@@ -1298,7 +1298,7 @@ class BrowserFetchPool:
                     pass
                 if not _is_challenge_url(page.url):
                     return
-            solved = await human_solve_challenge(
+            solved = await human_clear_challenge(
                 page, pointer, settle_ms=_BOT_CHALLENGE_GRACE_MS
             )
             if not solved:
@@ -1327,10 +1327,10 @@ class BrowserFetchPool:
         """
         # pylint: disable=import-outside-toplevel
         from searx.network.human_input import (
+            human_clear_challenge,
             human_read_results,
             human_search_on_page,
             human_session,
-            human_solve_challenge,
         )
 
         if _is_api_url(url):
@@ -1361,7 +1361,7 @@ class BrowserFetchPool:
                         logger.warning(
                             "human search: homepage %s failed, trying results URL", homepage
                         )
-                    await human_solve_challenge(page, pointer)
+                    await human_clear_challenge(page, pointer)
                     if await human_search_on_page(page, query, pointer):
                         await self._settle_after_search(page, pointer, timeout_s)
                     else:
@@ -1370,7 +1370,7 @@ class BrowserFetchPool:
                         await page.goto(
                             url, timeout=goto_timeout_ms, wait_until="domcontentloaded"
                         )
-                        await human_solve_challenge(page, pointer)
+                        await human_clear_challenge(page, pointer)
                         try:
                             await page.wait_for_load_state(
                                 "networkidle", timeout=_BOT_CHALLENGE_GRACE_MS
