@@ -688,6 +688,28 @@ async def _click_first_visible(frame_loc, selectors: tuple[str, ...], pointer) -
     return False
 
 
+# TEMPORARY (2026-09-26): dump what the vision model actually receives, for
+# diagnosing wrong tile answers. Active only while /tmp/captcha_debug exists.
+def _debug_dump(profile_name: str, round_index: int, png: bytes, instruction: str) -> None:
+    import os
+
+    dump_dir = '/tmp/captcha_debug'
+    if not os.path.isdir(dump_dir) or not png:
+        return
+    try:
+        stamp = time.strftime('%H%M%S')
+        with open(
+            os.path.join(dump_dir, f'{profile_name}_r{round_index}_{stamp}.png'), 'wb'
+        ) as handle:
+            handle.write(png)
+        with open(
+            os.path.join(dump_dir, f'{profile_name}_r{round_index}_{stamp}.txt'), 'w', encoding='utf-8'
+        ) as handle:
+            handle.write(instruction)
+    except OSError:
+        pass
+
+
 async def _run_image_rounds(page, pointer, solver, max_rounds: int, found) -> bool:
     """Solve a mounted image grid, one vision round per image set.
 
@@ -733,6 +755,7 @@ async def _run_image_rounds(page, pointer, solver, max_rounds: int, found) -> bo
             tile_count,
             solver.describe(),
         )
+        _debug_dump(profile.name, round_index, png, instruction)
         try:
             # blocking HTTP stays off the lane's event loop
             solution = await asyncio.to_thread(
