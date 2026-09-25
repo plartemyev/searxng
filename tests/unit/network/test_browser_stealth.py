@@ -3,9 +3,15 @@
 
 # pylint: disable=missing-module-docstring
 
+import json
+import time
+
 import pytest
 
+from searx.network import browser as browser_module
 from searx.network.browser import (
+    _geo_cache_read,
+    _geo_cache_write,
     _homepage_url_from_search_url,
     _ip_locale_from_payload,
     _is_api_url,
@@ -113,29 +119,43 @@ def test_homepage_carries_bing_locale_params():
 # _ip_locale_from_payload: the lane identity must match the public IP
 
 
-def test_ip_locale_from_ipapi_payload():
+def test_ip_locale_from_geojs_payload():
+    locale = _ip_locale_from_payload(
+        {
+            'country_code': 'TH',
+            'timezone': 'Asia/Bangkok',
+            'latitude': '13.7563',
+            'longitude': '100.5018',
+        }
+    )
+    assert locale['locale'] == 'th-TH'
+    assert locale['timezone'] == 'Asia/Bangkok'
+    assert locale['geolocation'] == {
+        'latitude': 13.7563,
+        'longitude': 100.5018,
+        'accuracy': 40.0,
+    }
+
+
+def test_ip_locale_from_ipwho_payload():
     locale = _ip_locale_from_payload(
         {
             'country_code': 'DE',
-            'timezone': 'Europe/Berlin',
-            'languages': 'de,de-DE',
+            'timezone': {'id': 'Europe/Berlin', 'abbr': '+02'},
             'latitude': 52.52,
             'longitude': 13.4,
         }
     )
-    assert locale == {
-        'locale': 'de-DE',
-        'timezone': 'Europe/Berlin',
-        'accept_language': 'de-DE,de;q=0.9,en;q=0.7',
-        'geolocation': {'latitude': 52.52, 'longitude': 13.4, 'accuracy': 40.0},
-    }
+    assert locale['locale'] == 'de-DE'
+    assert locale['timezone'] == 'Europe/Berlin'
+    assert locale['accept_language'] == 'de-DE,en;q=0.9'
 
 
 def test_ip_locale_from_ipinfo_payload():
     locale = _ip_locale_from_payload(
         {'country': 'JP', 'timezone': 'Asia/Tokyo', 'loc': '35.68,139.69'}
     )
-    assert locale['locale'] == 'en-US'
+    assert locale['locale'] == 'ja-JP'
     assert locale['timezone'] == 'Asia/Tokyo'
     assert locale['geolocation'] == {
         'latitude': 35.68,
@@ -145,14 +165,66 @@ def test_ip_locale_from_ipinfo_payload():
     assert 'en' in locale['accept_language']
 
 
+def test_ip_locale_languages_field_wins_over_table():
+    # a provider that carries languages keeps the multi-code accept-language
+    locale = _ip_locale_from_payload(
+        {'country_code': 'DE', 'languages': 'de,de-DE', 'timezone': 'Europe/Berlin'}
+    )
+    assert locale['locale'] == 'de-DE'
+    assert locale['accept_language'] == 'de-DE,de;q=0.9,en;q=0.7'
+
+
+def test_ip_locale_unknown_country_stays_english():
+    locale = _ip_locale_from_payload({'country_code': 'XK', 'timezone': 'Europe/Podgorica'})
+    assert locale['locale'] == 'en-US'
+    assert locale['timezone'] == 'Europe/Podgorica'
+
+
 def test_ip_locale_survives_missing_coordinates():
     locale = _ip_locale_from_payload(
         {'country_code': 'FR', 'timezone': 'Europe/Paris'}
     )
     assert locale['geolocation'] is None
-    assert locale['locale'] == 'en-US'
+    assert locale['locale'] == 'fr-FR'
     assert locale['timezone'] == 'Europe/Paris'
 
 
 def test_ip_locale_requires_a_country():
     assert _ip_locale_from_payload({'timezone': 'Europe/Berlin'}) is None
+
+
+# _geo_cache_read / _geo_cache_write: the identity survives restarts
+
+
+def test_geo_cache_roundtrip(tmp_path, monkeypatch):
+    monkeypatch.setattr(browser_module, '_GEO_CACHE_PATH', str(tmp_path / 'ip_locale.json'))
+    _geo_cache_write(
+        {'country_code': 'TH', 'timezone': 'Asia/Bangkok', 'latitude': 13.7, 'longitude': 100.5}
+    )
+    locale = _geo_cache_read()
+    assert locale['locale'] == 'th-TH'
+    assert 'cache' in locale['source']
+
+
+def test_geo_cache_expires(tmp_path, monkeypatch):
+    cache_path = tmp_path / 'ip_locale.json'
+    monkeypatch.setattr(browser_module, '_GEO_CACHE_PATH', str(cache_path))
+    _geo_cache_write({'country_code': 'TH', 'timezone': 'Asia/Bangkok'})
+    payload = json.loads(cache_path.read_text())
+    payload['fetched_at'] = time.time() - browser_module._GEO_CACHE_TTL_S - 10
+    cache_path.write_text(json.dumps(payload))
+    assert _geo_cache_read() is None
+
+
+def test_geo_cache_ignores_corrupt_payload(tmp_path, monkeypatch):
+    cache_path = tmp_path / 'ip_locale.json'
+    monkeypatch.setattr(browser_module, '_GEO_CACHE_PATH', str(cache_path))
+    cache_path.write_text('not json at all')
+    assert _geo_cache_read() is None
+    cache_path.write_text(json.dumps({'fetched_at': time.time(), 'data': {}}))
+    assert _geo_cache_read() is None
+
+
+def test_geo_cache_missing_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(browser_module, '_GEO_CACHE_PATH', str(tmp_path / 'nope.json'))
+    assert _geo_cache_read() is None

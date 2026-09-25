@@ -529,7 +529,7 @@ _IDENTITY_HEADERS = frozenset(
 # context is created with that locale. Playwright's en-US /
 # America/Los_Angeles defaults on a non-US datacenter IP are a classic
 # inconsistency search engines score.
-_GEO_SERVICES = ("https://ipapi.co/json/", "https://ipinfo.io/json")
+_GEO_SERVICES = ("https://get.geojs.io/v1/ip/geo.json", "https://ipwho.is/", "https://ipinfo.io/json")
 _GEO_FALLBACK: dict = {
     "locale": "en-US",
     "timezone": "America/Los_Angeles",
@@ -537,17 +537,60 @@ _GEO_FALLBACK: dict = {
     "geolocation": None,
     "source": "fallback",
 }
+
+# Primary browser language per country for the geo services that do not
+# return a language list. Unknown countries stay English: a wrong language
+# claim is worse than a common one.
+_COUNTRY_PRIMARY_LANGUAGE: dict[str, str] = {
+    # Americas
+    "AR": "es", "BO": "es", "BR": "pt", "CA": "en", "CL": "es", "CO": "es",
+    "CR": "es", "CU": "es", "DO": "es", "EC": "es", "GT": "es", "HN": "es",
+    "MX": "es", "NI": "es", "PA": "es", "PE": "es", "PR": "es", "PY": "es",
+    "SV": "es", "US": "en", "UY": "es", "VE": "es",
+    # Europe
+    "AL": "sq", "AT": "de", "BA": "bs", "BE": "nl", "BG": "bg", "BY": "be",
+    "CH": "de", "CY": "el", "CZ": "cs", "DE": "de", "DK": "da", "EE": "et",
+    "ES": "es", "FI": "fi", "FR": "fr", "GR": "el", "HR": "hr", "HU": "hu",
+    "IE": "en", "IS": "is", "IT": "it", "LT": "lt", "LV": "lv", "MD": "ro",
+    "MK": "mk", "MT": "mt", "NL": "nl", "NO": "no", "PL": "pl", "PT": "pt",
+    "RO": "ro", "RS": "sr", "SE": "sv", "SI": "sl", "SK": "sk", "UA": "uk",
+    "UK": "en", "GB": "en",
+    # Asia / Middle East
+    "AM": "hy", "AZ": "az", "BD": "bn", "CN": "zh", "GE": "ka", "HK": "zh",
+    "ID": "id", "IL": "he", "IN": "en", "IQ": "ar", "IR": "fa", "JO": "ar",
+    "JP": "ja", "KG": "ky", "KH": "km", "KR": "ko", "KW": "ar", "KZ": "kk",
+    "LA": "lo", "LB": "ar", "LK": "si", "MM": "my", "MN": "mn", "MO": "zh",
+    "MV": "dv", "MY": "ms", "NP": "ne", "OM": "ar", "PH": "en", "PK": "en",
+    "QA": "ar", "SA": "ar", "SG": "en", "SY": "ar", "TH": "th", "TJ": "tg",
+    "TM": "tk", "TR": "tr", "TW": "zh", "UZ": "uz", "VN": "vi", "YE": "ar",
+    # Africa
+    "AO": "pt", "CI": "fr", "DZ": "ar", "EG": "ar", "ET": "am", "GA": "fr",
+    "GH": "en", "KE": "en", "LY": "ar", "MA": "ar", "MG": "mg", "ML": "fr",
+    "MZ": "pt", "NG": "en", "SD": "ar", "SN": "fr", "TN": "ar", "TZ": "sw",
+    "UG": "en", "ZA": "en", "ZM": "en", "ZW": "en",
+    # Oceania
+    "AU": "en", "FJ": "en", "NZ": "en", "PG": "en",
+}
+
+# The resolved identity is cached on disk: geo lookups must survive
+# container restarts AND recreations without re-querying the services
+# (they rate-limit, and the identity does not change with the process).
+_GEO_CACHE_TTL_S = 48 * 3600.0
+_GEO_CACHE_PATH = os.path.join(
+    os.environ.get("__SEARXNG_DATA_PATH") or "/var/cache/searxng", "ip_locale.json"
+)
 _ip_locale_cache: dict | None = None
 
 
 def _ip_locale_from_payload(data: dict) -> dict | None:
     """Build the locale identity from one geo-IP service payload.
 
-    ipapi.co carries ``country_code``, ``timezone``, ``languages`` (e.g.
-    "de,de-DE") and coordinates; ipinfo.io carries ``country``,
-    ``timezone`` and a "lat,long" ``loc`` but no languages. Without a
-    language hint the identity stays English -- common enough for real
-    users -- while timezone, coordinates and country still match the IP.
+    Handled providers: geojs.io (``country_code``, ``timezone``,
+    ``latitude``/``longitude``), ipwho.is (``country_code``, ``timezone``
+    object with an ``id``, numeric coordinates) and ipinfo.io
+    (``country``, ``timezone``, "lat,long" ``loc``). Language: the
+    ``languages`` field when a provider carries one, else the country's
+    primary language from the static table, else English.
     """
     country = str(data.get("country_code") or data.get("country") or "").strip().upper()
     if len(country) != 2:
@@ -557,7 +600,9 @@ def _ip_locale_from_payload(data: dict) -> dict | None:
         for code in str(data.get("languages") or "").split(",")
         if code.strip()
     ]
-    primary = codes[0] if codes else ""
+    # no language list from the provider: claim the country's primary
+    # language; a country outside the table stays English (en-US)
+    primary = codes[0] if codes else _COUNTRY_PRIMARY_LANGUAGE.get(country)
     if primary and "-" in primary:
         locale = primary
     elif primary:
@@ -575,7 +620,11 @@ def _ip_locale_from_payload(data: dict) -> dict | None:
     else:
         lang_parts.append("en;q=0.8")
     accept_language = ",".join(lang_parts)
-    timezone = str(data.get("timezone") or "").strip() or "America/Los_Angeles"
+    timezone = data.get("timezone")
+    if isinstance(timezone, dict):
+        # ipwho.is: {"id": "Asia/Bangkok", ...}
+        timezone = timezone.get("id")
+    timezone = str(timezone or "").strip() or "America/Los_Angeles"
     latitude = data.get("latitude")
     longitude = data.get("longitude")
     if latitude is None or longitude is None:
@@ -597,32 +646,75 @@ def _ip_locale_from_payload(data: dict) -> dict | None:
     }
 
 
+def _geo_cache_read() -> dict | None:
+    """Return the cached locale identity when fresh and well-formed."""
+    try:
+        with open(_GEO_CACHE_PATH, encoding="utf-8") as cache_file:
+            payload = json.load(cache_file)
+        fetched_at = float(payload.get("fetched_at", 0.0))
+        if time.time() - fetched_at > _GEO_CACHE_TTL_S:
+            return None
+        locale = _ip_locale_from_payload(payload.get("data") or {})
+    except (OSError, TypeError, ValueError):
+        return None
+    if locale is None:
+        return None
+    age_days = max(0.0, time.time() - fetched_at) / 86400.0
+    locale["source"] = f"cache, {age_days:.1f}d old"
+    return locale
+
+
+def _geo_cache_write(data: dict) -> None:
+    """Persist the raw geo payload; best effort (read-only fs is fine).
+
+    Atomic via tmp file + rename, so a reader never sees a partial write.
+    """
+    try:
+        os.makedirs(os.path.dirname(_GEO_CACHE_PATH), exist_ok=True)
+        tmp_path = _GEO_CACHE_PATH + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as cache_file:
+            json.dump({"fetched_at": time.time(), "data": data}, cache_file)
+        os.replace(tmp_path, _GEO_CACHE_PATH)
+    except OSError:
+        pass
+
+
 def _detect_ip_locale() -> dict:
     """Resolve the public IP to a locale identity (blocking, one-time).
 
-    Queried once per pool start and cached: the first search pays the
-    lookup, every later context (re)build reuses it.
+    The resolved identity is cached in process memory and on disk: the
+    first pool start pays the lookup, later starts read the cache until
+    it expires (``_GEO_CACHE_TTL_S``). The providers are tried in order;
+    when all fail the static fallback applies.
     """
     global _ip_locale_cache  # pylint: disable=global-statement
     if _ip_locale_cache is not None:
         return _ip_locale_cache
-    # import inside the function: urllib pulls the SSL machinery and the
-    # pool module must stay importable without it (tests)
-    import urllib.request
+    cached = _geo_cache_read()
+    if cached is not None:
+        _ip_locale_cache = cached
+    else:
+        # import inside the function: urllib pulls the SSL machinery and
+        # the pool module must stay importable without it (tests)
+        import urllib.request
 
-    detected: dict | None = None
-    source = _GEO_FALLBACK["source"]
-    for service in _GEO_SERVICES:
-        try:
-            with urllib.request.urlopen(service, timeout=8) as resp:  # noqa: S310
-                data = json.loads(resp.read().decode("utf-8", "replace"))
-        except Exception:  # pylint: disable=broad-except
-            continue
-        detected = _ip_locale_from_payload(data)
+        detected: dict | None = None
+        raw_data: dict | None = None
+        source = _GEO_FALLBACK["source"]
+        for service in _GEO_SERVICES:
+            try:
+                with urllib.request.urlopen(service, timeout=8) as resp:  # noqa: S310
+                    data = json.loads(resp.read().decode("utf-8", "replace"))
+            except Exception:  # pylint: disable=broad-except
+                continue
+            detected = _ip_locale_from_payload(data)
+            if detected is not None:
+                source = service
+                raw_data = data
+                break
         if detected is not None:
-            source = service
-            break
-    _ip_locale_cache = detected if detected is not None else dict(_GEO_FALLBACK)
+            _geo_cache_write(raw_data or {})
+        _ip_locale_cache = detected if detected is not None else dict(_GEO_FALLBACK)
     logger.info(
         "Browser pool identity: locale=%s timezone=%s accept-language=%s"
         " geolocation=%s (via %s)",
