@@ -68,11 +68,15 @@ _SEARCH_BUTTON_SELECTORS = (
     "form button:not([type='button']):not([type='reset'])",
 )
 
-# Challenge checkboxes rendered inside cross-origin iframes.
+# Challenge checkboxes rendered inside cross-origin iframes. For reCAPTCHA
+# only the *anchor* frame carries the checkbox: a bare src*=recaptcha also
+# matches the bframe (image grid), and a frame_locator resolving to two
+# frames fails strict mode.
 _CHALLENGE_FRAME_SELECTORS = (
     "iframe[src*='challenges.cloudflare.com']",
     "iframe[src*='hcaptcha.com']",
-    "iframe[src*='recaptcha']",
+    "iframe[src*='recaptcha/enterprise/anchor']",
+    "iframe[src*='recaptcha/api2/anchor']",
 )
 _CHALLENGE_FRAME_SELECTOR = ", ".join(_CHALLENGE_FRAME_SELECTORS)
 _CHALLENGE_BOX_SELECTORS = (
