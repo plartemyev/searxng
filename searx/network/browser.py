@@ -1749,11 +1749,12 @@ class BrowserFetchPool:
             logger.debug("post-search browsing: challenge on %s", opened.url[:100])
             await self._return_to_serp(page, opened, serp_url)
             return False
-        if opened is page and _registrable_site(
-            urlsplit(opened.url).hostname
-        ) == _registrable_site(urlsplit(serp_url).hostname):
+        if _registrable_site(urlsplit(opened.url).hostname) == _registrable_site(
+            urlsplit(serp_url).hostname
+        ):
             # the wrapper resolved into another engine page (video panel,
-            # related search): back to the results, pick a real result
+            # related search, in a tab or in place): back to the results,
+            # pick a real result
             logger.debug("post-search browsing: stayed on-site (%s)", opened.url[:80])
             await self._return_to_serp(page, opened, serp_url)
             return False
