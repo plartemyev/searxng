@@ -420,6 +420,26 @@ def test_browsable_links_drops_google_translate_targets():
     assert out == ["https://example.org/page"]
 
 
+def test_unwrap_google_translate_url():
+    from searx.network.browser import unwrap_google_translate_url
+
+    assert (
+        unwrap_google_translate_url(
+            "https://energysavingtrust-org-uk.translate.goog/advice/x"
+            "?_x_tr_sl=en&_x_tr_tl=th"
+        )
+        == "https://energysavingtrust.org.uk/advice/x"
+    )
+    assert (
+        unwrap_google_translate_url(
+            "https://en-m-wikipedia-org.translate.goog/wiki/Heat_pump"
+            "?_x_tr_sl=en&_x_tr_tl=th&keep=1"
+        )
+        == "https://m.wikipedia.org/wiki/Heat_pump?keep=1"
+    )
+    assert unwrap_google_translate_url("https://example.org/x") == "https://example.org/x"
+
+
 def test_is_google_translate_url():
     assert browser_module._is_google_translate_url(
         "https://www-iea-org.translate.goog/reports/x?_x_tr_sl=en"

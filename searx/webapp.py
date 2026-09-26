@@ -599,6 +599,68 @@ def health():
     return Response('OK', mimetype='text/plain')
 
 
+@app.route('/crawl', methods=['GET'])
+def crawl():
+    """Page crawl on the masqueraded browser pool (outgoing.browser_crawl_endpoint).
+
+    Query: url=<absolute http(s) URL>, mode=render|bytes, timeout=<seconds>.
+    render -> JSON {final_url, status, challenge, html}; bytes -> raw body
+    with X-Final-URL / X-Crawl-Status / X-Crawl-Challenge headers. Redirects
+    are followed, so /goto-style wrappers resolve to their real target;
+    Google Translate wrappers are rewritten to the original page.
+    """
+    if not searx.get_setting('outgoing.browser_crawl_endpoint', False):
+        return Response('crawl endpoint disabled\n', status=404, mimetype='text/plain')
+    secret = searx.get_setting('outgoing.browser_crawl_secret', '')
+    if secret and sxng_request.headers.get('X-Crawl-Secret', '') != secret:
+        return Response('invalid crawl secret\n', status=403, mimetype='text/plain')
+
+    from searx.network import crawl
+
+    url = (sxng_request.args.get('url') or '').strip()
+    if not url:
+        return jsonify({'error': 'missing url parameter'}), 400
+    mode = sxng_request.args.get('mode', 'render')
+    try:
+        timeout_s = min(max(float(sxng_request.args.get('timeout', 30)), 5.0), 120.0)
+    except ValueError:
+        return jsonify({'error': 'invalid timeout parameter'}), 400
+    allow_private = searx.get_setting('outgoing.browser_crawl_allow_private_network', False)
+    max_bytes = int(searx.get_setting('outgoing.browser_crawl_max_bytes', 52428800))
+
+    try:
+        if mode == 'bytes':
+            result = crawl.fetch_bytes(
+                url, timeout_s=timeout_s, max_bytes=max_bytes,
+                allow_private_network=allow_private,
+            )
+            response = Response(
+                result['content'],
+                mimetype=result.get('content_type') or 'application/octet-stream',
+            )
+            response.headers['X-Final-URL'] = result['final_url']
+            response.headers['X-Crawl-Status'] = str(result['status'] or 0)
+            if result['challenge']:
+                response.headers['X-Crawl-Challenge'] = '1'
+            return response
+        if mode != 'render':
+            return jsonify({'error': "mode must be 'render' or 'bytes'"}), 400
+        result = crawl.render_page(url, timeout_s=timeout_s, allow_private_network=allow_private)
+        return jsonify({
+            'final_url': result['final_url'],
+            'status': result['status'],
+            'challenge': result['challenge'],
+            'html': result['html'],
+        })
+    except crawl.CrawlBodyTooLarge as e:
+        return jsonify({'error': str(e)}), 413
+    except crawl.CrawlError as e:
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:  # pylint: disable=broad-except
+        app.logger.warning('crawl of %s failed: %s', url[:200], e)
+        return jsonify({'error': 'crawl failed'}), 502
+
+
 @app.route('/client<token>.css', methods=['GET', 'POST'])
 def client_token(token=None):
     link_token.ping(sxng_request, token)

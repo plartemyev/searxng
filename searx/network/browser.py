@@ -62,15 +62,13 @@ import subprocess
 import threading
 import time
 from types import SimpleNamespace
-from urllib.parse import urlencode
-
+from urllib.parse import parse_qsl, parse_qs, urlencode, urljoin, urlsplit, urlunparse
 from lxml import html
 from searx.exceptions import (
     SearxEngineAccessDeniedException,
     SearxEngineTooManyRequestsException,
 )
 from searx.extended_types import SXNG_URL
-from urllib.parse import parse_qs, urljoin, urlsplit
 
 logger = logging.getLogger("searx.network.browser")
 
@@ -101,6 +99,10 @@ _xvfb_lock = threading.Lock()
 
 class BrowserFetchError(Exception):
     """Raised when the browser pool cannot serve a request."""
+
+
+class CrawlBodyTooLarge(BrowserFetchError):
+    """Raised when a crawled body exceeds the configured size cap."""
 
 
 def _discover_chromium():
@@ -413,6 +415,82 @@ def _is_google_translate_url(url: str | None) -> bool:
     """
     host = (urlsplit(url or "").hostname or "").lower()
     return host.endswith(".translate.goog") or host == "translate.google.com"
+
+
+# Public-suffix knowledge for reversing translate.goog subdomains: the
+# original host is encoded with dots turned into dashes, so the split point
+# between the registrable domain and the suffix has to be recovered.
+_TRANSLATE_TWO_LABEL_SUFFIXES = {
+    "co.uk", "org.uk", "ac.uk", "gov.uk", "me.uk",
+    "co.th", "or.th", "ac.th", "in.th",
+    "com.au", "net.au", "org.au", "co.nz", "net.nz",
+    "co.jp", "ne.jp", "or.jp", "co.kr", "co.in",
+    "com.br", "com.mx", "com.ar", "com.tr", "com.sg", "com.cn",
+    "com.ua", "com.my", "com.ph", "com.vn", "co.za", "co.id", "co.il",
+}
+_TRANSLATE_ONE_LABEL_SUFFIXES = {
+    "com", "org", "net", "edu", "gov", "int", "info", "biz",
+    "io", "ai", "app", "dev", "me", "tv", "cc", "co",
+    "uk", "de", "fr", "es", "it", "nl", "se", "no", "fi", "dk", "pl",
+    "pt", "ru", "ua", "cz", "sk", "at", "ch", "be", "ie", "gr", "hu",
+    "ro", "bg", "hr", "rs", "lt", "lv", "ee", "is",
+    "jp", "kr", "in", "th", "vn", "id", "ph", "my", "sg",
+    "au", "nz", "br", "mx", "ar", "cl", "pe",
+    "za", "ng", "ke", "eg", "ma", "cn", "hk", "tw", "il", "tr", "sa",
+    "ae", "us", "ca", "eu", "cat", "xyz", "online", "site", "store",
+}
+
+
+def _translate_host_from_segments(segments: list) -> str | None:
+    """Rebuild a hostname from translate.goog's dash-encoded segments.
+
+    Ambiguous by construction (dots and dashes both map to '-'), so the
+    public suffix is matched from the right to pick the split the domain
+    almost certainly used.
+    """
+    for size in (2, 1):
+        if len(segments) > size:
+            suffix = ".".join(segments[-size:])
+            known = (
+                _TRANSLATE_TWO_LABEL_SUFFIXES
+                if size == 2
+                else _TRANSLATE_TWO_LABEL_SUFFIXES | _TRANSLATE_ONE_LABEL_SUFFIXES
+            )
+            if suffix in known:
+                return ".".join(segments)
+    if len(segments) >= 2:
+        # last segment as the TLD is the only reasonable reading left
+        return ".".join(segments[:-1]) + "." + segments[-1]
+    return None
+
+
+def unwrap_google_translate_url(url: str) -> str:
+    """Map a Google Translate wrapper URL back to the original page URL.
+
+    The original host is encoded locally in the translate.goog subdomain,
+    so the reverse mapping needs no request -- the translation service
+    itself is never contacted for it. Non-translate URLs come back
+    unchanged.
+    """
+    parts = urlsplit(url or "")
+    host = (parts.hostname or "").lower()
+    suffix = ".translate.goog"
+    if host == "translate.google.com":
+        params = parse_qs(parts.query)
+        targets = params.get("u") or params.get("url") or []
+        return targets[0] if targets else url
+    if not host.endswith(suffix):
+        return url
+    sub = host[: -len(suffix)]
+    params = parse_qs(parts.query)
+    source_lang = (params.get("_x_tr_sl") or [""])[0]
+    if source_lang and source_lang != "auto" and sub.startswith(source_lang + "-"):
+        sub = sub[len(source_lang) + 1:]
+    original_host = _translate_host_from_segments(sub.split("-"))
+    if not original_host:
+        return url
+    query = [(k, v) for k, v in parse_qsl(parts.query) if not k.startswith("_x_tr_")]
+    return urlunparse(("https", original_host, parts.path, "", urlencode(query), ""))
 
 
 def _homepage_url_from_search_url(url: str) -> str:
@@ -1414,6 +1492,107 @@ class BrowserFetchPool:
                 self._lane_cycle.put_nowait(lane)
             except Exception:  # pylint: disable=broad-except
                 pass
+
+    # -- page crawling -------------------------------------------------------
+
+    async def _crawl_checkout(self) -> "_Lane":
+        """Check a lane out for a crawl, same lifecycle as a search fetch."""
+        await self._init()
+        await self._ensure_browser_alive()
+        lane = await self._lane_cycle.get()
+        lane.busy = True
+        lane.last_used = time.monotonic()
+        return lane
+
+    async def crawl_render(self, url: str, *, timeout_s: float = 30.0) -> dict:
+        """Navigate a page in a lane browser and return the rendered DOM.
+
+        Returns a dict with ``final_url``, ``status`` and ``html``. The
+        navigation follows redirects, so google's encrypted ``/goto``
+        wrappers resolve to their real target; a landing on a Google
+        Translate copy is rewritten to the original page and re-fetched
+        (the translation service stays unused).
+        """
+        url = unwrap_google_translate_url(url)
+        lane = await self._crawl_checkout()
+        try:
+            async with lane.lock:
+                page = await lane.context.new_page()
+                try:
+                    response = await page.goto(
+                        url, timeout=timeout_s * 1000, wait_until="commit"
+                    )
+                    status = response.status if response else None
+                    headers = response.headers if response else {}
+                    if _looks_like_bot_challenge(status, headers):
+                        await page.wait_for_timeout(_BOT_CHALLENGE_GRACE_MS)
+                    try:
+                        await page.wait_for_load_state(
+                            "networkidle", timeout=_BOT_CHALLENGE_GRACE_MS
+                        )
+                    except Exception:  # pylint: disable=broad-except
+                        pass
+                    final_url = page.url
+                    if _is_google_translate_url(final_url):
+                        original = unwrap_google_translate_url(final_url)
+                        if original != final_url:
+                            logger.info(
+                                "crawl of %s landed on a Google Translate copy;"
+                                " fetching the original %s",
+                                url, original[:100],
+                            )
+                            response = await page.goto(
+                                original, timeout=timeout_s * 1000,
+                                wait_until="commit",
+                            )
+                            status = response.status if response else None
+                            try:
+                                await page.wait_for_load_state(
+                                    "networkidle", timeout=_BOT_CHALLENGE_GRACE_MS
+                                )
+                            except Exception:  # pylint: disable=broad-except
+                                pass
+                            final_url = page.url
+                    html_text = await page.content()
+                    return {
+                        "final_url": final_url,
+                        "status": status,
+                        "html": html_text,
+                        "challenge": _looks_like_unresolved_challenge_body(
+                            html_text.encode("utf-8", errors="replace")
+                        ),
+                    }
+                finally:
+                    await page.close()
+        finally:
+            self._return_lane(lane)
+
+    async def crawl_bytes(self, url: str, *, timeout_s: float = 30.0, max_bytes: int = 52428800) -> dict:
+        """Fetch raw bytes in a lane's browser context (browser TLS + cookies).
+
+        Returns a dict with ``final_url``, ``status``, ``content_type`` and
+        ``content`` (bytes, capped at ``max_bytes``).
+        """
+        lane = await self._crawl_checkout()
+        try:
+            async with lane.lock:
+                response = await lane.context.request.get(
+                    url, timeout=timeout_s * 1000
+                )
+                body = await response.body()
+                if len(body) > max_bytes:
+                    raise CrawlBodyTooLarge(len(body), max_bytes)
+                return {
+                    "final_url": response.url,
+                    "status": response.status,
+                    "content_type": response.headers.get("content-type"),
+                    "challenge": _looks_like_bot_challenge(
+                        response.status, response.headers
+                    ),
+                    "content": body,
+                }
+        finally:
+            self._return_lane(lane)
 
     async def _fetch_on_lane(
         self,
