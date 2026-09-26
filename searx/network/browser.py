@@ -946,6 +946,11 @@ class _Lane:
         # flock handle for the lane's persistent profile (see
         # _acquire_profile_lock); None for ephemeral lanes
         self.profile_lock = None
+        # True while the lane is checked out by a request or a browsing
+        # session; the idle reaper must not touch it then
+        self.busy = False
+        # last return-to-cycle time (monotonic); drives idle reaping
+        self.last_used = time.monotonic()
         # SERP page handed over by a human-path fetch for post-search
         # browsing; the browsing session consumes (and closes) it.
         self.serp_page = None
@@ -1025,6 +1030,7 @@ class BrowserFetchPool:
         self._init_lock = asyncio.Lock()
         self._playwright = None
         self._closed = False
+        self._reaper_task: asyncio.Task | None = None
 
     async def _init(self):
         if self._lanes:
@@ -1059,6 +1065,8 @@ class BrowserFetchPool:
                 self._lane_cycle = asyncio.Queue()
                 for lane in self._lanes:
                     self._lane_cycle.put_nowait(lane)
+                if self._profile_dir:
+                    self._reaper_task = asyncio.create_task(self._reap_loop())
                 logger.info(
                     "Browser fetch pool up: %d lane(s) on displays %s, chromium=%s",
                     len(self._lanes),
@@ -1070,6 +1078,12 @@ class BrowserFetchPool:
                 # keeps running otherwise, one ~130 MiB leak per failed start.
                 await self._shutdown_browser()
                 raise BrowserFetchError(f"browser pool init failed: {e}") from e
+
+    # Lanes idle this long get their browser closed and their profile lock
+    # released, so the shared lane dirs become available to other browser
+    # operators (Onyx's crawler workers). A reaped lane relaunches
+    # transparently on its next request.
+    _LANE_IDLE_REAP_S = 900.0
 
     def _lane_profile_dir(self, lane_index: int) -> str | None:
         """This lane's persistent profile directory, or None for an
@@ -1181,6 +1195,9 @@ class BrowserFetchPool:
             # let the sessions run their finally blocks (page close) while
             # the contexts still exist
             await asyncio.gather(*list(self._browsing_tasks), return_exceptions=True)
+        if self._reaper_task is not None:
+            self._reaper_task.cancel()
+            self._reaper_task = None
         for lane in self._lanes:
             _release_profile_lock(lane.profile_lock)
             lane.profile_lock = None
@@ -1202,6 +1219,55 @@ class BrowserFetchPool:
                 pass
             self._playwright = None
 
+    async def _reap_loop(self) -> None:
+        """Periodically close browsers on idle lanes, releasing their
+        profile locks for other operators sharing the lane volume."""
+        while not self._closed:
+            try:
+                await asyncio.sleep(60.0)
+            except asyncio.CancelledError:
+                return
+            if self._closed or self._lane_cycle is None:
+                return
+            try:
+                await self._reap_idle_lanes()
+            except Exception:  # pylint: disable=broad-except
+                logger.debug("idle lane reap failed", exc_info=True)
+
+    async def _reap_idle_lanes(self) -> None:
+        """Close the browser of each lane idle past ``_LANE_IDLE_REAP_S``.
+
+        The profile flock is held for the browser's lifetime, so releasing
+        it requires closing the browser; a reaped lane relaunches
+        transparently on its next request via ``_ensure_browser_alive``
+        (which re-acquires the lock or degrades that request to an
+        ephemeral context when another operator holds the lane).
+        """
+        now = time.monotonic()
+        for lane in self._lanes:
+            if lane.busy or not self._lane_is_alive(lane):
+                continue
+            if now - lane.last_used < self._LANE_IDLE_REAP_S:
+                continue
+            logger.info(
+                "Reaping idle browser lane %s (profile lock released)",
+                lane.display or "headless",
+            )
+            if lane.context is not None:
+                try:
+                    await lane.context.close()
+                except Exception:  # pylint: disable=broad-except
+                    pass
+            if lane.browser is not None:
+                try:
+                    await lane.browser.close()
+                except Exception:  # pylint: disable=broad-except
+                    pass
+            _release_profile_lock(lane.profile_lock)
+            lane.profile_lock = None
+            lane.browser = None
+            lane.context = None
+
     async def _ensure_browser_alive(self):
         """Restart lanes whose browser process died after a crash.
 
@@ -1209,7 +1275,8 @@ class BrowserFetchPool:
         still looks initialized: without this check every fetch on the lane
         keeps raising TargetClosedError until the container is restarted.
         Only affected lanes restart -- one crashed lane must not take down
-        the whole pool.
+        the whole pool. A lane reaped by the idle reaper (context closed to
+        release its profile lock) relaunches through the same path.
         """
         if all(self._lane_is_alive(lane) for lane in self._lanes):
             return
@@ -1234,17 +1301,18 @@ class BrowserFetchPool:
     async def _restart_lane(self, lane: _Lane) -> None:
         """Rebuild a lane in place: the lane cycle queue holds this object."""
         lane_index = self._lanes.index(lane)
-        try:
-            await lane.context.close()
-        except Exception:  # pylint: disable=broad-except
-            pass
+        _release_profile_lock(lane.profile_lock)
+        lane.profile_lock = None
+        if lane.context is not None:
+            try:
+                await lane.context.close()
+            except Exception:  # pylint: disable=broad-except
+                pass
         if lane.browser is not None:
             try:
                 await lane.browser.close()
             except Exception:  # pylint: disable=broad-except
                 pass
-        _release_profile_lock(lane.profile_lock)
-        lane.profile_lock = None
         replacement = await self._launch_lane(lane_index, _discover_chromium())
         lane.browser = replacement.browser
         lane.context = replacement.context
@@ -1285,6 +1353,8 @@ class BrowserFetchPool:
 
         # One lane per in-flight request: wait for the next free lane.
         lane = await self._lane_cycle.get()
+        lane.busy = True
+        lane.last_used = time.monotonic()
         # Decided up front so the interactive path knows to hand its page
         # over; the actual spawn happens once the response is captured.
         keep_page = method.upper() == "GET" and self._post_search_wanted(url)
@@ -1328,7 +1398,17 @@ class BrowserFetchPool:
                 return response
         finally:
             if not browsing:
+                self._return_lane(lane)
+
+    def _return_lane(self, lane: _Lane) -> None:
+        """Hand a lane back to the cycle (centralized for the busy flag)."""
+        lane.busy = False
+        lane.last_used = time.monotonic()
+        if self._lane_cycle is not None:
+            try:
                 self._lane_cycle.put_nowait(lane)
+            except Exception:  # pylint: disable=broad-except
+                pass
 
     async def _fetch_on_lane(
         self,
@@ -1785,11 +1865,7 @@ class BrowserFetchPool:
             )
         finally:
             await self._discard_serp_page(lane)
-            if not self._closed and self._lane_cycle is not None:
-                try:
-                    self._lane_cycle.put_nowait(lane)
-                except Exception:  # pylint: disable=broad-except
-                    pass
+            self._return_lane(lane)
             logger.info(
                 "post-search browsing done on lane %s: %d visit(s) in %.0fs",
                 lane.display or "headless",
