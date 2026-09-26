@@ -292,6 +292,13 @@ def unwrap_google_url(raw_url: str) -> str:
     # remove redirector from url
     if raw_url.startswith("/url?q="):
         return unquote(raw_url[7:].split("&sa=U")[0])
+    if raw_url.startswith("/goto?url="):
+        # Google's newer encrypted redirect: the target is only resolvable
+        # server-side, so the redirector itself stays the result URL.
+        # Resolving it would cost one inorganic request per result -- exactly
+        # the traffic antibot protections notice -- while the link still
+        # leads to the target when it is followed.
+        return "https://www.google.com" + raw_url
     return raw_url
 
 

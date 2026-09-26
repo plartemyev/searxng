@@ -114,6 +114,27 @@ class TestGoogleDesktopResponse(SearxTestCase):
         suggestions = [getattr(r, "suggestion", None) for r in results]
         self.assertIn("searxng docker", suggestions)
 
+    def test_response_keeps_encrypted_goto_links(self):
+        html = """
+        <html><body><div id="rso">
+          <div class="g">
+            <a href="/goto?url=CAESgwEB6zswFZ2Jd9EVFTvydtJ4FRrW427FWj8"><h3>How Do Solar Panels Work?</h3></a>
+            <div class="VwiC3b">Sunlight hits the panel and the inverter converts the current.</div>
+          </div>
+        </div></body></html>
+        """
+        resp = self._resp(html)
+        results = list(google.response(resp))
+
+        main = [r for r in results if getattr(r, "url", None)]
+        self.assertEqual(len(main), 1)
+        self.assertEqual(
+            main[0].url,
+            "https://www.google.com/goto?url=CAESgwEB6zswFZ2Jd9EVFTvydtJ4FRrW427FWj8",
+        )
+        self.assertEqual(main[0].title, "How Do Solar Panels Work?")
+        self.assertIn("Sunlight hits the panel", main[0].content)
+
     def test_response_falls_back_to_wml_layout(self):
         resp = self._resp(
             '<?xml version="1.0" encoding="UTF-8"?>'
@@ -173,3 +194,9 @@ class TestUnwrapGoogleUrl(SearxTestCase):
             "https://example.com/a",
         )
         self.assertEqual(google.unwrap_google_url("https://example.com/a"), "https://example.com/a")
+        # the encrypted redirect is kept: it leads to the target when
+        # followed, and decoding it inorganically would trip antibot
+        self.assertEqual(
+            google.unwrap_google_url("/goto?url=CAESgwEB6zswFZ2Jd9EVFTvydtJ4FRrW427FWj8"),
+            "https://www.google.com/goto?url=CAESgwEB6zswFZ2Jd9EVFTvydtJ4FRrW427FWj8",
+        )
