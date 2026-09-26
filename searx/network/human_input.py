@@ -462,6 +462,17 @@ async def human_search_on_page(page, query: str, pointer: _XPointer) -> bool:
         return False
 
     await _human_type(page, query, pointer)
+    # TEMPORARY (diagnostics): confirm the keystrokes really reached the box
+    try:
+        typed = await input_loc.evaluate("el => el.value")
+        if typed:
+            logger.debug("human search: typed %r", typed)
+        else:
+            logger.warning(
+                "human search: the search box stayed empty on %s", page.url
+            )
+    except Exception:  # pylint: disable=broad-except
+        pass
     # proofread what was typed before firing the search; the hand rests
     # near the box, so the drift stays tight
     await _human_idle(
@@ -470,6 +481,13 @@ async def human_search_on_page(page, query: str, pointer: _XPointer) -> bool:
 
     button_loc = await _find_visible(page, _SEARCH_BUTTON_SELECTORS)
     if button_loc is not None:
+        try:
+            state = await button_loc.evaluate(
+                "el => ({disabled: el.disabled, name: el.name || ''})"
+            )
+            logger.debug("human search: submit control %s", state)
+        except Exception:  # pylint: disable=broad-except
+            pass
         await _human_click_locator(button_loc, pointer)
     else:
         pointer.press('enter')

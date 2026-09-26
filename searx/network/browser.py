@@ -281,6 +281,12 @@ _LAUNCH_ARGS = [
     "--disable-dev-shm-usage",
     "--disable-blink-features=AutomationControlled",
     "--disable-infobars",
+    # Keep the physical window equal to the emulated viewport: the XTEST
+    # mapping (human_input._to_screen) derives the chrome offset from
+    # outerHeight - innerHeight, and under viewport emulation innerHeight
+    # reports the emulated size -- a 1031px window around a 900px viewport
+    # pushed every click 131px below its target.
+    "--window-size=1440,900",
 ]
 
 
@@ -1410,7 +1416,7 @@ class BrowserFetchPool:
 
     async def _settle_after_search(
         self, page, pointer, timeout_s: float
-    ) -> None:
+    ) -> bool:
         """Wait out the post-click navigation, solving challenges on the way.
 
         The search submit navigates asynchronously: a ``networkidle`` or URL
@@ -1419,9 +1425,13 @@ class BrowserFetchPool:
         it leaves the challenge interstitial (clicking its checkbox with the
         real mouse when one appears), or until the budget is spent -- the
         captured DOM then tells the engine what happened.
+
+        Returns False when the submission never navigated away at all: the
+        caller must not capture the front page then, or the engine would
+        parse a silent zero-results success out of it.
         """
         # pylint: disable=import-outside-toplevel
-        from searx.network.human_input import human_clear_challenge
+        from searx.network.human_input import _debug_dump, human_clear_challenge
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + max(8.0, min(timeout_s, 30.0))
@@ -1439,7 +1449,14 @@ class BrowserFetchPool:
             logger.warning(
                 "human search: submission never navigated away from %s", start_url
             )
-            return
+            # trace the stuck page: without a dump this failure mode is
+            # invisible in engine stats
+            try:
+                png = await page.screenshot()
+                _debug_dump("stuck_home", 0, png, page.url)
+            except Exception:  # pylint: disable=broad-except
+                pass
+            return False
 
         # phase 2: challenges on the arrival page
         iterations = 0
@@ -1453,12 +1470,13 @@ class BrowserFetchPool:
                 except Exception:  # pylint: disable=broad-except
                     pass
                 if not _is_challenge_url(page.url):
-                    return
+                    return True
             solved = await human_clear_challenge(
                 page, pointer, settle_ms=_BOT_CHALLENGE_GRACE_MS
             )
             if not solved:
                 await asyncio.sleep(random.uniform(0.6, 1.2))  # noqa: S311
+        return True
 
     async def _fetch_via_human_search(
         self, lane: _Lane, url: str, timeout_s: float, keep_page: bool = False
@@ -1522,7 +1540,12 @@ class BrowserFetchPool:
                         )
                     await human_clear_challenge(page, pointer)
                     if await human_search_on_page(page, query, pointer):
-                        await self._settle_after_search(page, pointer, timeout_s)
+                        if not await self._settle_after_search(
+                            page, pointer, timeout_s
+                        ):
+                            # stuck on the front page: the engine would parse
+                            # a silent zero-results success out of that DOM
+                            return None
                     else:
                         # No usable search box: navigate the results URL so
                         # at least challenge JS runs in a real page.
