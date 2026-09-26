@@ -1673,6 +1673,9 @@ class BrowserFetchPool:
         Translate copy is rewritten to the original page and re-fetched
         (the translation service stays unused).
         """
+        # pylint: disable=import-outside-toplevel
+        from searx.network.human_input import debug_trace_enabled
+
         url = unwrap_google_translate_url(url)
         lane, affinity, borrowed = await self._checkout_for_crawl(url)
         if affinity:
@@ -1725,7 +1728,7 @@ class BrowserFetchPool:
                     "lane": lane.display or "headless",
                     "affinity": affinity,
                 }
-                if _TRACE_STATE["enabled"]:
+                if debug_trace_enabled():
                     result["memory"] = self._memory_debug(url)
                 return result
             finally:
@@ -1760,7 +1763,7 @@ class BrowserFetchPool:
                     "lane": lane.display or "headless",
                     "affinity": affinity,
                 }
-                if _TRACE_STATE["enabled"]:
+                if debug_trace_enabled():
                     result["memory"] = self._memory_debug(url)
                 return result
         finally:

@@ -472,20 +472,22 @@ def test_checkout_for_crawl_borrows_busy_affinity_lane():
     same browser instead of losing affinity -- and must not hand the lane
     back to the cycle afterwards."""
     import asyncio
+    from types import SimpleNamespace as NS
 
     pool = browser_module.BrowserFetchPool(pool_size=2)
     lane_a = browser_module._Lane(None, None, ":110")
     lane_b = browser_module._Lane(None, None, ":111")
     pool._lanes = [lane_a, lane_b]
     pool._lane_cycle = asyncio.Queue()
-    for lane in pool._lanes:
-        pool._lane_cycle.put_nowait(lane)
+    pool._init_done = True  # fake lanes: skip the real pool init
+    pool._ensure_browser_alive = lambda: asyncio.sleep(0)  # noqa: ARG005
+    lane_b.browser = NS(is_connected=lambda: True)
 
     target = "https://www.google.com/goto?url=CAESZAHrOzAVHB0og9NqrORWjur2zmOTzwdJe1Vj5Y"
     lane_b.serp_urls.append(target)
 
     # simulate lane_b being checked out by a browsing session
-    pool._lane_cycle.get_nowait()  # remove lane order: pop both, keep b out
+    pool._lane_cycle.get_nowait()  # drop lane order: both out
     pool._lane_cycle.get_nowait()
     lane_b.busy = True
 
@@ -493,7 +495,6 @@ def test_checkout_for_crawl_borrows_busy_affinity_lane():
         return await pool._checkout_for_crawl(target)
 
     lane, affinity, borrowed = asyncio.new_event_loop().run_until_complete(_run())
-    assert (lane, affinity, borrowed) is not None
     assert lane is lane_b
     assert affinity is True
     assert borrowed is True
