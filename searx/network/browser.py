@@ -280,83 +280,41 @@ _LAUNCH_ARGS = [
 ]
 
 
-def _stealth_init_script(chrome_major: str, chrome_full: str) -> str:
-    """Init script aligning every JS-visible surface with a Windows Chrome
-    ``{chrome_major}`` identity. Claims must match the UA/Client Hints set on
-    the context."""
+def _stealth_init_script(language_tags: list[str]) -> str:
+    """Init script with anti-automation patches only.
+
+    The lane presents the binary's real identity (distro Chromium, Linux,
+    IP-derived locale): kernel, TLS stack and Client-Hint headers already
+    say Linux Chrome, so anything claimed in JS must agree -- a Windows
+    persona here would be contradicted on the wire by every other layer.
+    """
     return """
     Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-    Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-    Object.defineProperty(navigator, 'platform', {get: () => 'Win32'});
-    window.chrome = { runtime: {}, loadTimes: function () {}, csi: function () {} };
-    const fakePlugin = (name) => {
-        const p = { name, description: name,
-                    filename: name.toLowerCase().replaceAll(' ', '_'), length: 1 };
-        p[0] = { type: 'application/pdf', suffixes: 'pdf', description: name };
-        return p;
-    };
-    Object.defineProperty(navigator, 'plugins', {
-        get: () => {
-            const arr = [fakePlugin('PDF Viewer'), fakePlugin('Chrome PDF Viewer'),
-                         fakePlugin('Chromium PDF Viewer'),
-                         fakePlugin('Microsoft Edge PDF Viewer'),
-                         fakePlugin('WebKit built-in PDF')];
-            arr.namedItem = (n) => arr.find(p => p.name === n) || null;
-            arr.item = (i) => arr[i] || null;
-            arr.refresh = () => {};
-            return arr;
-        }
-    });
-    Object.defineProperty(navigator, 'mimeTypes', {
-        get: () => {
-            const arr = [{ type: 'application/pdf', suffixes: 'pdf', description: '' }];
-            arr.namedItem = (n) => arr.find(m => m.type === n) || null;
-            arr.item = (i) => arr[i] || null;
-            return arr;
-        }
-    });
-    if (window.Notification) {
-        Object.defineProperty(Notification, 'permission', { get: () => 'default' });
-    }
+    Object.defineProperty(navigator, 'languages',
+                          {get: () => __LANGUAGES__});
     const patchGL = (proto) => {
         const orig = proto.getParameter;
         proto.getParameter = function (param) {
-            // UNMASKED_VENDOR_WEBGL / UNMASKED_RENDERER_WEBGL: headless and VM
-            // builds report SwiftShader/llvmpipe, a top bot signal.
+            // UNMASKED_VENDOR_WEBGL / UNMASKED_RENDERER_WEBGL: the VM has
+            // no GPU and would report llvmpipe, a classic bot signal.
             if (param === 37445) return 'Google Inc. (NVIDIA)';
             if (param === 37446) {
-                return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+                return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1650/PCIe/SSE2,'
+                       + ' OpenGL 4.5.0 NVIDIA 550.107.02)';
             }
             return orig.call(this, param);
         };
     };
     if (window.WebGLRenderingContext) patchGL(WebGLRenderingContext.prototype);
     if (window.WebGL2RenderingContext) patchGL(WebGL2RenderingContext.prototype);
-    const brands = [
-        { brand: 'Chromium', version: '__MAJOR__' },
-        { brand: 'Google Chrome', version: '__MAJOR__' },
-        { brand: 'Not:A-Brand', version: '24' },
-    ];
-    Object.defineProperty(navigator, 'userAgentData', {
-        get: () => ({
-            brands,
-            mobile: false,
-            platform: 'Windows',
-            getHighEntropyValues: (hints) => Promise.resolve({
-                architecture: 'x86',
-                bitness: '64',
-                model: '',
-                mobile: false,
-                platform: 'Windows',
-                platformVersion: '15.0.0',
-                uaFullVersion: '__FULL__',
-                fullVersionList: brands,
-                wow64: false,
-            }),
-            toJSON: () => ({ brands, mobile: false, platform: 'Windows' }),
-        }),
-    });
-    """.replace("__MAJOR__", chrome_major).replace("__FULL__", chrome_full)
+    """.replace("__LANGUAGES__", json.dumps(language_tags))
+
+
+def _language_tags(accept_language: str) -> list[str]:
+    """Language tags in priority order, from the geo Accept-Language header,
+    so ``navigator.languages`` agrees with what goes on the wire."""
+    tags = [part.split(";")[0].strip() for part in accept_language.split(",")]
+    return [tag for tag in tags if tag] or ["en-US"]
 
 
 # A Cloudflare challenge interstitial is identified by its page title and by
@@ -525,9 +483,10 @@ def _looks_like_js_interstitial(body: bytes) -> bool:
 
 
 # Identity headers the masqueraded browser owns. Engine-supplied values are
-# dropped from fetch requests unless the engine opted out: a Chromium lane
-# whose TLS stack, Client Hints and JS surface say Windows Chrome must not
-# introduce itself with a per-request engine UA on the same cookie jar.
+# dropped from fetch requests unless the engine opted out: the lane's
+# identity is the binary's own (Linux Chromium, IP-derived locale), and a
+# per-request engine UA on the same cookie jar would contradict everything
+# else the lane emits.
 _IDENTITY_HEADERS = frozenset(
     {
         "user-agent",
@@ -932,20 +891,16 @@ class BrowserFetchPool:
             launch_kwargs["proxy"] = {"server": self._proxy}
         browser = await self._playwright.chromium.launch(**launch_kwargs)
         geo = await loop.run_in_executor(None, _detect_ip_locale)
-        chrome_full = browser.version  # e.g. "153.0.8010.52"
-        chrome_major = chrome_full.split(".", 1)[0]
         context = await browser.new_context(
-            **self._context_kwargs(geo, chrome_major)
+            **self._context_kwargs(geo)
         )
-        await context.add_init_script(_stealth_init_script(chrome_major, chrome_full))
+        await context.add_init_script(_stealth_init_script(_language_tags(geo["accept_language"])))
         return _Lane(browser, context, display)
 
-    def _context_kwargs(self, geo: dict, chrome_major: str) -> dict:
-        """Context options matching the IP-derived identity and binary."""
-        user_agent = (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            f"(KHTML, like Gecko) Chrome/{chrome_major}.0.0.0 Safari/537.36"
-        )
+    def _context_kwargs(self, geo: dict) -> dict:
+        """Context options matching the IP-derived identity. The UA is left
+        at the binary's own value: kernel, TLS and Client-Hint headers say
+        Linux Chromium, so no override is needed or wanted."""
         extra_headers = {
             # Accept-Language only: Chromium sets Accept and the
             # Sec-Fetch-* headers per request itself. Forcing
@@ -955,7 +910,6 @@ class BrowserFetchPool:
             "Accept-Language": geo["accept_language"],
         }
         context_kwargs: dict = {
-            "user_agent": user_agent,
             "viewport": {"width": 1440, "height": 900},
             "locale": geo["locale"],
             "timezone_id": geo["timezone"],
