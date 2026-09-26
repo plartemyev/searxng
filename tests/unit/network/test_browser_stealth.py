@@ -672,3 +672,142 @@ def test_post_search_wanted_requires_idle_lane():
     pool._lane_cycle.put_nowait(object())
     assert pool._post_search_wanted("https://www.bing.com/search?q=x") is True
     assert pool._post_search_wanted("https://www.bing.com/ac/?q=x") is False
+
+
+# -- per-origin human pacing -------------------------------------------------
+
+def test_origin_gate_spaces_hits_on_one_origin_only(monkeypatch):
+    """Two requests to one origin keep the jittered gap; another origin
+    is never delayed by them."""
+    async def _run():
+        pool = browser_module.BrowserFetchPool(
+            origin_gap_search=(0.05, 0.08), origin_gap_site=(0.05, 0.08)
+        )
+        t0 = time.monotonic()
+        await pool._origin_gate("https://www.example.org/a")
+        await pool._origin_gate("https://www.example.org/b")
+        same = time.monotonic() - t0
+        t0 = time.monotonic()
+        await pool._origin_gate("https://other.example.net/x")
+        other = time.monotonic() - t0
+        return same, other
+
+    same, other = asyncio.new_event_loop().run_until_complete(_run())
+    assert same >= 0.04  # the second hit waited out the gap
+    assert other < 0.04  # a different origin does not wait
+
+
+def test_origin_gate_caps_the_wait(monkeypatch):
+    """A burst never waits more than the cap: delivery beats pacing."""
+    monkeypatch.setattr(browser_module, "_ORIGIN_GATE_MAX_WAIT_S", 0.05)
+
+    async def _run():
+        pool = browser_module.BrowserFetchPool()
+        pool._origin_last["busy.example.org"] = time.monotonic() + 1000.0
+        t0 = time.monotonic()
+        await pool._origin_gate("https://busy.example.org/page")
+        return time.monotonic() - t0
+
+    waited = asyncio.new_event_loop().run_until_complete(_run())
+    assert waited < 1.0
+
+
+# -- bounded lane waits -------------------------------------------------------
+
+def test_search_lane_wait_preempts_browsing_session(monkeypatch):
+    """When every lane is out with background browsing, the oldest session
+    is cancelled and its lane serves the waiting search."""
+    monkeypatch.setattr(browser_module, "_SEARCH_LANE_WAIT_S", 0.05)
+
+    pool = browser_module.BrowserFetchPool(pool_size=1)
+    lane = browser_module._Lane(None, None, ":110")
+    pool._lanes = [lane]
+    pool._lane_cycle = asyncio.Queue()
+    pool._init_done = True
+
+    async def _browsing():
+        try:
+            await asyncio.sleep(60)
+        finally:
+            pool._return_lane(lane)  # the real session's finally
+
+    async def _run():
+        task = asyncio.get_running_loop().create_task(_browsing())
+        pool._browsing_tasks.add(task)
+        pool._browsing_started[task] = time.monotonic()
+        got = await pool._wait_for_free_search_lane()
+        return got, task
+
+    got, task = asyncio.new_event_loop().run_until_complete(_run())
+    assert got is lane
+    assert task.cancelled() or task.done()
+
+
+def test_search_lane_wait_gives_up_bounded(monkeypatch):
+    """No lane, no browsing to preempt: the wait fails inside its budget
+    so the search call can end and the client can retry later."""
+    monkeypatch.setattr(browser_module, "_SEARCH_LANE_WAIT_S", 0.05)
+    monkeypatch.setattr(browser_module, "_SEARCH_LANE_WAIT_AFTER_PREEMPT_S", 0.05)
+
+    pool = browser_module.BrowserFetchPool(pool_size=1)
+    pool._lanes = [browser_module._Lane(None, None, ":110")]
+    pool._lane_cycle = asyncio.Queue()
+    pool._init_done = True
+
+    async def _run():
+        return await pool._wait_for_free_search_lane()
+
+    try:
+        asyncio.new_event_loop().run_until_complete(_run())
+        raise AssertionError("expected BrowserFetchError")
+    except browser_module.BrowserFetchError:
+        pass
+
+
+def test_checkout_for_crawl_borrows_any_lane_when_pool_full():
+    """A crawl must not fail for lack of a lane: when nothing is free and
+    no affinity lane exists, it borrows a busy (alive) lane."""
+    pool = browser_module.BrowserFetchPool(pool_size=2)
+    lane_a = browser_module._Lane(None, None, ":110")
+    lane_b = browser_module._Lane(None, None, ":111")
+    for lane in (lane_a, lane_b):
+        lane.busy = True
+        lane.browser = SimpleNamespace(is_connected=lambda: True)
+    pool._lanes = [lane_a, lane_b]
+    pool._lane_cycle = asyncio.Queue()
+    pool._init_done = True
+    pool._ensure_browser_alive = lambda: asyncio.sleep(0)  # noqa: ARG005
+
+    async def _run():
+        return await pool._checkout_for_crawl("https://unrelated.example.org/x")
+
+    lane, affinity, borrowed = asyncio.new_event_loop().run_until_complete(_run())
+    assert lane in (lane_a, lane_b)
+    assert affinity is False
+    assert borrowed is True
+
+
+# -- solver session budget ----------------------------------------------------
+
+def test_vision_session_budget_stops_the_rounds(monkeypatch):
+    """A solve attempt returns once its wall-clock budget is spent instead
+    of holding the lane for the full round allowance."""
+    class _FakeTime:
+        def __init__(self):
+            self.calls = 0
+
+        def monotonic(self):
+            self.calls += 1
+            # first read starts the solve; by the budget check it is spent
+            return 0.0 if self.calls == 1 else 9999.0
+
+    monkeypatch.setattr(human_input_module, "time", _FakeTime())
+    solver = SimpleNamespace(cfg=SimpleNamespace(session_budget=0.001))
+
+    async def _run():
+        return await human_input_module._run_image_rounds(
+            None, None, solver, max_rounds=99, found=set()
+        )
+
+    solved = asyncio.new_event_loop().run_until_complete(_run())
+    assert solved is False

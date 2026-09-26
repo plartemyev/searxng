@@ -557,6 +557,28 @@ _POST_SEARCH_DWELL_RANGE = (10.0, 30.0)  # seconds per visited result page
 _POST_SEARCH_EXTRA_VISITS = (1, 3)  # more result pages after the first
 _POST_SEARCH_BUDGET_S = 180.0  # wall-clock cap for a whole browsing session
 _POST_SEARCH_MAX_LINKS = 60  # candidate result links kept per SERP
+
+# Human-paced access per origin. From a target server's view our traffic
+# must look like one attentive person doing research: successive requests
+# to the SAME site keep a minimum gap (jittered) even across lanes, while
+# different origins stay parallel -- a human with several tabs. Gaps are
+# [min, max] seconds; settable via outgoing.browser_origin_gap_search and
+# outgoing.browser_origin_gap_site.
+_ORIGIN_GAP_SEARCH_S = (4.0, 10.0)  # re-querying a search engine
+_ORIGIN_GAP_SITE_S = (8.0, 20.0)  # reading a page before the next hit
+# Burst cap: after ~5 queued same-origin requests the pacing yields to
+# delivering the result (wait = min(needed, cap), start-time gated).
+_ORIGIN_GATE_MAX_WAIT_S = 45.0
+# Lane waits for a search: bounded so a search call always finishes inside
+# the client's budget. When the first window lapses, the oldest background
+# browsing session is cancelled (a reader drops idle reading to search
+# again) and the wait continues; an in-flight fetch takes at most one
+# engine timeout, so the second window covers it.
+_SEARCH_LANE_WAIT_S = 20.0
+_SEARCH_LANE_WAIT_AFTER_PREEMPT_S = 90.0
+# A crawl never fails for lack of a lane: after this wait it borrows a busy
+# lane (the reader opens another tab on that identity).
+_CRAWL_LANE_WAIT_S = 30.0
 # Same-site links that are the engine's outbound redirect wrappers: these
 # ARE the organic click targets on the results page. Any other same-site
 # link (verticals, related searches, settings) is not a reader's click.
@@ -569,6 +591,19 @@ _POST_SEARCH_SKIP_EXTENSIONS = (
 # Result URLs the lane memory keeps for crawl affinity: same skip list, so
 # a crawl never gets routed because a favicon matched.
 _SERP_MEMORY_SKIP_EXTENSIONS = _POST_SEARCH_SKIP_EXTENSIONS
+
+
+_SEARCH_ORIGIN_HOST_PARTS = (
+    "google.", "bing.", "brave.com", "duckduckgo.", "yandex.",
+    "baidu.", "startpage.", "ecosia.org", "qwant.", "search.marcia",
+    "mojeek.", "searx.",
+)
+
+
+def _is_search_origin(host: str) -> bool:
+    """Is this host a search engine the pool actually queries?"""
+    host = (host or "").lower()
+    return any(part in host for part in _SEARCH_ORIGIN_HOST_PARTS)
 
 
 def _is_browsable_search_url(url: str) -> bool:
@@ -1103,6 +1138,8 @@ class BrowserFetchPool:
         self, pool_size: int = 3, verify: bool = True, proxy: str | None = None,
         human_fallback: bool = True, max_stealth: bool = False,
         profile_dir: str | None = None, post_search_browsing: bool = False,
+        origin_gap_search: tuple[float, float] | None = None,
+        origin_gap_site: tuple[float, float] | None = None,
     ):
         self._pool_size = max(1, pool_size)
         self._verify = verify
@@ -1111,7 +1148,14 @@ class BrowserFetchPool:
         self._max_stealth = max_stealth
         self._profile_dir = profile_dir
         self._post_search = post_search_browsing
+        self._gap_search = tuple(origin_gap_search or _ORIGIN_GAP_SEARCH_S)
+        self._gap_site = tuple(origin_gap_site or _ORIGIN_GAP_SITE_S)
+        # per-origin pacing state: one lock serializes the waiters for an
+        # origin, the timestamp is the last request START to that origin
+        self._origin_locks: dict[str, asyncio.Lock] = {}
+        self._origin_last: dict[str, float] = {}
         self._browsing_tasks: set[asyncio.Task] = set()
+        self._browsing_started: dict[asyncio.Task, float] = {}
         self._lanes: list[_Lane] = []
         self._lane_cycle: asyncio.Queue | None = None
         self._init_lock = asyncio.Lock()
@@ -1443,6 +1487,120 @@ class BrowserFetchPool:
         self._closed = True
         await self._shutdown_browser()
 
+    # -- per-origin human pacing ---------------------------------------------
+
+    def _origin_of(self, url: str) -> str:
+        try:
+            host = urlsplit(url).hostname or ""
+        except ValueError:
+            host = ""
+        return (host or url).lower()
+
+    def _origin_gap(self, origin: str) -> tuple[float, float]:
+        return self._gap_search if _is_search_origin(origin) else self._gap_site
+
+    async def _origin_gate(self, url: str) -> str:
+        """Wait out the human gap for this URL's origin; returns the origin.
+
+        Gating is on request STARTS: a burst of requests to one origin
+        spaces out like a person opening tabs in quick succession, never
+        N * gap in total for the last one (capped anyway).
+        """
+        origin = self._origin_of(url)
+        lock = self._origin_locks.setdefault(origin, asyncio.Lock())
+        lo, hi = self._origin_gap(origin)
+        async with lock:
+            wait = 0.0
+            if origin in self._origin_last:
+                wait = (
+                    self._origin_last[origin]
+                    + random.uniform(lo, hi)
+                    - time.monotonic()
+                )
+            if wait > 0:
+                await asyncio.sleep(min(wait, _ORIGIN_GATE_MAX_WAIT_S))
+            self._origin_last[origin] = time.monotonic()
+        return origin
+
+    def _origin_note(self, url: str) -> None:
+        """Record an origin hit that paced itself by other means (the
+        browsing session's dwells), so crawls keep their distance."""
+        self._origin_last[self._origin_of(url)] = time.monotonic()
+
+    # -- lane acquisition -----------------------------------------------------
+
+    def _preempt_oldest_browsing(self) -> bool:
+        """Cancel the longest-running background browsing session.
+
+        A reader drops idle reading when they want to search again; the
+        session's human-like value is already banked. Its finally-block
+        returns the lane to the cycle.
+        """
+        live = [t for t in self._browsing_tasks if not t.done()]
+        if not live:
+            return False
+        oldest = min(live, key=lambda t: self._browsing_started.get(t, 0.0))
+        logger.info(
+            "all lanes busy: cancelling the oldest browsing session (%s)"
+            " to free a lane",
+            oldest.get_name(),
+        )
+        oldest.cancel()
+        return True
+
+    async def _wait_for_free_search_lane(self) -> _Lane:
+        """Next free lane for a search, with a bounded wait.
+
+        Bounded so a search call always finishes inside the client's
+        budget: first window, then one browsing preemption, then a final
+        window that covers one in-flight engine fetch.
+        """
+        cycle = self._lane_cycle
+        if cycle is None:
+            raise BrowserFetchError("browser pool is not initialized")
+        try:
+            return await asyncio.wait_for(cycle.get(), _SEARCH_LANE_WAIT_S)
+        except asyncio.TimeoutError:
+            pass
+        self._preempt_oldest_browsing()
+        try:
+            return await asyncio.wait_for(
+                cycle.get(), _SEARCH_LANE_WAIT_AFTER_PREEMPT_S
+            )
+        except asyncio.TimeoutError as err:
+            raise BrowserFetchError(
+                "no browser lane freed within"
+                f" {_SEARCH_LANE_WAIT_S + _SEARCH_LANE_WAIT_AFTER_PREEMPT_S:.0f}s"
+            ) from err
+
+    async def _claim_free_lane_for_crawl(self) -> _Lane | None:
+        """A free lane for a crawl, waiting at most _CRAWL_LANE_WAIT_S."""
+        try:
+            lane = await asyncio.wait_for(
+                self._lane_cycle.get(), _CRAWL_LANE_WAIT_S
+            )
+        except (asyncio.TimeoutError, TypeError):
+            return None
+        lane.busy = True
+        lane.last_used = time.monotonic()
+        return lane
+
+    def _borrow_any_lane(self) -> _Lane | None:
+        """Last resort: any alive busy lane, borrowed (not checked out).
+
+        A reader with many tabs: the crawl opens its page on an identity
+        that is already serving a request or a browsing session. The
+        caller must not hand the lane back to the cycle.
+        """
+        for lane in self._lanes:
+            if lane.busy and self._lane_is_alive(lane):
+                logger.info(
+                    "crawl borrows the busy lane %s (all lanes occupied)",
+                    lane.display or "headless",
+                )
+                return lane
+        return None
+
     # pylint: disable=too-many-arguments, too-many-locals
     async def fetch(
         self,
@@ -1469,8 +1627,13 @@ class BrowserFetchPool:
 
         timeout_s = max(timeout or 0, _MIN_TIMEOUT_S)
 
-        # One lane per in-flight request: wait for the next free lane.
-        lane = await self._lane_cycle.get()
+        # Human pacing first: the gap is waited out BEFORE a lane is
+        # checked out, so pacing never consumes pool capacity.
+        await self._origin_gate(url)
+
+        # One lane per in-flight request: wait (bounded) for the next free
+        # lane, preempting a background browsing session when needed.
+        lane = await self._wait_for_free_search_lane()
         lane.busy = True
         lane.last_used = time.monotonic()
         # Decided up front so the interactive path knows to hand its page
@@ -1640,6 +1803,9 @@ class BrowserFetchPool:
         """
         await self._init()
         await self._ensure_browser_alive()
+        # human pacing: keep the minimum gap to the previous hit on this
+        # origin before any lane is taken (never consumes pool capacity)
+        await self._origin_gate(url)
         preferred = self._lane_for_serp_url(url)
         if preferred is not None:
             if preferred.busy and self._lane_is_alive(preferred):
@@ -1659,10 +1825,15 @@ class BrowserFetchPool:
             # the finding lane is alive-but-unclearable or vanished in a
             # race: fall through to the normal cycle
         logger.info("crawl of %s: no lane memory hit", url)
-        lane = await self._lane_cycle.get()
-        lane.busy = True
-        lane.last_used = time.monotonic()
-        return lane, False, False
+        lane = await self._claim_free_lane_for_crawl()
+        if lane is not None:
+            return lane, False, False
+        # every lane occupied: a crawl must not fail for lack of a lane --
+        # it borrows a busy one (a reader with many tabs)
+        lane = self._borrow_any_lane()
+        if lane is None:
+            raise BrowserFetchError("no alive browser lane available for crawling")
+        return lane, False, True
 
     async def crawl_render(self, url: str, *, timeout_s: float = 30.0) -> dict:
         """Navigate a page in a lane browser and return the rendered DOM.
@@ -2179,7 +2350,11 @@ class BrowserFetchPool:
                 name=f"post-search-browsing-{lane.display or 'headless'}",
             )
             self._browsing_tasks.add(task)
+            self._browsing_started[task] = time.monotonic()
             task.add_done_callback(self._browsing_tasks.discard)
+            task.add_done_callback(
+                lambda t: self._browsing_started.pop(t, None)
+            )
             logger.info(
                 "post-search browsing: lane %s stays on %s",
                 lane.display or "headless",
@@ -2281,6 +2456,9 @@ class BrowserFetchPool:
             if await self._visit_result_page(page, pointer, raw_href, deadline):
                 visits += 1
                 visits_left -= 1
+                # the visit paced itself with its dwell; record it so a
+                # crawl to the same site keeps a human distance from it
+                self._origin_note(urljoin(serp_url, raw_href))
         return visits
 
     async def _visit_result_page(self, page, pointer, raw_href: str, deadline: float) -> bool:
@@ -2533,6 +2711,20 @@ class BrowserFetchPool:
 _POOL: BrowserFetchPool | None = None
 
 
+def _gap_range_setting(name: str, default: tuple[float, float]) -> tuple[float, float]:
+    """Read a [min, max] pacing-gap range from settings, sane-bounded."""
+    from searx import get_setting
+
+    value = get_setting(name, list(default))
+    try:
+        lo, hi = float(value[0]), float(value[1])
+    except (TypeError, ValueError, IndexError, KeyError):
+        return default
+    if not 0.0 <= lo <= hi <= 300.0:
+        return default
+    return (lo, hi)
+
+
 def get_browser_fetch_pool() -> BrowserFetchPool:
     """Return the process-wide browser fetch pool (created on first use)."""
     global _POOL  # pylint: disable=global-statement
@@ -2547,6 +2739,12 @@ def get_browser_fetch_pool() -> BrowserFetchPool:
             max_stealth=get_setting("outgoing.browser_max_stealth", False),
             profile_dir=get_setting("outgoing.browser_profile_dir", "") or None,
             post_search_browsing=get_setting("outgoing.browser_post_search_browsing", False),
+            origin_gap_search=_gap_range_setting(
+                "outgoing.browser_origin_gap_search", _ORIGIN_GAP_SEARCH_S
+            ),
+            origin_gap_site=_gap_range_setting(
+                "outgoing.browser_origin_gap_site", _ORIGIN_GAP_SITE_S
+            ),
         )
         from searx.network.human_input import set_debug_trace
 

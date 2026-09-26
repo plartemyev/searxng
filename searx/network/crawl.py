@@ -36,6 +36,13 @@ class CrawlError(BrowserFetchError):
     """Rejected crawl request (bad URL, private network, ...)."""
 
 
+# Wall-clock slack on top of the caller's navigation timeout that covers
+# the origin pacing gap, the bounded lane wait, and the bot-challenge
+# graces on the pool side. The HTTP clients on the caller side must allow
+# at least timeout + this slack (Onyx's SEARXNG_CRAWL_TIMEOUT_SECONDS).
+_CRAWL_FUTURE_SLACK_S = 150.0
+
+
 def _assert_crawlable_url(url: str, allow_private_network: bool) -> None:
     parts = urlsplit(url)
     if parts.scheme not in ("http", "https") or not parts.hostname:
@@ -63,7 +70,7 @@ def render_page(
         get_browser_fetch_pool().crawl_render(url, timeout_s=timeout_s), get_loop()
     )
     try:
-        return future.result(timeout_s + 90.0)
+        return future.result(timeout_s + _CRAWL_FUTURE_SLACK_S)
     except concurrent.futures.TimeoutError as err:
         raise CrawlError("crawl timed out waiting for a browser lane") from err
 
@@ -85,6 +92,6 @@ def fetch_bytes(
         get_loop(),
     )
     try:
-        return future.result(timeout_s + 90.0)
+        return future.result(timeout_s + _CRAWL_FUTURE_SLACK_S)
     except concurrent.futures.TimeoutError as err:
         raise CrawlError("crawl timed out waiting for a browser lane") from err

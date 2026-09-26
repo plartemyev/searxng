@@ -98,6 +98,10 @@ class VisionSolverConfig:
     timeout: float = 360.0
     max_rounds: int = 12
     votes: int = 1
+    # Wall-clock cap for ONE whole solve attempt (all rounds). Bounds how
+    # long a lane can be held hostage by a challenge that never clears:
+    # ~2x the slowest solve observed to succeed. 0 disables the cap.
+    session_budget: float = 1500.0
     temperature: float = 0.0
     max_tokens: int = 2048
 
@@ -111,6 +115,9 @@ class VisionSolverConfig:
             timeout=float(get_setting("outgoing.captcha_vision.timeout", 360.0) or 360.0),
             max_rounds=int(get_setting("outgoing.captcha_vision.max_rounds", 12) or 12),
             votes=int(get_setting("outgoing.captcha_vision.votes", 1) or 1),
+            session_budget=float(
+                get_setting("outgoing.captcha_vision.session_budget", 1500.0) or 0
+            ),
             temperature=float(get_setting("outgoing.captcha_vision.temperature", 0.0) or 0.0),
             max_tokens=int(get_setting("outgoing.captcha_vision.max_tokens", 2048) or 2048),
         )

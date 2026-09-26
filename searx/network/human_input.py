@@ -869,7 +869,22 @@ async def _run_image_rounds(page, pointer, solver, max_rounds: int, found) -> bo
     round_index = 1
     re_reads = 0
     fresh_slide = True
+    # one solve must not hold a lane forever: the budget bounds the whole
+    # attempt (rounds x votes x vision timeouts compound quickly)
+    solve_started = time.monotonic()
+    session_budget = float(getattr(solver.cfg, "session_budget", 0.0) or 0.0)
     while round_index <= max_rounds:
+        if (
+            session_budget > 0
+            and time.monotonic() - solve_started > session_budget
+        ):
+            logger.warning(
+                "human input: solve session budget %.0fs spent after %d"
+                " round(s); giving up this attempt",
+                session_budget,
+                round_index - 1,
+            )
+            return solved
         if fresh_slide and round_index > 1:
             # a person reads the new image set before acting on it; the
             # next grid mounts after the verify round trip, so this probe
