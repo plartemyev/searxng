@@ -479,6 +479,8 @@ def test_checkout_for_crawl_borrows_busy_affinity_lane():
     lane_b = browser_module._Lane(None, None, ":111")
     pool._lanes = [lane_a, lane_b]
     pool._lane_cycle = asyncio.Queue()
+    for lane in pool._lanes:
+        pool._lane_cycle.put_nowait(lane)
     pool._init_done = True  # fake lanes: skip the real pool init
     pool._ensure_browser_alive = lambda: asyncio.sleep(0)  # noqa: ARG005
     lane_b.browser = NS(is_connected=lambda: True)

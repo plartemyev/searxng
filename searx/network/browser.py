@@ -1743,6 +1743,10 @@ class BrowserFetchPool:
         Returns a dict with ``final_url``, ``status``, ``content_type`` and
         ``content`` (bytes, capped at ``max_bytes``).
         """
+        # pylint: disable=import-outside-toplevel
+        from searx.network.human_input import debug_trace_enabled
+
+        url = unwrap_google_translate_url(url)
         lane, affinity, borrowed = await self._checkout_for_crawl(url)
         try:
             async with lane.lock:
