@@ -1313,6 +1313,16 @@ class BrowserFetchPool:
         if profile_path:
             profile_lock = _acquire_profile_lock(profile_path, lane_index)
         if profile_lock is not None and profile_path:
+            # The flock proves no live lane holds this profile, so any
+            # Chromium Singleton* symlinks left inside are from a dead
+            # container (e.g. OOM-killed). Chromium cannot verify a dead
+            # foreign hostname and would hang on its profile-in-use path,
+            # so remove them before relaunching.
+            for stale in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+                try:
+                    os.remove(os.path.join(profile_path, stale))
+                except OSError:
+                    pass
             # persistent profile: cookies, storage and earned clearances
             # survive lane crashes and process restarts
             context = await self._playwright.chromium.launch_persistent_context(
