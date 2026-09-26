@@ -615,7 +615,7 @@ def crawl():
     if secret and sxng_request.headers.get('X-Crawl-Secret', '') != secret:
         return Response('invalid crawl secret\n', status=403, mimetype='text/plain')
 
-    from searx.network import crawl
+    from searx.network import crawl as crawl_client
 
     url = (sxng_request.args.get('url') or '').strip()
     if not url:
@@ -636,7 +636,7 @@ def crawl():
 
     try:
         if mode == 'bytes':
-            result = crawl.fetch_bytes(
+            result = crawl_client.fetch_bytes(
                 url, timeout_s=timeout_s, max_bytes=max_bytes,
                 allow_private_network=allow_private,
             )
@@ -652,7 +652,7 @@ def crawl():
             return response
         if mode != 'render':
             return jsonify({'error': "mode must be 'render' or 'bytes'"}), 400
-        result = crawl.render_page(url, timeout_s=timeout_s, allow_private_network=allow_private)
+        result = crawl_client.render_page(url, timeout_s=timeout_s, allow_private_network=allow_private)
         return jsonify({
             'final_url': result['final_url'],
             'status': result['status'],
@@ -661,9 +661,9 @@ def crawl():
             'affinity': result['affinity'],
             'html': result['html'],
         })
-    except crawl.CrawlBodyTooLarge as e:
+    except crawl_client.CrawlBodyTooLarge as e:
         return jsonify({'error': str(e)}), 413
-    except crawl.CrawlError as e:
+    except crawl_client.CrawlError as e:
         return jsonify({'error': str(e)}), 400
     except Exception as e:  # pylint: disable=broad-except
         app.logger.warning('crawl of %s failed: %s', url[:200], e, exc_info=True)
