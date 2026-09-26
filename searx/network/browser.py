@@ -37,7 +37,10 @@ the browser's claims agree with where its requests come from.
 
 The pool owns N browser contexts ("lanes"). Each lane serves one request at
 a time; cookies persist per lane, so solved challenges benefit later
-requests on the same lane.
+requests on the same lane. With ``outgoing.browser_profile_dir`` set, each
+lane also gets a persistent on-disk Chromium profile (one subdirectory per
+lane), keeping cookies and earned clearances across restarts; otherwise
+profiles are in-memory only.
 """
 
 # SPDX-License-Identifier: AGPL-3.0-or-later
@@ -794,7 +797,9 @@ class _Lane:
 
     One browser per lane (not one browser with N contexts) is what makes
     per-lane displays possible: a Chromium process binds a single display.
-    In exchange, a lane crash takes down only its own lane.
+    In exchange, a lane crash takes down only its own lane. ``browser`` may
+    be None for a persistent-context lane on some playwright versions; the
+    context is then the aliveness signal.
     """
 
     def __init__(self, browser, context, display: str | None):
@@ -815,12 +820,14 @@ class BrowserFetchPool:
     def __init__(
         self, pool_size: int = 3, verify: bool = True, proxy: str | None = None,
         human_fallback: bool = True, max_stealth: bool = False,
+        profile_dir: str | None = None,
     ):
         self._pool_size = max(1, pool_size)
         self._verify = verify
         self._proxy = proxy
         self._human_fallback = human_fallback
         self._max_stealth = max_stealth
+        self._profile_dir = profile_dir
         self._lanes: list[_Lane] = []
         self._lane_cycle: asyncio.Queue | None = None
         self._init_lock = asyncio.Lock()
@@ -864,13 +871,38 @@ class BrowserFetchPool:
                     "Browser fetch pool up: %d lane(s) on displays %s, chromium=%s",
                     len(self._lanes),
                     ",".join(lane.display or "headless" for lane in self._lanes),
-                    self._lanes[0].browser.version,
+                    self._lanes[0].browser.version if self._lanes[0].browser else "unknown",
                 )
             except Exception as e:
                 # Stop playwright before re-raising: its node driver process
                 # keeps running otherwise, one ~130 MiB leak per failed start.
                 await self._shutdown_browser()
                 raise BrowserFetchError(f"browser pool init failed: {e}") from e
+
+    def _lane_profile_dir(self, lane_index: int) -> str | None:
+        """This lane's persistent profile directory, or None for an
+        ephemeral in-memory context (no ``outgoing.browser_profile_dir``, or
+        the directory is not usable).
+
+        One subdirectory per lane keeps the cookie jars fully isolated;
+        Chromium holds a singleton lock per profile, so the 1:1 mapping
+        also prevents two browsers from ever sharing one jar.
+        """
+        if not self._profile_dir:
+            return None
+        path = os.path.join(self._profile_dir, f"lane-{lane_index}")
+        try:
+            os.makedirs(path, exist_ok=True)
+            if not os.access(path, os.W_OK):
+                raise OSError("not writable")
+        except OSError as err:
+            logger.warning(
+                "browser profile dir %s unusable (%s); lane %s runs with an"
+                " ephemeral context",
+                self._profile_dir, err, lane_index,
+            )
+            return None
+        return path
 
     async def _launch_lane(self, lane_index: int, executable_path: str | None) -> _Lane:
         """Launch one lane: its own browser process on its own X display."""
@@ -889,11 +921,20 @@ class BrowserFetchPool:
             launch_kwargs["executable_path"] = executable_path
         if self._proxy:
             launch_kwargs["proxy"] = {"server": self._proxy}
-        browser = await self._playwright.chromium.launch(**launch_kwargs)
         geo = await loop.run_in_executor(None, _detect_ip_locale)
-        context = await browser.new_context(
-            **self._context_kwargs(geo)
-        )
+        profile_path = self._lane_profile_dir(lane_index)
+        if profile_path:
+            # persistent profile: cookies, storage and earned clearances
+            # survive lane crashes and process restarts
+            context = await self._playwright.chromium.launch_persistent_context(
+                profile_path, **launch_kwargs, **self._context_kwargs(geo)
+            )
+            browser = context.browser
+        else:
+            browser = await self._playwright.chromium.launch(**launch_kwargs)
+            context = await browser.new_context(
+                **self._context_kwargs(geo)
+            )
         await context.add_init_script(_stealth_init_script(_language_tags(geo["accept_language"])))
         return _Lane(browser, context, display)
 
@@ -934,10 +975,11 @@ class BrowserFetchPool:
                 await lane.context.close()
             except Exception:  # pylint: disable=broad-except
                 pass
-            try:
-                await lane.browser.close()
-            except Exception:  # pylint: disable=broad-except
-                pass
+            if lane.browser is not None:
+                try:
+                    await lane.browser.close()
+                except Exception:  # pylint: disable=broad-except
+                    pass
         self._lanes.clear()
         self._lane_cycle = None
         if self._playwright is not None:
@@ -967,7 +1009,14 @@ class BrowserFetchPool:
 
     @staticmethod
     def _lane_is_alive(lane: _Lane) -> bool:
-        return lane.browser is not None and lane.browser.is_connected()
+        if lane.browser is not None:
+            return lane.browser.is_connected()
+        # persistent contexts may not expose their browser: a dead browser
+        # process closes its context, so the context state is the signal
+        try:
+            return not lane.context.is_closed()
+        except Exception:  # pylint: disable=broad-except
+            return False
 
     async def _restart_lane(self, lane: _Lane) -> None:
         """Rebuild a lane in place: the lane cycle queue holds this object."""
@@ -976,10 +1025,11 @@ class BrowserFetchPool:
             await lane.context.close()
         except Exception:  # pylint: disable=broad-except
             pass
-        try:
-            await lane.browser.close()
-        except Exception:  # pylint: disable=broad-except
-            pass
+        if lane.browser is not None:
+            try:
+                await lane.browser.close()
+            except Exception:  # pylint: disable=broad-except
+                pass
         replacement = await self._launch_lane(lane_index, _discover_chromium())
         lane.browser = replacement.browser
         lane.context = replacement.context
@@ -1456,6 +1506,7 @@ def get_browser_fetch_pool() -> BrowserFetchPool:
             proxy=_proxy_from_proxies_setting(get_setting("outgoing.proxies", None)),
             human_fallback=get_setting("outgoing.browser_human_fallback", True),
             max_stealth=get_setting("outgoing.browser_max_stealth", False),
+            profile_dir=get_setting("outgoing.browser_profile_dir", "") or None,
         )
     return _POOL
 

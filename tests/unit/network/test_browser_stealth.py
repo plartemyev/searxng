@@ -5,6 +5,7 @@
 
 import asyncio
 import json
+import os
 import time
 
 import pytest
@@ -297,3 +298,53 @@ def test_human_session_requires_a_display():
                 pass
 
     asyncio.run(check())
+
+
+# --------------------------------------------------------------------------
+# persistent per-lane profiles (outgoing.browser_profile_dir)
+
+
+class _FakeContext:
+    """Just enough of a BrowserContext for the aliveness check."""
+
+    def __init__(self, closed: bool):
+        self._closed = closed
+
+    def is_closed(self) -> bool:
+        return self._closed
+
+
+def test_lane_profile_dir_unset_runs_ephemeral():
+    pool = browser_module.BrowserFetchPool(profile_dir=None)
+    assert pool._lane_profile_dir(0) is None
+
+
+def test_lane_profile_dir_creates_one_dir_per_lane(tmp_path):
+    pool = browser_module.BrowserFetchPool(profile_dir=str(tmp_path))
+    first = pool._lane_profile_dir(2)
+    second = pool._lane_profile_dir(5)
+    assert first == str(tmp_path / "lane-2")
+    assert second == str(tmp_path / "lane-5")
+    assert (tmp_path / "lane-2").is_dir()
+    assert (tmp_path / "lane-5").is_dir()
+    # distinct lanes never share a profile
+    assert first != second
+
+
+@pytest.mark.skipif(os.getuid() == 0, reason="root ignores directory permissions")
+def test_lane_profile_dir_unwritable_falls_back_ephemeral(tmp_path):
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o500)
+    try:
+        pool = browser_module.BrowserFetchPool(profile_dir=str(locked))
+        assert pool._lane_profile_dir(0) is None
+    finally:
+        locked.chmod(0o700)
+
+
+def test_lane_is_alive_handles_persistent_contexts():
+    alive = browser_module._Lane(None, _FakeContext(closed=False), None)
+    dead = browser_module._Lane(None, _FakeContext(closed=True), None)
+    assert browser_module.BrowserFetchPool._lane_is_alive(alive) is True
+    assert browser_module.BrowserFetchPool._lane_is_alive(dead) is False

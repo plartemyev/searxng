@@ -33,6 +33,11 @@ COPY searx/ ./searx/
 RUN printf 'VERSION_STRING = "2026.9.22-browser"\nVERSION_TAG = "2026.9.22"\nDOCKER_TAG = "browser"\nGIT_URL = "https://github.com/searxng/searxng"\nGIT_BRANCH = "master"\n' > searx/version.py
 RUN chown -R searxng:searxng /usr/local/searxng
 
+# Persistent per-lane Chromium profiles (outgoing.browser_profile_dir): the
+# deployment mounts a docker volume here; pre-owning the path means the
+# volume inherits the searxng ownership instead of root's.
+RUN mkdir -p /var/lib/searxng/lanes && chown -R searxng:searxng /var/lib/searxng
+
 USER searxng
 EXPOSE 8080
 
