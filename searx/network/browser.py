@@ -1076,7 +1076,13 @@ class BrowserFetchPool:
             "Accept-Language": geo["accept_language"],
         }
         context_kwargs: dict = {
-            "viewport": {"width": 1440, "height": 900},
+            # No viewport emulation: _to_screen derives the chrome offset
+            # from outerHeight - innerHeight, which only equals the real
+            # browser UI when innerHeight is the physical content size.
+            # Emulating 1440x900 inside a taller window reported a 131px
+            # offset against a ~70px real UI and pushed every XTEST click
+            # ~61px below its target.
+            "no_viewport": True,
             "locale": geo["locale"],
             "timezone_id": geo["timezone"],
             "has_touch": False,
