@@ -971,6 +971,7 @@ def _acquire_profile_lock(profile_path: str, lane_index: int):
 
     try:
         handle = open(profile_path + ".lock", "a", encoding="utf-8")  # noqa: SIM115
+        os.chmod(profile_path + ".lock", 0o666)
     except OSError as err:
         logger.warning(
             "lane %d profile lock file unusable (%s); running ephemeral",
@@ -1099,6 +1100,10 @@ class BrowserFetchPool:
         path = os.path.join(self._profile_dir, f"lane-{lane_index}")
         try:
             os.makedirs(path, exist_ok=True)
+            # the volume may be shared with another container running as a
+            # different UID (Onyx's crawler workers); keep the dir and the
+            # lock file usable by both sides
+            os.chmod(path, 0o777)
             if not os.access(path, os.W_OK):
                 raise OSError("not writable")
         except OSError as err:
