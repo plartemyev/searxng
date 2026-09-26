@@ -1509,6 +1509,7 @@ class BrowserFetchPool:
         """
         # pylint: disable=import-outside-toplevel
         from searx.network.human_input import (
+            _debug_dump,
             human_clear_challenge,
             human_read_results,
             human_search_on_page,
@@ -1575,6 +1576,18 @@ class BrowserFetchPool:
                     rendered_html = (await page.content()).encode(
                         "utf-8", errors="replace"
                     )
+                    # TEMPORARY (diagnostics): trace exactly what the engine
+                    # is asked to parse
+                    try:
+                        _debug_dump(
+                            "capture",
+                            0,
+                            await page.screenshot(),
+                            rendered_url,
+                            html=rendered_html.decode("utf-8", errors="replace"),
+                        )
+                    except Exception:  # pylint: disable=broad-except
+                        pass
                     if keep_page:
                         # the live results page becomes the starting point of
                         # post-search browsing; the session closes it
