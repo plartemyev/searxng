@@ -466,7 +466,7 @@ _POST_SEARCH_MAX_LINKS = 60  # candidate result links kept per SERP
 # Same-site links that are the engine's outbound redirect wrappers: these
 # ARE the organic click targets on the results page. Any other same-site
 # link (verticals, related searches, settings) is not a reader's click.
-_REDIRECT_HINTS = ("/ck/a", "/l/?uddg", "/url?q=", "/interstitial", "/proxy?")
+_REDIRECT_HINTS = ("/ck/a", "/goto?url=", "/l/?uddg", "/url?q=", "/interstitial", "/proxy?")
 # Clicking a bare image or archive URL is not reading; skip those links.
 _POST_SEARCH_SKIP_EXTENSIONS = (
     ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".ico", ".css", ".js",

@@ -393,6 +393,20 @@ def test_browsable_links_keeps_offsite_and_engine_wrappers():
     assert len(out) == 2
 
 
+def test_browsable_links_keeps_google_goto_wrappers():
+    serp = "https://www.google.com/search?q=linux"
+    out = browser_module._browsable_links(
+        [
+            "/goto?url=CAESZAHrOzAVHB0og9NqrORWjur2zmOTzwdJe1Vj5Y",  # organic wrapper
+            "/search?q=related+searches",  # related search
+            "https://www.google.com/preferences",  # settings
+            "https://www.google.com/intl/en/about/products",  # footer
+        ],
+        serp,
+    )
+    assert out == ["/goto?url=CAESZAHrOzAVHB0og9NqrORWjur2zmOTzwdJe1Vj5Y"]
+
+
 def test_browsable_links_dedups_identical_wrappers_and_keeps_first_raw():
     serp = "https://duckduckgo.com/?q=linux&ia=web"
     wrap = "//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2F&rut=abc"
