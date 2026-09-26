@@ -61,6 +61,7 @@ import shutil
 import subprocess
 import threading
 import time
+from html import unescape as _html_unescape
 from types import SimpleNamespace
 from collections import deque
 from urllib.parse import parse_qsl, parse_qs, urlencode, urljoin, urlsplit, urlunparse
@@ -1556,7 +1557,9 @@ class BrowserFetchPool:
         base_site = _registrable_site(urlsplit(base).hostname)
         recorded = []
         for raw in self._SERP_HREF_RE.findall(html_text):
-            resolved = urljoin(base, raw.strip()).split("#", 1)[0]
+            # attribute values carry HTML entities (&amp;): unescape so the
+            # stored URL matches what the engine parser produces
+            resolved = urljoin(base, _html_unescape(raw.strip())).split("#", 1)[0]
             try:
                 parts = urlsplit(resolved)
             except ValueError:
