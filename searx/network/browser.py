@@ -1573,7 +1573,7 @@ class BrowserFetchPool:
                 recorded.append(resolved)
         if recorded:
             lane.serp_urls.extend(recorded)
-            logger.debug(
+            logger.info(
                 "lane %s: %d result URL(s) remembered (search %s)",
                 lane.display or "headless", len(recorded), request_url[:80],
             )
@@ -1612,9 +1612,13 @@ class BrowserFetchPool:
         return found
 
     async def _checkout_for_crawl(self, url: str) -> tuple["_Lane", bool]:
+        """Check a lane out for a crawl, preferring the lane whose search
+        returned the URL. Returns (lane, affinity_hit)."""
         await self._init()
         await self._ensure_browser_alive()
         preferred = self._lane_for_serp_url(url)
+        if preferred is None:
+            logger.info("crawl of %s: no lane memory hit", url[:100])
         if preferred is not None:
             lane = self._claim_lane_now(preferred)
             if lane is not None:
