@@ -1699,23 +1699,32 @@ class BrowserFetchPool:
         try:
             await locator.scroll_into_view_if_needed(timeout=4000)
         except Exception:  # pylint: disable=broad-except
+            logger.debug("post-search browsing: link not clickable (%s)", raw_href[:80])
             return False
+        # snapshot before the click: a fast target=_blank tab must show up
+        # as fresh, not as pre-existing
+        before = {p for p in page.context.pages if not p.is_closed()}
         if pointer is not None:
             clicked = await _human_click_locator(locator, pointer)
         else:
             clicked = await self._cdp_click(page, locator)
         if not clicked:
+            logger.debug("post-search browsing: click missed (%s)", raw_href[:80])
             return False
-        opened = await self._wait_click_target(page, serp_url, deadline)
+        opened = await self._wait_click_target(page, before, serp_url, deadline)
         if opened is None:
             return False
         if _is_challenge_url(opened.url):
             # a rebuffed click-through: back to the results, no dwelling
+            logger.debug("post-search browsing: challenge on %s", opened.url[:100])
             await self._return_to_serp(page, opened, serp_url)
             return False
         dwell = min(
             random.uniform(*_POST_SEARCH_DWELL_RANGE),
             max(5.0, deadline - time.monotonic()),
+        )
+        logger.debug(
+            "post-search browsing: visiting %s for %.0fs", opened.url[:100], dwell
         )
         await self._dwell_on_page(opened, pointer, dwell)
         await self._return_to_serp(page, opened, serp_url)
@@ -1726,9 +1735,8 @@ class BrowserFetchPool:
         return True
 
     @staticmethod
-    async def _wait_click_target(page, serp_url: str, deadline: float):
+    async def _wait_click_target(page, before: set, serp_url: str, deadline: float):
         """What the click did: a new tab, a same-tab navigation, or nothing."""
-        before = {p for p in page.context.pages if not p.is_closed()}
         for _ in range(20):
             await asyncio.sleep(0.5)
             fresh = [
@@ -1743,7 +1751,12 @@ class BrowserFetchPool:
                 except Exception:  # pylint: disable=broad-except
                     pass
                 if target.url == "about:blank":
-                    return None  # opened but never navigated: dead tab
+                    logger.debug("post-search browsing: dead tab discarded")
+                    try:
+                        await target.close()
+                    except Exception:  # pylint: disable=broad-except
+                        pass
+                    return None
                 return target
             if page.url != serp_url:
                 try:
@@ -1753,6 +1766,7 @@ class BrowserFetchPool:
                 return page
             if time.monotonic() > deadline:
                 return None
+        logger.debug("post-search browsing: click produced no navigation")
         return None
 
     @staticmethod
