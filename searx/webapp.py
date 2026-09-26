@@ -670,6 +670,41 @@ def crawl():
         return jsonify({'error': 'crawl failed'}), 502
 
 
+def _warm_browser_pool() -> None:
+    """Start the browser pool lanes in the background at worker startup.
+
+    A cold start launches every lane's Chromium and loads its persistent
+    profile -- tens of seconds of CPU- and disk-bound work. Done here,
+    the first search finds warm lanes instead of timing out inside the
+    engine budget. No-op unless outgoing.using_browser is enabled.
+    """
+    if not searx.get_setting('outgoing.using_browser', False):
+        return
+    import threading
+
+    from searx.network.browser import get_browser_fetch_pool
+
+    def _warm() -> None:
+        # pylint: disable=import-outside-toplevel
+        import asyncio
+
+        from searx.network.client import get_loop
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                get_browser_fetch_pool().warm_up(), get_loop()
+            )
+            future.result(timeout=600)
+            logger.info('browser pool warmup complete')
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning('browser pool warmup failed: %s', exc)
+
+    threading.Thread(target=_warm, name='browser-pool-warmup', daemon=True).start()
+
+
+_warm_browser_pool()
+
+
 @app.route('/client<token>.css', methods=['GET', 'POST'])
 def client_token(token=None):
     link_token.ping(sxng_request, token)

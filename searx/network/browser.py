@@ -565,6 +565,9 @@ _POST_SEARCH_SKIP_EXTENSIONS = (
     ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".ico", ".css", ".js",
     ".zip", ".rar", ".7z", ".gz", ".pdf", ".exe", ".dmg", ".iso", ".mp4",
 )
+# Result URLs the lane memory keeps for crawl affinity: same skip list, so
+# a crawl never gets routed because a favicon matched.
+_SERP_MEMORY_SKIP_EXTENSIONS = _POST_SEARCH_SKIP_EXTENSIONS
 
 
 def _is_browsable_search_url(url: str) -> bool:
@@ -1053,7 +1056,7 @@ def _acquire_profile_lock(profile_path: str, lane_index: int):
 
     try:
         handle = open(profile_path + ".lock", "a", encoding="utf-8")  # noqa: SIM115
-        os.chmod(profile_path + ".lock", 0o666)
+        os.chmod(profile_path + ".lock", 0o600)
     except OSError as err:
         logger.warning(
             "lane %d profile lock file unusable (%s); running ephemeral",
@@ -1197,10 +1200,12 @@ class BrowserFetchPool:
         path = os.path.join(self._profile_dir, f"lane-{lane_index}")
         try:
             os.makedirs(path, exist_ok=True)
-            # the volume may be shared with another container running as a
-            # different UID (Onyx's crawler workers); keep the dir and the
-            # lock file usable by both sides
-            os.chmod(path, 0o777)
+            # 0700 on purpose: Chromium profiles hold cookie secrets, and
+            # Chromium itself clamps the dir to this mode and REFUSES
+            # profiles locked by another UID -- sharing a profile across
+            # container UIDs is not supported; share the volume with
+            # disjoint lane-index ranges instead
+            os.chmod(path, 0o700)
             if not os.access(path, os.W_OK):
                 raise OSError("not writable")
         except OSError as err:
@@ -1321,6 +1326,15 @@ class BrowserFetchPool:
             except Exception:  # pylint: disable=broad-except
                 pass
             self._playwright = None
+
+    async def warm_up(self) -> None:
+        """Initialize the pool (launch all lanes) without serving a request.
+
+        Called at webapp startup so the first search finds the lanes
+        already up instead of paying the full launch cost inside its own
+        engine timeout.
+        """
+        await self._init()
 
     async def _reap_loop(self) -> None:
         """Periodically close browsers on idle lanes, releasing their
@@ -1545,6 +1559,8 @@ class BrowserFetchPool:
             resolved = urljoin(base, raw.strip()).split("#", 1)[0]
             parts = urlsplit(resolved)
             if parts.scheme not in ("http", "https") or not parts.hostname:
+                continue
+            if parts.path.lower().endswith(_SERP_MEMORY_SKIP_EXTENSIONS):
                 continue
             if _registrable_site(parts.hostname) == base_site:
                 tail = f"{parts.path}?{parts.query}"
