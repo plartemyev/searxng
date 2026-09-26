@@ -1557,7 +1557,10 @@ class BrowserFetchPool:
         recorded = []
         for raw in self._SERP_HREF_RE.findall(html_text):
             resolved = urljoin(base, raw.strip()).split("#", 1)[0]
-            parts = urlsplit(resolved)
+            try:
+                parts = urlsplit(resolved)
+            except ValueError:
+                continue
             if parts.scheme not in ("http", "https") or not parts.hostname:
                 continue
             if parts.path.lower().endswith(_SERP_MEMORY_SKIP_EXTENSIONS):
