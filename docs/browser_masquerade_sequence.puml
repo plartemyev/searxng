@@ -1,0 +1,76 @@
+@startuml browser_masquerade_sequence
+' Browser masquerade search workflow with measured timings (2026-09-26).
+' 6 lanes on Xvfb :99-:104, distro Chromium 154, Thai residential egress.
+
+autonumber
+
+participant "Onyx\n(web_search tool)" as Onyx
+participant "searxng\nwebapp" as Web
+participant "engine module\n(google/bing/brave)" as Eng
+participant "BrowserFetchPool\n(6 lanes)" as Pool
+participant "lane N\nChromium on Xvfb" as Lane
+participant "human_input\n(XTEST pointer)" as Hand
+participant "captcha_vision\n(OpenAI-compatible\nvision endpoint)" as Vision
+participant "provider\n(google.com ...)" as Up
+
+Onyx -> Web : GET /search?q=... (json)
+note right of Onyx : Onyx client read budget 90 s\n(SEARXNG_READ_TIMEOUT_SECONDS)
+
+Web -> Eng : engine request
+Eng -> Pool : fetch(url) via browser pool
+note right of Pool : provider send pacing:\n1-5 s random gap per host,\nqueue cap 20 s
+
+Pool -> Pool : checkout next idle lane\n(asyncio lane cycle)
+note right of Pool : wait here if all 6 lanes busy\n(engine timeout budget:\ngoogle 85 s, others 60 s)
+
+alt maximum stealth (browser_max_stealth: on)
+    Pool -> Lane : open provider homepage\n(hl/gl locale params ride along)
+    Lane -> Up : GET homepage
+    Hand -> Lane : Bezier move to search box (0.04-0.10 s),\nreal click focuses the box
+    Hand -> Lane : type query with human cadence\n(uneven keys, bursts, pauses)
+    Hand -> Lane : drift pointer (0.4-1.4 s),\nclick the submit button
+    Lane -> Up : form submit -> results page
+    Pool -> Lane : settle: wait for navigation,\nread results like a human
+    note right of Pool : full human search measured ~19 s\n(warm lane, google)
+
+    opt challenge served (/sorry or 200 CAPTCHA wall)
+        Pool -> Lane : screenshot challenge + instruction text
+        loop up to 12 rounds (max_rounds)
+            loop 6 votes (votes), rising temperature
+                Lane -> Vision : screenshot + prompt (~35 s per vote,\nendpoint timeout 360 s)
+                Vision --> Lane : tile coordinates
+                Hand -> Lane : click tiles with real X input
+            end
+            Hand -> Lane : press VERIFY (strict-majority quorum)
+            opt rejected -> grid regrows
+                Lane -> Lane : next round, adapted geometry
+            end
+        end
+        note right of Lane : a round costs ~3.5-4 min;\n12 rounds ~50 min worst case.\nA request waiting on a solve\ngives up at its engine timeout,\nthe lane keeps solving in the\nbackground and banks the\nclearance cookies
+    end
+
+    Pool -> Lane : capture rendered DOM (google desktop layout)
+    Lane --> Pool : HTML (~2.9 MB)
+    Pool --> Eng : response
+    Eng -> Eng : parse results\n(/url?q= unwrapped,\n/goto?url= kept as absolute URL)
+else not a human-search candidate (API endpoints, images, ddg)
+    Pool -> Lane : fetch-style request in browser context\n(browser TLS + lane cookies)
+    Lane -> Up : GET url
+    Lane --> Pool : response
+end
+
+opt post-search browsing (browser_post_search_browsing)\nonly when another lane is idle
+    Pool -> Lane : background task keeps the SERP page
+    loop 1-4 visits, budget 180 s total
+        Hand -> Lane : click an organic result\n(/goto wrapper -> new tab; never\ntranslate.goog targets)
+        Lane -> Up : navigate to result
+        Hand -> Lane : scroll + pointer drift, dwell 10-30 s
+        Lane -> Lane : close tab, back on results
+    end
+    note right of Lane : measured: 4 visits in 170 s
+    Lane --> Pool : lane returns to the cycle
+end
+
+Pool --> Web : parsed results
+Web --> Onyx : json (measured ~19-20 s warm,\nno challenge)
+@enduml
