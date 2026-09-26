@@ -302,13 +302,16 @@ SCHEMA: dict[str, t.Any] = {
             # Seconds allowed for one vision call (local models can be slow
             # on their first, cold request).
             'timeout': SettingsValue(numbers.Real, 360.0),
-            # Image sets solved per challenge before giving up (reCAPTCHA
-            # often asks for two or three rounds in a row).
-            'max_rounds': SettingsValue(int, 5),
+            # Image sets (slide changes) solved per challenge before giving
+            # up. Dynamic challenges can ask many grids in a row; each slide
+            # costs votes x model latency, so raise with care.
+            'max_rounds': SettingsValue(int, 12),
             # Samples per round decided by per-tile strict-majority quorum.
-            # Local vision models localize the right region reliably but
-            # flicker on single tiles between samples; more votes cost time
-            # (each is one model call) and buy click precision.
+            # Odd samples ask the inverted question (which tiles do NOT
+            # match) and are mapped back through the complement, so a
+            # hallucination must be wrong twice in opposite directions to
+            # cross the quorum. More votes cost time (each is one model
+            # call) and buy click precision.
             'votes': SettingsValue(int, 1),
             'temperature': SettingsValue(numbers.Real, 0.0),
             # generous ceiling: reasoning models spend tokens thinking before

@@ -538,6 +538,33 @@ def test_rounds_exhausted_returns_false(fast_pacing):
     return asyncio.run(run())
 
 
+def test_grid_growth_mid_solve_rereads_without_consuming_slide(fast_pacing, monkeypatch):
+    async def run():
+        world = FakeWorld(rounds=1)
+        page = FakePage(world)
+        page.frame_locator = lambda selector: VerifyingFrameLocator(page)  # type: ignore[method-assign]
+        # tiles stream in while the model thinks: the first three reads see
+        # 6 tiles, everything after sees 9
+        reads = {"n": 0}
+
+        async def growing_count(locator):
+            reads["n"] += 1
+            return 6 if reads["n"] <= 3 else 9
+
+        monkeypatch.setattr(human_input, "_element_count", growing_count)
+        monkeypatch.setattr(human_input, "_tiles_fully_painted", lambda png, rects: True)
+        stub = StubSolver([captcha_vision.GridSolution(tiles=(2,), action="submit")])
+        pointer = RecorderPointer()
+        solved = await human_input.human_solve_image_challenge(page, pointer, solver=stub, max_rounds=3)
+        assert solved is True
+        # the growth was detected and forced a re-solve of the bigger grid
+        assert [c["tile_count"] for c in stub.calls] == [6, 9]
+        # the re-read consumed no slide: exactly one VERIFY press
+        assert world.verify_clicks == 1
+
+    return asyncio.run(run())
+
+
 def test_empty_selection_presses_verify_as_skip(fast_pacing):
     async def run():
         # reCAPTCHA has no separate skip button: the verify button relabels
@@ -737,13 +764,21 @@ def test_cells_fallback_for_irregular_layouts():
 def test_cells_mode_quorum(fake_transport, monkeypatch):
     cfg = VisionSolverConfig(endpoint="http://x", model="m", votes=3)
     solver_cells = OpenAICompatVisionSolver(cfg)
-    answers = ['{"tiles": [0, 4]}', '{"tiles": [4]}', '{"tiles": [4, 8]}']
-    monkeypatch.setattr(solver_cells, "chat_vision", lambda p, i, temperature=None: answers.pop(0))
+    prompts = []
+
+    def fake_chat(prompt, images, temperature=None):
+        prompts.append(prompt)
+        # odd votes ask the inverted question: everything except tile 4
+        return '{"tiles": [0, 1, 2, 3, 5, 6, 7, 8]}' if len(prompts) % 2 == 0 else '{"tiles": [4]}'
+
+    monkeypatch.setattr(solver_cells, "chat_vision", fake_chat)
     cells = [f"cell{i}".encode() for i in range(9)]
     solution = solver_cells.solve_grid(b"widget", ("cells", cells), "select bike", 9, 3, 3)
-    # tile 4 reaches 3/3; tile 0 and 8 stay at 1/3 (below the 2-vote quorum)
+    # positive votes say 4; the inverted votes' complements also say 4
     assert solution.tiles == (4,)
     assert solution.action == "submit"
+    assert "contains NO part" in prompts[1]
+    assert "contains NO part" not in prompts[0]
 
 
 # --------------------------------------------------------------------------
@@ -780,16 +815,19 @@ def test_parse_strip_solution_no_json_raises():
 def test_quorum_keeps_majority_tiles(fake_transport, monkeypatch):
     cfg = VisionSolverConfig(endpoint="http://x", model="m", votes=5)
     solver_votes = OpenAICompatVisionSolver(cfg)
+    # odd votes are inverted: they answer with everything EXCEPT tiles 1, 2
     answers = [
         '{"rows": [[1, 2], [], []]}',
-        '{"rows": [[1, 2], [], []]}',
+        '{"rows": [[0], [0, 1, 2], [0, 1, 2]]}',
         '{"rows": [[1], [], []]}',
-        '{"rows": [[2], [], []]}',
+        '{"rows": [[0], [0, 1, 2], [0, 1, 2]]}',
         '{"rows": [[1, 2], [], []]}',
     ]
     calls = {"n": 0}
+    prompts = []
 
     def fake_chat(prompt, images, temperature=None):
+        prompts.append(prompt)
         answer = answers[calls["n"]]
         calls["n"] += 1
         # votes must sample at rising temperatures after the first
@@ -803,15 +841,52 @@ def test_quorum_keeps_majority_tiles(fake_transport, monkeypatch):
     strips = [b"row0", b"row1", b"row2"]
     solution = solver_votes.solve_grid(b"widget", ("rows", strips), "select bike", 9, 3, 3)
     assert calls["n"] == 5
-    # tile 1: 4 votes, tile 2: 4 votes -> strict majority; nothing else
+    # positive votes and inverted-vote complements agree: tile 1: 5 votes,
+    # tile 2: 4 votes -> strict majority; nothing else
     assert solution.tiles == (1, 2)
     assert solution.action == "submit"
+    assert "contains NO part" in prompts[1] and "contains NO part" in prompts[3]
+    assert "contains NO part" not in prompts[0] and "contains NO part" not in prompts[2]
+
+
+def test_negated_disagreement_kills_quorum(fake_transport, monkeypatch):
+    cfg = VisionSolverConfig(endpoint="http://x", model="m", votes=3)
+    solver_votes = OpenAICompatVisionSolver(cfg)
+    # the inverted vote's complement points at tile 1 while the positive
+    # votes disagree with each other: nothing crosses the majority
+    answers = [
+        '{"rows": [[0], [], []]}',
+        '{"rows": [[0, 2], [0, 1, 2], [0, 1, 2]]}',
+        '{"rows": [[2], [], []]}',
+    ]
+    monkeypatch.setattr(solver_votes, "chat_vision", lambda p, i, temperature=None: answers.pop(0))
+    solution = solver_votes.solve_grid(b"widget", ("rows", [b"r0", b"r1", b"r2"]), "select", 9, 3, 3)
+    assert solution.tiles == ()
+    assert solution.action == "skip"
+
+
+def test_negated_empty_answer_cannot_win_alone(fake_transport, monkeypatch):
+    cfg = VisionSolverConfig(endpoint="http://x", model="m", votes=2)
+    solver_votes = OpenAICompatVisionSolver(cfg)
+    # a lazy inverted answer ("nothing is without the object") maps to the
+    # whole grid -- one such vote stays below the strict majority
+    answers = ['{"rows": [[4], [], []]}', '{"rows": [[], [], []]}']
+    monkeypatch.setattr(solver_votes, "chat_vision", lambda p, i, temperature=None: answers.pop(0))
+    solution = solver_votes.solve_grid(b"widget", ("rows", [b"r0", b"r1", b"r2"]), "select", 9, 3, 3)
+    assert solution.tiles == ()
+    assert solution.action == "skip"
 
 
 def test_quorum_all_disagreement_becomes_skip(fake_transport, monkeypatch):
     cfg = VisionSolverConfig(endpoint="http://x", model="m", votes=3)
     solver_votes = OpenAICompatVisionSolver(cfg)
-    answers = ['{"rows": [[0], [], []]}', '{"rows": [[1], [], []]}', '{"rows": [[2], [], []]}']
+    # positive votes disagree, and the inverted vote's complement (tile 1)
+    # agrees with neither: nothing reaches the majority
+    answers = [
+        '{"rows": [[0], [], []]}',
+        '{"rows": [[0, 2], [0, 1, 2], [0, 1, 2]]}',
+        '{"rows": [[2], [], []]}',
+    ]
     monkeypatch.setattr(solver_votes, "chat_vision", lambda p, i, temperature=None: answers.pop(0))
     solution = solver_votes.solve_grid(b"widget", ("rows", [b"r0", b"r1", b"r2"]), "select", 9, 3, 3)
     assert solution.tiles == ()
@@ -821,11 +896,13 @@ def test_quorum_all_disagreement_becomes_skip(fake_transport, monkeypatch):
 def test_quorum_skips_unusable_votes(fake_transport, monkeypatch):
     cfg = VisionSolverConfig(endpoint="http://x", model="m", votes=4)
     solver_votes = OpenAICompatVisionSolver(cfg)
+    # votes 0 and 2 are unusable; the two usable votes are inverted ones
+    # whose complements both say tiles 0 and 2
     answers = [
         "complete nonsense without any json",
-        '{"rows": [[0, 2], [], []]}',
+        '{"rows": [[1], [0, 1, 2], [0, 1, 2]]}',
         "also unusable",
-        '{"rows": [[0, 2], [], []]}',
+        '{"rows": [[1], [0, 1, 2], [0, 1, 2]]}',
     ]
     monkeypatch.setattr(solver_votes, "chat_vision", lambda p, i, temperature=None: answers.pop(0))
     solution = solver_votes.solve_grid(b"widget", ("rows", [b"r0", b"r1", b"r2"]), "select", 9, 3, 3)

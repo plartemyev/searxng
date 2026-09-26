@@ -31,8 +31,8 @@ Configuration (settings.yml)::
         model: 'my-vision-model'
         context_size: 58192                  # num_ctx hint (Ollama); 0 = backend default
         timeout: 360                         # seconds per vision call
-        max_rounds: 5                        # challenge rounds per solve attempt
-        votes: 5                             # samples per round, decided by quorum
+        max_rounds: 12                       # slide changes/captcha screens per solve attempt
+        votes: 6                             # samples per round, quorum-decided; odd ones inverted
 
 Any server that implements the OpenAI chat completions schema works; extra
 fields the server does not know (like the ``options`` context hint) are
@@ -96,7 +96,7 @@ class VisionSolverConfig:
     api_key: str = ""
     context_size: int = 0
     timeout: float = 360.0
-    max_rounds: int = 5
+    max_rounds: int = 12
     votes: int = 1
     temperature: float = 0.0
     max_tokens: int = 2048
@@ -109,7 +109,7 @@ class VisionSolverConfig:
             api_key=(get_setting("outgoing.captcha_vision.api_key", "") or "").strip(),
             context_size=int(get_setting("outgoing.captcha_vision.context_size", 0) or 0),
             timeout=float(get_setting("outgoing.captcha_vision.timeout", 360.0) or 360.0),
-            max_rounds=int(get_setting("outgoing.captcha_vision.max_rounds", 5) or 5),
+            max_rounds=int(get_setting("outgoing.captcha_vision.max_rounds", 12) or 12),
             votes=int(get_setting("outgoing.captcha_vision.votes", 1) or 1),
             temperature=float(get_setting("outgoing.captcha_vision.temperature", 0.0) or 0.0),
             max_tokens=int(get_setting("outgoing.captcha_vision.max_tokens", 2048) or 2048),
@@ -127,9 +127,16 @@ def get_vision_solver() -> "OpenAICompatVisionSolver | None":
     return OpenAICompatVisionSolver(cfg)
 
 
-def widget_prompt(instruction: str, tile_count: int, rows: int, cols: int) -> str:
+def widget_prompt(instruction: str, tile_count: int, rows: int, cols: int, negate: bool = False) -> str:
     """Fallback prompt when the widget screenshot could not be cut into row
     strips: the model sees the whole widget and must number the grid itself."""
+    pick = (
+        "select every tile whose photo contains NO part of that object; if"
+        " every tile contains the object, answer with an empty list"
+        if negate else
+        "select every tile whose photo contains that object; a partly"
+        " visible object still counts"
+    )
     return (
         "You are helping a person pass an image CAPTCHA challenge. The image shows "
         "the full challenge widget: a blue instruction header (may be in ANY language, "
@@ -138,16 +145,29 @@ def widget_prompt(instruction: str, tile_count: int, rows: int, cols: int) -> st
         "counts: number its tiles left-to-right, top-to-bottom starting at 0 (the "
         "tile row directly under the header is row 0).\n"
         f"The challenge instruction also reads: {instruction}\n"
-        "Work out what object the instruction asks for, then select every tile whose "
-        "photo contains that object; a partly visible object still counts. Answer "
+        "Work out what object the instruction asks for, then "
+        + pick + ". Answer "
         'immediately with strict JSON only, no other text: {"tiles": [..], "action": "submit"}'
     )
 
 
-def strip_prompt(instruction: str, rows: int, cols: int) -> str:
+def strip_prompt(instruction: str, rows: int, cols: int, negate: bool = False) -> str:
     """Prompt for the per-row strip images: the model only reports positions
     within each strip, which it binds far more reliably than absolute tile
-    numbers over a composite widget."""
+    numbers over a composite widget. ``negate`` inverts the question (which
+    photos contain NO part of the object) so the quorum can cross-check."""
+    pick = (
+        "for each row strip list the positions whose photo contains NO part of "
+        "that object (a picture OF a sign, icon or logo contains no part of "
+        "it). If every photo in a strip contains the object, give that strip "
+        "an empty list; never guess"
+        if negate else
+        "for each row strip list the positions whose photo contains any part of "
+        "that object; a partly visible object still counts. Beware decoys: a "
+        "picture OF a sign, icon or logo is not the object itself. If NO photo "
+        "in a strip contains the object, give that strip an empty list; never "
+        "guess"
+    )
     return (
         "You are helping a person pass an image CAPTCHA challenge. You receive one "
         "image strip per grid row, in order: the first image is row 0, the second is "
@@ -155,27 +175,34 @@ def strip_prompt(instruction: str, rows: int, cols: int) -> str:
         f"photos left to right, at positions 0 to {cols - 1}.\n"
         f"The challenge instruction (may be in ANY language, often not English) reads: "
         f"{instruction}\n"
-        "Work out what object the instruction asks for, then for each row strip list "
-        "the positions whose photo contains any part of that object; a partly visible "
-        "object still counts. Do NOT reason step by step. Answer immediately with "
-        'strict JSON only, no other text, one inner list per row in order: '
-        '{"rows": [[..], [..]]}'
+        "Work out what object the instruction asks for, then " + pick + ". Do NOT "
+        "reason step by step. Answer immediately with strict JSON only, no other "
+        'text, one inner list per row in order: {"rows": [[..], [..]]}'
     )
 
 
-def cell_prompt(instruction: str, tile_count: int) -> str:
+def cell_prompt(instruction: str, tile_count: int, negate: bool = False) -> str:
     """Prompt for per-cell images, the fallback for layouts that do not form
-    a uniform grid."""
+    a uniform grid. ``negate`` inverts the question (see :py:func:`strip_prompt`)."""
+    pick = (
+        "list every tile photo that contains NO part of that object (a picture"
+        " OF a sign, icon or logo contains no part of it). If every tile photo"
+        " contains the object, answer with an empty list; never guess"
+        if negate else
+        "select every tile photo that contains any part of that object; a"
+        " partly visible object still counts. Beware decoys: a picture OF a"
+        " sign, icon or logo is not the object itself. If NO tile photo"
+        " contains the object, answer with an empty list; never guess"
+    )
     return (
         "You are helping a person pass an image CAPTCHA challenge. You receive "
         f"{tile_count} tile photos in order: the first image is tile 0, the second "
         f"image is tile 1, and so on (the last image is tile {tile_count - 1}).\n"
         f"The challenge instruction (may be in ANY language, often not English) reads: "
         f"{instruction}\n"
-        "Work out what object the instruction asks for, then select every tile photo "
-        "that contains any part of that object; a partly visible object still counts. "
-        "Do NOT reason step by step. Answer immediately with strict JSON only, no "
-        'other text: {"tiles": [..], "action": "submit"}'
+        "Work out what object the instruction asks for, then " + pick + ". Do NOT "
+        "reason step by step. Answer immediately with strict JSON only, no other "
+        'text: {"tiles": [..], "action": "submit"}'
     )
 
 
@@ -259,24 +286,33 @@ class OpenAICompatVisionSolver:
 
         The answer is sampled ``cfg.votes`` times (first vote at the
         configured temperature, the rest at rising temperatures to
-        decorrelate the answers) and the tiles kept are those that reach a
-        strict-majority quorum.
+        decorrelate the answers). Odd votes ask the INVERTED question
+        (which tiles contain no part of the object); their answers are
+        mapped back through the complement before the quorum, so a
+        hallucinated tile must be wrong twice, in opposite directions, to
+        reach a strict majority. The tiles kept are those that reach that
+        quorum.
         """
         if grid_images is None:
             mode, images = "widget", [widget_png]
         else:
             mode, images = grid_images
-        if mode == "rows":
-            prompt = strip_prompt(instruction, rows, cols)
-        elif mode == "cells":
-            prompt = cell_prompt(instruction, tile_count)
-        else:
-            prompt = widget_prompt(instruction, tile_count, rows, cols)
+
+        def build_prompt(negate: bool) -> str:
+            if mode == "rows":
+                return strip_prompt(instruction, rows, cols, negate=negate)
+            if mode == "cells":
+                return cell_prompt(instruction, tile_count, negate=negate)
+            return widget_prompt(instruction, tile_count, rows, cols, negate=negate)
 
         def parse(text: str) -> GridSolution:
             if mode == "rows":
                 return self.parse_strip_solution(text, rows, cols)
             return self.parse_solution(text, tile_count)
+
+        # the valid tile positions: strips report row-major indices over the
+        # whole grid, cells and the widget report plain tile indices
+        universe = rows * cols if mode == "rows" else tile_count
 
         votes = max(1, self.cfg.votes)
         per_vote: list[set[int]] = []
@@ -284,21 +320,29 @@ class OpenAICompatVisionSolver:
             # vote 0 pins the configured (usually greedy) temperature; the
             # rest sample around it so the quorum can separate a stable
             # answer from a flickering one
+            negate = vote % 2 == 1
             temperature = self.cfg.temperature if vote == 0 else min(0.8, 0.25 * vote)
             try:
-                answer = self.chat_vision(prompt, images, temperature=temperature)
+                answer = self.chat_vision(build_prompt(negate), images, temperature=temperature)
                 solution = parse(answer)
             except VisionSolverError as err:
                 logger.warning("vision vote %s/%s unusable: %s", vote + 1, votes, err)
                 continue
+            seen = set(solution.tiles)
+            if negate:
+                # invert back to "tiles WITH the object"
+                mapped = set(range(universe)) - seen
+            else:
+                mapped = seen
             logger.info(
-                "vision vote %s/%s (temp %.2f): tiles=%s",
+                "vision vote %s/%s (temp %.2f%s): tiles=%s",
                 vote + 1,
                 votes,
                 temperature,
-                list(solution.tiles),
+                ", inverted" if negate else "",
+                sorted(mapped),
             )
-            per_vote.append(set(solution.tiles))
+            per_vote.append(mapped)
 
         if not per_vote:
             raise VisionSolverError("no usable answer in %s vision vote(s)" % votes)

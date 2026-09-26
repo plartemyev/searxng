@@ -670,6 +670,21 @@ async def _element_count(locator) -> int:
         return 0
 
 
+async def _stable_tile_count(tiles) -> int:
+    """Tile count once it stops changing: dynamic grids stream tiles in,
+    and a count read too early solves the wrong grid. Returns the last
+    count seen when the grid does not settle in time."""
+    count = 0
+    deadline = time.monotonic() + 6.0
+    while time.monotonic() < deadline:
+        current = await _element_count(tiles)
+        if current > 0 and current == count:
+            return count
+        count = current
+        await asyncio.sleep(0.3)
+    return count
+
+
 async def _wait_tiles_painted(frame_loc, profile: _ImageGridProfile, tile_count: int) -> None:
     """Give the challenge photos a moment to render before the screenshot.
 
@@ -684,7 +699,7 @@ async def _wait_tiles_painted(frame_loc, profile: _ImageGridProfile, tile_count:
     while time.monotonic() < deadline:
         try:
             flags = []
-            for i in range(min(tile_count, 16)):
+            for i in range(min(tile_count, 25)):
                 flags.append(
                     await img.nth(i).evaluate('el => el.complete && el.naturalWidth > 0')
                 )
@@ -722,7 +737,7 @@ async def _tile_rects(frame_loc, profile: _ImageGridProfile, tile_count: int) ->
     as the widget screenshot), DOM order = row-major. None on any failure."""
     tiles = frame_loc.locator(profile.tile_selector)
     rects: list[list[int]] = []
-    for i in range(min(tile_count, 16)):
+    for i in range(min(tile_count, 25)):
         try:
             rect = await tiles.nth(i).evaluate(
                 'el => (r => [r.x, r.y, r.width, r.height])(el.getBoundingClientRect())'
@@ -733,6 +748,33 @@ async def _tile_rects(frame_loc, profile: _ImageGridProfile, tile_count: int) ->
             return None
         rects.append([int(rect[0]), int(rect[1]), int(rect[2]), int(rect[3])])
     return rects
+
+
+def _tiles_fully_painted(png: bytes, rects: list[list[int]]) -> bool:
+    """False when any tile region is a blank placeholder.
+
+    Dynamic challenges sometimes stream one tile late: the DOM paint flags
+    read complete while the pixels are still a flat white block. The
+    standard deviation of the tile's luminance separates a photo (or any
+    real image content) from a blank block.
+    """
+    try:
+        # pylint: disable=import-outside-toplevel
+        from searx.network.captcha_vision import crop_png, _png_decode
+
+        for x, y, w, h in rects:
+            tile = crop_png(png, x, y, w, h)
+            _, _, _, pixels = _png_decode(tile)
+            n = len(pixels) // 3
+            if n == 0:
+                return False
+            mean = sum(pixels[0::3]) / n
+            variance = sum((v - mean) ** 2 for v in pixels[0::3]) / n
+            if variance ** 0.5 < 10.0:
+                return False
+        return True
+    except Exception:  # pylint: disable=broad-except
+        return True  # codec trouble must not wedge the round loop
 
 
 async def _click_first_visible(frame_loc, selectors: tuple[str, ...], pointer) -> bool:
@@ -777,14 +819,20 @@ def _debug_dump(profile_name: str, round_index: int, png: bytes, instruction: st
 
 
 async def _run_image_rounds(page, pointer, solver, max_rounds: int, found) -> bool:
-    """Solve a mounted image grid, one vision round per image set.
+    """Solve a mounted image grid, one vision round per image set (slide).
 
-    Between rounds the pointer waits like a person reading the next
-    instruction; success is the browser leaving the challenge page.
+    A slide is consumed only when VERIFY is pressed: a grid that grew
+    (dynamically added tiles) while the model was thinking is re-read and
+    re-solved on the same slide. Between rounds the pointer waits like a
+    person reading the next instruction; success is the browser leaving
+    the challenge page.
     """
     solved = False
-    for round_index in range(1, max_rounds + 1):
-        if round_index > 1:
+    round_index = 1
+    re_reads = 0
+    fresh_slide = True
+    while round_index <= max_rounds:
+        if fresh_slide and round_index > 1:
             # a person reads the new image set before acting on it; the
             # next grid mounts after the verify round trip, so this probe
             # uses the full window -- a quick probe here would give up
@@ -797,12 +845,13 @@ async def _run_image_rounds(page, pointer, solver, max_rounds: int, found) -> bo
             if found is None:
                 solved = not await _page_looks_like_challenge(page)
                 break
+        fresh_slide = True
         profile, frame_loc = found
 
         try:
             instruction = await _frame_text(frame_loc, profile.instruction_selector)
             tiles = frame_loc.locator(profile.tile_selector)
-            tile_count = await _element_count(tiles)
+            tile_count = await _stable_tile_count(tiles)
             if tile_count <= 0:
                 solved = not await _page_looks_like_challenge(page)
                 break
@@ -829,11 +878,35 @@ async def _run_image_rounds(page, pointer, solver, max_rounds: int, found) -> bo
         # presentation is decided by the tiles' own geometry: uniform grids
         # of any dimension become row strips, irregular ones fall back to
         # per-cell images, and DOM failures to the whole widget screenshot
-        rows, cols = _grid_shape(tile_count)
         grid_images = None
-        try:
-            rects = await _tile_rects(frame_loc, profile, tile_count)
-            if rects:
+        rects = None
+        paint_deadline = time.monotonic() + 8.0
+        while True:
+            try:
+                fresh_count = await _element_count(tiles)
+                if fresh_count > 0 and fresh_count != tile_count:
+                    logger.info(
+                        'human input: %s grid added tiles: %s -> %s',
+                        profile.name,
+                        tile_count,
+                        fresh_count,
+                    )
+                    tile_count = fresh_count
+                    await _wait_tiles_painted(frame_loc, profile, tile_count)
+                    png = await _iframe_screenshot(page, profile) or png
+                rects = await _tile_rects(frame_loc, profile, tile_count)
+            except Exception:  # pylint: disable=broad-except
+                rects = None
+                break
+            if rects and _tiles_fully_painted(png, rects):
+                break
+            if time.monotonic() >= paint_deadline:
+                break
+            # a late tile: reshoot and check the pixels again
+            await asyncio.sleep(random.uniform(0.5, 0.9))  # noqa: S311
+            png = await _iframe_screenshot(page, profile) or png
+        if rects:
+            try:
                 # pylint: disable=import-outside-toplevel
                 from searx.network.captcha_vision import build_row_strips, crop_cells, derive_grid_layout
 
@@ -843,8 +916,8 @@ async def _run_image_rounds(page, pointer, solver, max_rounds: int, found) -> bo
                     grid_images = ("rows", build_row_strips(png, rects, cols))
                 else:
                     grid_images = ("cells", crop_cells(png, rects))
-        except Exception:  # pylint: disable=broad-except
-            grid_images = None
+            except Exception:  # pylint: disable=broad-except
+                grid_images = None
         try:
             # blocking HTTP stays off the lane's event loop
             solution = await asyncio.to_thread(
@@ -864,6 +937,25 @@ async def _run_image_rounds(page, pointer, solver, max_rounds: int, found) -> bo
             instruction,
         )
 
+        # the challenge can add tiles while the model thinks: a stale
+        # answer would click wrong tiles, so re-read the grid instead.
+        # This costs no slide -- nothing was pressed yet.
+        try:
+            fresh_count = await _element_count(tiles)
+        except Exception:  # pylint: disable=broad-except
+            fresh_count = tile_count
+        if fresh_count > 0 and fresh_count != tile_count and re_reads < 8:
+            re_reads += 1
+            fresh_slide = False
+            logger.info(
+                'human input: %s grid changed while solving: %s -> %s tiles;'
+                ' re-reading the grid',
+                profile.name,
+                tile_count,
+                fresh_count,
+            )
+            continue
+
         # look over the grid, then click the matching tiles like a person:
         # uneven gaps between clicks, an occasional longer double-take
         await asyncio.sleep(random.uniform(0.5, 1.2))  # noqa: S311
@@ -879,6 +971,15 @@ async def _run_image_rounds(page, pointer, solver, max_rounds: int, found) -> bo
             else:
                 await asyncio.sleep(random.uniform(0.35, 0.95))  # noqa: S311
 
+        # TEMPORARY: selection state before the press -- selected tiles
+        # show overlays and the press clears them
+        try:
+            sel_png = await _iframe_screenshot(page, profile)
+            if sel_png:
+                _debug_dump(profile.name + '_sel', round_index, sel_png, page.url)
+        except Exception:  # pylint: disable=broad-except
+            pass
+
         # hover the button a moment before pressing it
         await asyncio.sleep(random.uniform(0.6, 1.4))  # noqa: S311
         if solution.action == 'skip' and clicked_tiles == 0:
@@ -890,7 +991,7 @@ async def _run_image_rounds(page, pointer, solver, max_rounds: int, found) -> bo
         if not clicked:
             logger.warning('human input: no VERIFY/SKIP button found in %s challenge', profile.name)
             return False
-        # TEMPORARY: post-selection state -- selected tiles show overlays
+        # TEMPORARY: post-press state -- the error banner shows on a reject
         try:
             post_png = await _iframe_screenshot(page, profile)
             if post_png:
@@ -899,12 +1000,16 @@ async def _run_image_rounds(page, pointer, solver, max_rounds: int, found) -> bo
             pass
         logger.info('human input: pressed VERIFY for round %s, page %s', round_index, page.url)
 
+        # the press consumes the slide; grid re-reads above are free
+        round_index += 1
+        re_reads = 0
+
         # wait out the round trip: the next image set replaces this one, or
         # the browser leaves the challenge page entirely
         await asyncio.sleep(random.uniform(2.0, 3.5))  # noqa: S311
 
     if not solved:
-        logger.warning('human input: image challenge not solved after %s round(s)', max_rounds)
+        logger.warning('human input: image challenge not solved after %s slide(s)', max_rounds)
     return solved
 
 
