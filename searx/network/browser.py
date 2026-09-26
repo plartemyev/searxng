@@ -98,6 +98,33 @@ _XVFB_GEOMETRY = "1440x900x24"
 _xvfb_processes: dict[str, subprocess.Popen] = {}
 _xvfb_lock = threading.Lock()
 
+_PR_SET_MEMORY_MERGE = 67  # linux/prctl.h, kernel >= 6.4
+
+
+def _enable_ksm_merge() -> bool:
+    """Mark this process tree mergeable for the host's ksmd.
+
+    The six headed Chromium lanes duplicate large anonymous regions (V8
+    startup heaps, decoded static assets, idle reader tabs); KSM merges
+    those pages host-side. The flag lives on the mm and is inherited
+    through fork, so one call before the lanes launch covers Chromium,
+    Xvfb, and their helpers. Chromium never calls madvise(MERGEABLE)
+    itself, and the KSM switch is host-global, so without this the
+    daemon has nothing to scan. Harmless no-op when the kernel is older
+    than 6.4 or KSM is disabled on the host.
+    """
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(_PR_SET_MEMORY_MERGE, 1, 0, 0, 0) != 0:
+            logger.info("KSM mergeable not set (prctl failed, errno %d)", ctypes.get_errno())
+            return False
+        return True
+    except Exception as e:  # pragma: no cover - defensive
+        logger.info("KSM mergeable not set: %s", e)
+        return False
+
 
 class BrowserFetchError(Exception):
     """Raised when the browser pool cannot serve a request."""
@@ -1191,6 +1218,7 @@ class BrowserFetchPool:
                 )
 
             try:
+                _enable_ksm_merge()
                 self._playwright = await async_playwright().start()
                 # one geo lookup for all lanes (cached in process memory);
                 # parallel launches would each miss the cache and re-fetch

@@ -811,3 +811,37 @@ def test_vision_session_budget_stops_the_rounds(monkeypatch):
 
     solved = asyncio.new_event_loop().run_until_complete(_run())
     assert solved is False
+
+
+# -- KSM mergeable ------------------------------------------------------------
+
+def test_ksm_merge_success(monkeypatch):
+    """prctl(PR_SET_MEMORY_MERGE, 1) succeeding reports mergeable."""
+    class _FakeLibc:
+        def prctl(self, *_):
+            return 0
+
+    monkeypatch.setattr(
+        "ctypes.CDLL", lambda *_a, **_kw: _FakeLibc(), raising=True
+    )
+    assert browser_module._enable_ksm_merge() is True
+
+
+def test_ksm_merge_failure_is_not_fatal(monkeypatch):
+    """A prctl rejection (old kernel, KSM off) is logged, not raised."""
+    class _FakeLibc:
+        def prctl(self, *_):
+            return -1
+
+    monkeypatch.setattr(
+        "ctypes.CDLL", lambda *_a, **_kw: _FakeLibc(), raising=True
+    )
+    assert browser_module._enable_ksm_merge() is False
+
+
+def test_ksm_merge_missing_libc_is_not_fatal(monkeypatch):
+    def _boom(*_a, **_kw):
+        raise OSError("no libc")
+
+    monkeypatch.setattr("ctypes.CDLL", _boom, raising=True)
+    assert browser_module._enable_ksm_merge() is False
