@@ -467,6 +467,42 @@ def test_lane_serp_url_affinity_routing():
     assert pool._lane_cycle.get_nowait() is lane_a
 
 
+def test_checkout_for_crawl_borrows_busy_affinity_lane():
+    """When the finding lane is mid-request/browsing, the crawl rides that
+    same browser instead of losing affinity -- and must not hand the lane
+    back to the cycle afterwards."""
+    import asyncio
+
+    pool = browser_module.BrowserFetchPool(pool_size=2)
+    lane_a = browser_module._Lane(None, None, ":110")
+    lane_b = browser_module._Lane(None, None, ":111")
+    pool._lanes = [lane_a, lane_b]
+    pool._lane_cycle = asyncio.Queue()
+    for lane in pool._lanes:
+        pool._lane_cycle.put_nowait(lane)
+
+    target = "https://www.google.com/goto?url=CAESZAHrOzAVHB0og9NqrORWjur2zmOTzwdJe1Vj5Y"
+    lane_b.serp_urls.append(target)
+
+    # simulate lane_b being checked out by a browsing session
+    pool._lane_cycle.get_nowait()  # remove lane order: pop both, keep b out
+    pool._lane_cycle.get_nowait()
+    lane_b.busy = True
+
+    async def _run():
+        return await pool._checkout_for_crawl(target)
+
+    lane, affinity, borrowed = asyncio.new_event_loop().run_until_complete(_run())
+    assert (lane, affinity, borrowed) is not None
+    assert lane is lane_b
+    assert affinity is True
+    assert borrowed is True
+    # the borrowed lane was NOT returned to the cycle: it stays with its
+    # original owner (the browsing session)
+    assert pool._lane_cycle.qsize() == 0
+    assert lane_b.busy is True
+
+
 def test_record_serp_urls_keeps_organic_links_only():
     from types import SimpleNamespace as NS
 

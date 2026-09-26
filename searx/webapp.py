@@ -653,14 +653,18 @@ def crawl():
         if mode != 'render':
             return jsonify({'error': "mode must be 'render' or 'bytes'"}), 400
         result = crawl_client.render_page(url, timeout_s=timeout_s, allow_private_network=allow_private)
-        return jsonify({
+        response = {
             'final_url': result['final_url'],
             'status': result['status'],
             'challenge': result['challenge'],
             'lane': result['lane'],
             'affinity': result['affinity'],
             'html': result['html'],
-        })
+        }
+        if 'memory' in result:
+            # diagnostics requested via outgoing.browser_debug_trace
+            response['memory'] = result['memory']
+        return jsonify(response)
     except crawl_client.CrawlBodyTooLarge as e:
         return jsonify({'error': str(e)}), 413
     except crawl_client.CrawlError as e:

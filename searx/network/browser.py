@@ -1578,7 +1578,7 @@ class BrowserFetchPool:
             lane.serp_urls.extend(recorded)
             logger.info(
                 "lane %s: %d result URL(s) remembered (search %s)",
-                lane.display or "headless", len(recorded), request_url[:80],
+                lane.display or "headless", len(recorded), request_url[:120],
             )
 
     def _lane_for_serp_url(self, url: str) -> "_Lane | None":
@@ -1590,6 +1590,21 @@ class BrowserFetchPool:
         # freshest memory first
         matches.sort(key=lambda lane: lane.last_used, reverse=True)
         return matches[0]
+
+    def _memory_debug(self, url: str) -> dict:
+        """Snapshot of the lane memory for one crawl URL (diagnostics)."""
+        normalized = (url or "").split("#", 1)[0]
+        return {
+            "affinity_lanes": [
+                lane.display or "headless"
+                for lane in self._lanes
+                if normalized in lane.serp_urls
+            ],
+            "memory": [
+                {"lane": lane.display or "headless", "urls": len(lane.serp_urls)}
+                for lane in self._lanes
+            ],
+        }
 
     def _claim_lane_now(self, preferred: _Lane) -> "_Lane | None":
         """Take a specific lane out of the free cycle, if it is free now."""
@@ -1614,27 +1629,40 @@ class BrowserFetchPool:
             found.last_used = time.monotonic()
         return found
 
-    async def _checkout_for_crawl(self, url: str) -> tuple["_Lane", bool]:
+    async def _checkout_for_crawl(self, url: str) -> tuple[_Lane, bool, bool]:
         """Check a lane out for a crawl, preferring the lane whose search
-        returned the URL. Returns (lane, affinity_hit)."""
+        returned the URL.
+
+        Returns (lane, affinity_hit, borrowed). A borrowed lane is already
+        checked out by a search or a browsing session: the crawl opens its
+        page on that same browser (a reader opens another tab) and the
+        caller must NOT hand the lane back to the cycle.
+        """
         await self._init()
         await self._ensure_browser_alive()
         preferred = self._lane_for_serp_url(url)
-        if preferred is None:
-            logger.info("crawl of %s: no lane memory hit", url[:100])
         if preferred is not None:
+            if preferred.busy and self._lane_is_alive(preferred):
+                # the finding lane is mid-request or browsing: the crawl
+                # rides along on the same browser and identity
+                logger.info(
+                    "crawl of %s rides the busy affinity lane %s", url, preferred.display or "headless",
+                )
+                return preferred, True, True
             lane = self._claim_lane_now(preferred)
             if lane is not None:
                 logger.info(
                     "crawl of %s routed to lane %s: its search returned this URL",
-                    url[:100], lane.display or "headless",
+                    url, lane.display or "headless",
                 )
-                return lane, True
-            # the finding lane is busy: fall through to the normal cycle
+                return lane, True, False
+            # the finding lane is alive-but-unclearable or vanished in a
+            # race: fall through to the normal cycle
+        logger.info("crawl of %s: no lane memory hit", url)
         lane = await self._lane_cycle.get()
         lane.busy = True
         lane.last_used = time.monotonic()
-        return lane, False
+        return lane, False, False
 
     async def crawl_render(self, url: str, *, timeout_s: float = 30.0) -> dict:
         """Navigate a page in a lane browser and return the rendered DOM.
@@ -1646,49 +1674,48 @@ class BrowserFetchPool:
         (the translation service stays unused).
         """
         url = unwrap_google_translate_url(url)
-        lane, affinity = await self._checkout_for_crawl(url)
+        lane, affinity, borrowed = await self._checkout_for_crawl(url)
         if affinity:
-            logger.debug("affinity crawl on lane %s", lane.display or "headless")
+            logger.info("affinity crawl on lane %s (borrowed=%s)", lane.display or "headless", borrowed)
         try:
-            async with lane.lock:
-                page = await lane.context.new_page()
+            page = await lane.context.new_page()
+            try:
+                response = await page.goto(
+                    url, timeout=timeout_s * 1000, wait_until="commit"
+                )
+                status = response.status if response else None
+                headers = response.headers if response else {}
+                if _looks_like_bot_challenge(status, headers):
+                    await page.wait_for_timeout(_BOT_CHALLENGE_GRACE_MS)
                 try:
-                    response = await page.goto(
-                        url, timeout=timeout_s * 1000, wait_until="commit"
+                    await page.wait_for_load_state(
+                        "networkidle", timeout=_BOT_CHALLENGE_GRACE_MS
                     )
-                    status = response.status if response else None
-                    headers = response.headers if response else {}
-                    if _looks_like_bot_challenge(status, headers):
-                        await page.wait_for_timeout(_BOT_CHALLENGE_GRACE_MS)
-                    try:
-                        await page.wait_for_load_state(
-                            "networkidle", timeout=_BOT_CHALLENGE_GRACE_MS
+                except Exception:  # pylint: disable=broad-except
+                    pass
+                final_url = page.url
+                if _is_google_translate_url(final_url):
+                    original = unwrap_google_translate_url(final_url)
+                    if original != final_url:
+                        logger.info(
+                            "crawl of %s landed on a Google Translate copy;"
+                            " fetching the original %s",
+                            url, original[:100],
                         )
-                    except Exception:  # pylint: disable=broad-except
-                        pass
-                    final_url = page.url
-                    if _is_google_translate_url(final_url):
-                        original = unwrap_google_translate_url(final_url)
-                        if original != final_url:
-                            logger.info(
-                                "crawl of %s landed on a Google Translate copy;"
-                                " fetching the original %s",
-                                url, original[:100],
+                        response = await page.goto(
+                            original, timeout=timeout_s * 1000,
+                            wait_until="commit",
+                        )
+                        status = response.status if response else None
+                        try:
+                            await page.wait_for_load_state(
+                                "networkidle", timeout=_BOT_CHALLENGE_GRACE_MS
                             )
-                            response = await page.goto(
-                                original, timeout=timeout_s * 1000,
-                                wait_until="commit",
-                            )
-                            status = response.status if response else None
-                            try:
-                                await page.wait_for_load_state(
-                                    "networkidle", timeout=_BOT_CHALLENGE_GRACE_MS
-                                )
-                            except Exception:  # pylint: disable=broad-except
-                                pass
-                            final_url = page.url
+                        except Exception:  # pylint: disable=broad-except
+                            pass
+                        final_url = page.url
                     html_text = await page.content()
-                    return {
+                    result = {
                         "final_url": final_url,
                         "status": status,
                         "html": html_text,
@@ -1698,10 +1725,14 @@ class BrowserFetchPool:
                         "lane": lane.display or "headless",
                         "affinity": affinity,
                     }
+                    if _TRACE_STATE["enabled"]:
+                        result["memory"] = self._memory_debug(url)
+                    return result
                 finally:
                     await page.close()
         finally:
-            self._return_lane(lane)
+            if not borrowed:
+                self._return_lane(lane)
 
     async def crawl_bytes(self, url: str, *, timeout_s: float = 30.0, max_bytes: int = 52428800) -> dict:
         """Fetch raw bytes in a lane's browser context (browser TLS + cookies).
@@ -1709,7 +1740,7 @@ class BrowserFetchPool:
         Returns a dict with ``final_url``, ``status``, ``content_type`` and
         ``content`` (bytes, capped at ``max_bytes``).
         """
-        lane, _affinity = await self._checkout_for_crawl(url)
+        lane, affinity, borrowed = await self._checkout_for_crawl(url)
         try:
             async with lane.lock:
                 response = await lane.context.request.get(
@@ -1727,10 +1758,14 @@ class BrowserFetchPool:
                     ),
                     "content": body,
                     "lane": lane.display or "headless",
-                    "affinity": _affinity,
+                    "affinity": affinity,
                 }
+                if _TRACE_STATE["enabled"]:
+                    result["memory"] = self._memory_debug(url)
+                return result
         finally:
-            self._return_lane(lane)
+            if not borrowed:
+                self._return_lane(lane)
 
     async def _fetch_on_lane(
         self,
