@@ -50,6 +50,7 @@ __all__ = ["BrowserFetchPool", "get_browser_fetch_pool", "ensure_display", "Brow
 
 import asyncio
 import atexit
+import base64
 import http.client as http
 import json
 import logging
@@ -492,13 +493,35 @@ def _registrable_site(host: str | None) -> str:
     return ".".join(labels[-2:])
 
 
+def _bing_wrapper_target(resolved: str) -> str | None:
+    """Decoded target of a bing ``/ck/a`` wrapper link, when parseable.
+
+    Bing hides the destination in ``u=a1<base64url>``; wrappers that point
+    back at a bing page (video panels, related searches) are not result
+    click-throughs, so callers can drop them.
+    """
+    parts = urlsplit(resolved)
+    if "/ck/a" not in parts.path:
+        return None
+    payload = (parse_qs(parts.query).get("u") or [""])[0]
+    if not payload.startswith("a1"):
+        return None
+    body = payload[2:]
+    try:
+        padded = body + "=" * (-len(body) % 4)
+        return base64.urlsafe_b64decode(padded).decode("utf-8", errors="replace")
+    except Exception:  # pylint: disable=broad-except
+        return None
+
+
 def _browsable_links(hrefs, serp_url: str) -> list[str]:
     """Raw result hrefs worth a human click-through.
 
     Keeps off-site links and the engine's outbound redirect wrappers;
     drops engine-internal links (verticals, related searches, account
-    pages), non-page assets, self links and duplicates. Returns the raw
-    attribute values, so a locator can match the anchor exactly.
+    pages), wrappers that resolve back into the engine, non-page assets,
+    self links and duplicates. Returns the raw attribute values, so a
+    locator can match the anchor exactly.
     """
     base_site = _registrable_site(urlsplit(serp_url).hostname)
     seen: set[str] = set()
@@ -514,6 +537,9 @@ def _browsable_links(hrefs, serp_url: str) -> list[str]:
         if _registrable_site(parts.hostname) == base_site:
             tail = f"{parts.path}?{parts.query}"
             if not any(hint in tail for hint in _REDIRECT_HINTS):
+                continue
+            target = _bing_wrapper_target(resolved)
+            if target and _registrable_site(urlsplit(target).hostname) == base_site:
                 continue
         if parts.path.lower().endswith(_POST_SEARCH_SKIP_EXTENSIONS):
             continue
@@ -1666,8 +1692,12 @@ class BrowserFetchPool:
         except Exception:  # pylint: disable=broad-except
             pass
         try:
+            # anchors with layout boxes only: hidden duplicates of result
+            # links (accessibility markup) would just waste a pick
             raw_hrefs = await page.eval_on_selector_all(
-                "a[href]", "els => els.map(e => e.getAttribute('href'))"
+                "a[href]",
+                "els => els.filter(e => e.getClientRects().length > 0)"
+                ".map(e => e.getAttribute('href'))",
             )
         except Exception:  # pylint: disable=broad-except
             return 0

@@ -4,6 +4,7 @@
 # pylint: disable=missing-module-docstring
 
 import asyncio
+import base64
 import json
 import os
 import time
@@ -441,7 +442,7 @@ def test_post_search_browsing_spawn_gate():
         pool = browser_module.BrowserFetchPool(post_search_browsing=True)
         pool._lane_cycle = asyncio.Queue()
 
-        async def noop_session(lane, page, serp_url):
+        async def noop_session(_lane, _page, _serp_url):
             return
 
         pool._post_search_browsing_session = noop_session
@@ -476,6 +477,34 @@ def test_post_search_browsing_disabled_by_default():
         ) is False
 
     asyncio.run(check())
+
+
+def test_browsable_links_drops_wrappers_resolving_insite():
+    serp = "https://www.bing.com/search?q=x"
+
+    def wrap(target: str) -> str:
+        u = "a1" + base64.urlsafe_b64encode(target.encode()).decode().rstrip("=")
+        return f"https://www.bing.com/ck/a?!&&u={u}&ntb=1"
+
+    out = browser_module._browsable_links(
+        [
+            wrap("https://www.bing.com/images/search?q=y"),  # stays on bing
+            wrap("https://en.wikipedia.org/wiki/Linux"),  # real result
+            "https://example.org/page",
+        ],
+        serp,
+    )
+    assert out == [
+        wrap("https://en.wikipedia.org/wiki/Linux"),
+        "https://example.org/page",
+    ]
+
+
+def test_browsable_links_keeps_wrappers_with_unparseable_targets():
+    serp = "https://www.bing.com/search?q=x"
+    href = "https://www.bing.com/ck/a?!&&p=deadbeef&ntb=1"  # no u= payload
+    assert browser_module._browsable_links([href], serp) == [href]
+
 
 
 def test_post_search_wanted_requires_idle_lane():
