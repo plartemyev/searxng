@@ -1714,22 +1714,22 @@ class BrowserFetchPool:
                         except Exception:  # pylint: disable=broad-except
                             pass
                         final_url = page.url
-                    html_text = await page.content()
-                    result = {
-                        "final_url": final_url,
-                        "status": status,
-                        "html": html_text,
-                        "challenge": _looks_like_unresolved_challenge_body(
-                            html_text.encode("utf-8", errors="replace")
-                        ),
-                        "lane": lane.display or "headless",
-                        "affinity": affinity,
-                    }
-                    if _TRACE_STATE["enabled"]:
-                        result["memory"] = self._memory_debug(url)
-                    return result
-                finally:
-                    await page.close()
+                html_text = await page.content()
+                result = {
+                    "final_url": final_url,
+                    "status": status,
+                    "html": html_text,
+                    "challenge": _looks_like_unresolved_challenge_body(
+                        html_text.encode("utf-8", errors="replace")
+                    ),
+                    "lane": lane.display or "headless",
+                    "affinity": affinity,
+                }
+                if _TRACE_STATE["enabled"]:
+                    result["memory"] = self._memory_debug(url)
+                return result
+            finally:
+                await page.close()
         finally:
             if not borrowed:
                 self._return_lane(lane)
@@ -1749,7 +1749,7 @@ class BrowserFetchPool:
                 body = await response.body()
                 if len(body) > max_bytes:
                     raise CrawlBodyTooLarge(len(body), max_bytes)
-                return {
+                result = {
                     "final_url": response.url,
                     "status": response.status,
                     "content_type": response.headers.get("content-type"),
