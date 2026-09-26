@@ -627,6 +627,12 @@ def crawl():
         return jsonify({'error': 'invalid timeout parameter'}), 400
     allow_private = searx.get_setting('outgoing.browser_crawl_allow_private_network', False)
     max_bytes = int(searx.get_setting('outgoing.browser_crawl_max_bytes', 52428800))
+    if mode == 'bytes':
+        # the client may lower the cap for this call, never raise it
+        try:
+            max_bytes = min(max(int(sxng_request.args.get('max_bytes', max_bytes)), 1024), max_bytes)
+        except ValueError:
+            pass
 
     try:
         if mode == 'bytes':
