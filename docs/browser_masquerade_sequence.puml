@@ -14,14 +14,15 @@ participant "captcha_vision\n(OpenAI-compatible\nvision endpoint)" as Vision
 participant "provider\n(google.com ...)" as Up
 
 Onyx -> Web : GET /search?q=... (json)
-note right of Onyx : Onyx client read budget 90 s\n(SEARXNG_READ_TIMEOUT_SECONDS)
+note right of Onyx : Onyx client read budget 450 s = 2x worst\nattempt (SEARXNG_READ_TIMEOUT_SECONDS);\nretries paced 20 s / 40 s like a person\nre-querying
 
 Web -> Eng : engine request
 Eng -> Pool : fetch(url) via browser pool
 note right of Pool : provider send pacing:\n1-5 s random gap per host,\nqueue cap 20 s
 
 Pool -> Pool : checkout next idle lane\n(asyncio lane cycle)
-note right of Pool : wait here if all 6 lanes busy\n(engine timeout budget:\ngoogle 85 s, others 60 s)
+note right of Pool : per-origin human pacing on the\nbrowser lanes (searx/network/browser.py):\nsame origin keeps a jittered min gap\n-- search engines 4-10 s, other sites\n8-20 s, burst cap 45 s -- across all\nlanes, like one attentive person;\ndifferent origins stay parallel
+note right of Pool : wait here if all 6 lanes busy,\nbounded: 20 s, then the oldest\nbackground browsing session is\ncancelled, then up to 90 s more\n(engine timeout budget:\ngoogle 85 s, others 75 s)
 
 alt maximum stealth (browser_max_stealth: on)
     Pool -> Lane : open provider homepage\n(hl/gl locale params ride along)
