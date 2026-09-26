@@ -273,6 +273,15 @@ SCHEMA: dict[str, t.Any] = {
         # Empty (default) runs lanes with ephemeral in-memory contexts.
         # Mount this path on a docker volume to persist across recreations.
         'browser_profile_dir': SettingsValue(str, ''),
+        # Post-search reputation browsing: after a browser-served search
+        # returns its results, a background task keeps the lane behaving
+        # like a reader -- click an organic result, scroll and drift the
+        # pointer over the page for 10-30s, return to the results, maybe
+        # visit 1-3 more results. Engines score each persistent lane
+        # profile by exactly this follow-through behavior; a jar that only
+        # ever searches looks like a bot. Skipped automatically when no
+        # other lane is idle, so searches never starve.
+        'browser_post_search_browsing': SettingsValue(bool, False),
         # On a bot challenge, fall back to driving the provider's search UI
         # like a human: XTEST mouse (Bezier curve with jitter), typing and a
         # natural click on the search button (see searx/network/human_input.py).

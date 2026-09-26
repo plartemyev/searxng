@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -348,3 +349,139 @@ def test_lane_is_alive_handles_persistent_contexts():
     dead = browser_module._Lane(None, _FakeContext(closed=True), None)
     assert browser_module.BrowserFetchPool._lane_is_alive(alive) is True
     assert browser_module.BrowserFetchPool._lane_is_alive(dead) is False
+
+
+# --------------------------------------------------------------------------
+# post-search reputation browsing
+
+
+def _serp_response(status=200, url="https://www.bing.com/search?q=test",
+                   content_type="text/html; charset=utf-8"):
+    return browser_module.BrowserResponse(
+        status_code=status,
+        headers={"content-type": content_type},
+        content=b"<html></html>",
+        url=url,
+        method="GET",
+    )
+
+
+def _lane_stub():
+    return browser_module._Lane(None, None, None)
+
+
+def test_browsable_links_keeps_offsite_and_engine_wrappers():
+    serp = "https://www.bing.com/search?q=linux"
+    out = browser_module._browsable_links(
+        [
+            "https://www.bing.com/ck/a?!&u=a1&ntb=1",  # organic wrapper
+            "https://en.wikipedia.org/wiki/Linux",  # off-site result
+            "https://www.bing.com/images/search?q=linux",  # vertical
+            "/search?q=related+searches",  # related search
+            "https://www.bing.com/account/general",  # settings
+            "javascript:void(0)",
+            "mailto:x@y.z",
+            "#",
+            "",
+            None,
+        ],
+        serp,
+    )
+    assert "https://www.bing.com/ck/a?!&u=a1&ntb=1" in out
+    assert "https://en.wikipedia.org/wiki/Linux" in out
+    assert len(out) == 2
+
+
+def test_browsable_links_dedups_identical_wrappers_and_keeps_first_raw():
+    serp = "https://duckduckgo.com/?q=linux&ia=web"
+    wrap = "//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2F&rut=abc"
+    out = browser_module._browsable_links(
+        [
+            wrap,
+            "/l/?uddg=https%3A%2F%2Fexample.com%2F&rut=abc",  # same target
+            "https://example.org/page",
+        ],
+        serp,
+    )
+    assert len(out) == 2
+    assert out[0] == wrap  # raw attribute value preserved for the locator
+
+
+def test_browsable_links_drops_assets_and_caps_candidates():
+    serp = "https://www.bing.com/search?q=x"
+    assert browser_module._browsable_links(
+        ["https://cdn.example.com/photo.jpg"], serp
+    ) == []
+    many = [f"https://site{i}.example.com/page" for i in range(100)]
+    out = browser_module._browsable_links(many, serp)
+    assert len(out) == browser_module._POST_SEARCH_MAX_LINKS
+
+
+def test_registrable_site():
+    assert browser_module._registrable_site("www.bing.com") == "bing.com"
+    assert browser_module._registrable_site("localhost") == "localhost"
+    assert browser_module._registrable_site(None) == ""
+
+
+def test_link_locator_escapes_attribute_value():
+    selectors = []
+
+    class FakePage:
+        def locator(self, selector):
+            selectors.append(selector)
+            return SimpleNamespace(first="locator")
+
+    loc = browser_module._link_locator(FakePage(), 'https://x.com/a"b\\c')
+    assert loc == "locator"
+    assert selectors == ['a[href="https://x.com/a\\"b\\\\c"]']
+
+
+def test_post_search_browsing_spawn_gate():
+    async def check():
+        pool = browser_module.BrowserFetchPool(post_search_browsing=True)
+        pool._lane_cycle = asyncio.Queue()
+
+        async def noop_session(lane, page, serp_url):
+            return
+
+        pool._post_search_browsing_session = noop_session
+        # non-HTML or failing responses never spawn
+        assert await pool._maybe_start_post_search_browsing(
+            _lane_stub(), _serp_response(status=403)
+        ) is False
+        assert await pool._maybe_start_post_search_browsing(
+            _lane_stub(), _serp_response(content_type="application/json")
+        ) is False
+        # no idle lane: browsing is skipped, search keeps the capacity
+        assert await pool._maybe_start_post_search_browsing(
+            _lane_stub(), _serp_response()
+        ) is False
+        # good response with a spare lane: spawn and hold the lane
+        pool._lane_cycle.put_nowait(object())
+        lane = _lane_stub()
+        assert await pool._maybe_start_post_search_browsing(
+            lane, _serp_response()
+        ) is True
+
+    asyncio.run(check())
+
+
+def test_post_search_browsing_disabled_by_default():
+    async def check():
+        pool = browser_module.BrowserFetchPool()
+        pool._lane_cycle = asyncio.Queue()
+        pool._lane_cycle.put_nowait(object())
+        assert await pool._maybe_start_post_search_browsing(
+            _lane_stub(), _serp_response()
+        ) is False
+
+    asyncio.run(check())
+
+
+def test_post_search_wanted_requires_idle_lane():
+    pool = browser_module.BrowserFetchPool(post_search_browsing=True)
+    pool._lane_cycle = asyncio.Queue()
+    assert pool._post_search_wanted("https://www.bing.com/search?q=x") is False
+    pool._lane_cycle.put_nowait(object())
+    assert pool._post_search_wanted("https://www.bing.com/search?q=x") is True
+    assert pool._post_search_wanted("https://www.bing.com/ac/?q=x") is False

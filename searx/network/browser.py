@@ -69,7 +69,7 @@ from searx.exceptions import (
     SearxEngineTooManyRequestsException,
 )
 from searx.extended_types import SXNG_URL
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urljoin, urlsplit
 
 logger = logging.getLogger("searx.network.browser")
 
@@ -444,6 +444,94 @@ def _is_human_search_candidate(url: str) -> bool:
     return bool(_search_query_from_url(url))
 
 
+# -- post-search browsing ----------------------------------------------------
+# Engines score a cookie jar by what it does around searches, not by the
+# searches alone. After a browser-served search returns its results, a
+# background task keeps the lane behaving like a reader: click an organic
+# result, scroll and drift the pointer over the page, come back to the
+# results, maybe visit more results. The HTTP traffic is pure observation;
+# every click and scroll is real X input (see searx/network/human_input.py).
+
+_POST_SEARCH_DWELL_RANGE = (10.0, 30.0)  # seconds per visited result page
+_POST_SEARCH_EXTRA_VISITS = (1, 3)  # more result pages after the first
+_POST_SEARCH_BUDGET_S = 180.0  # wall-clock cap for a whole browsing session
+_POST_SEARCH_MAX_LINKS = 60  # candidate result links kept per SERP
+# Same-site links that are the engine's outbound redirect wrappers: these
+# ARE the organic click targets on the results page. Any other same-site
+# link (verticals, related searches, settings) is not a reader's click.
+_REDIRECT_HINTS = ("/ck/a", "/l/?uddg", "/url?q=", "/interstitial", "/proxy?")
+# Clicking a bare image or archive URL is not reading; skip those links.
+_POST_SEARCH_SKIP_EXTENSIONS = (
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".ico", ".css", ".js",
+    ".zip", ".rar", ".7z", ".gz", ".pdf", ".exe", ".dmg", ".iso", ".mp4",
+)
+
+
+def _is_browsable_search_url(url: str) -> bool:
+    """A search-results GET worth continuing with human-like browsing.
+
+    Like :py:func:`_is_human_search_candidate`, but duckduckgo included:
+    its jar earns reputation the same way, it just skips the interactive
+    search itself.
+    """
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        return False
+    if _is_api_url(url):
+        return False
+    return bool(_search_query_from_url(url))
+
+
+def _registrable_site(host: str | None) -> str:
+    """Last two labels of a hostname -- 'same engine site' granularity.
+
+    A coarse heuristic on purpose: the engines browsed here (google, bing,
+    ddg, brave) sit on plain second-level domains.
+    """
+    labels = [part for part in (host or "").lower().split(".") if part]
+    return ".".join(labels[-2:])
+
+
+def _browsable_links(hrefs, serp_url: str) -> list[str]:
+    """Raw result hrefs worth a human click-through.
+
+    Keeps off-site links and the engine's outbound redirect wrappers;
+    drops engine-internal links (verticals, related searches, account
+    pages), non-page assets, self links and duplicates. Returns the raw
+    attribute values, so a locator can match the anchor exactly.
+    """
+    base_site = _registrable_site(urlsplit(serp_url).hostname)
+    seen: set[str] = set()
+    out: list[str] = []
+    for href in hrefs or []:
+        raw = (href or "").strip()
+        if not raw:
+            continue
+        resolved = urljoin(serp_url, raw)
+        parts = urlsplit(resolved)
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            continue
+        if _registrable_site(parts.hostname) == base_site:
+            tail = f"{parts.path}?{parts.query}"
+            if not any(hint in tail for hint in _REDIRECT_HINTS):
+                continue
+        if parts.path.lower().endswith(_POST_SEARCH_SKIP_EXTENSIONS):
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        out.append(raw)
+        if len(out) >= _POST_SEARCH_MAX_LINKS:
+            break
+    return out
+
+
+def _link_locator(page, raw_href: str):
+    """Locator for the exact anchor attribute value seen in the DOM."""
+    safe = raw_href.replace("\\", "\\\\").replace('"', '\\"')
+    return page.locator(f'a[href="{safe}"]').first
+
+
 def _looks_like_bot_challenge(status_code, headers) -> bool:
     """Heuristic: does this response look like a challenge / rate limit?"""
     if headers.get("cf-ray") is not None:
@@ -806,6 +894,9 @@ class _Lane:
         self.browser = browser
         self.context = context
         self.display = display
+        # SERP page handed over by a human-path fetch for post-search
+        # browsing; the browsing session consumes (and closes) it.
+        self.serp_page = None
         self.lock = asyncio.Lock()
 
 
@@ -820,7 +911,7 @@ class BrowserFetchPool:
     def __init__(
         self, pool_size: int = 3, verify: bool = True, proxy: str | None = None,
         human_fallback: bool = True, max_stealth: bool = False,
-        profile_dir: str | None = None,
+        profile_dir: str | None = None, post_search_browsing: bool = False,
     ):
         self._pool_size = max(1, pool_size)
         self._verify = verify
@@ -828,6 +919,8 @@ class BrowserFetchPool:
         self._human_fallback = human_fallback
         self._max_stealth = max_stealth
         self._profile_dir = profile_dir
+        self._post_search = post_search_browsing
+        self._browsing_tasks: set[asyncio.Task] = set()
         self._lanes: list[_Lane] = []
         self._lane_cycle: asyncio.Queue | None = None
         self._init_lock = asyncio.Lock()
@@ -970,6 +1063,12 @@ class BrowserFetchPool:
         Called on close and after a failed launch; without the explicit
         playwright stop the node driver process leaks (about 130 MiB each).
         """
+        for task in list(self._browsing_tasks):
+            task.cancel()
+        if self._browsing_tasks:
+            # let the sessions run their finally blocks (page close) while
+            # the contexts still exist
+            await asyncio.gather(*list(self._browsing_tasks), return_exceptions=True)
         for lane in self._lanes:
             try:
                 await lane.context.close()
@@ -1069,6 +1168,10 @@ class BrowserFetchPool:
 
         # One lane per in-flight request: wait for the next free lane.
         lane = await self._lane_cycle.get()
+        # Decided up front so the interactive path knows to hand its page
+        # over; the actual spawn happens once the response is captured.
+        keep_page = method.upper() == "GET" and self._post_search_wanted(url)
+        browsing = False
         try:
             async with lane.lock:
                 if self._max_stealth and method.upper() == "GET":
@@ -1077,14 +1180,19 @@ class BrowserFetchPool:
                     # request fails: no fetch-style attempt may slip out to
                     # the search engine behind a human visit.
                     if _is_human_search_candidate(url):
-                        human = await self._fetch_via_human_search(lane, url, timeout_s)
+                        human = await self._fetch_via_human_search(
+                            lane, url, timeout_s, keep_page=keep_page
+                        )
                         if human is not None:
+                            browsing = await self._maybe_start_post_search_browsing(
+                                lane, human
+                            )
                             return human
                         raise BrowserFetchError(
                             "max stealth: human search failed for"
                             f" {url}; refusing a fetch-style request"
                         )
-                return await self._fetch_on_lane(
+                response = await self._fetch_on_lane(
                     lane,
                     method.upper(),
                     url,
@@ -1097,9 +1205,13 @@ class BrowserFetchPool:
                     allow_redirects=allow_redirects,
                     max_redirects=max_redirects,
                     keep_identity_headers=keep_identity_headers,
+                    keep_page=keep_page,
                 )
+                browsing = await self._maybe_start_post_search_browsing(lane, response)
+                return response
         finally:
-            self._lane_cycle.put_nowait(lane)
+            if not browsing:
+                self._lane_cycle.put_nowait(lane)
 
     async def _fetch_on_lane(
         self,
@@ -1116,6 +1228,7 @@ class BrowserFetchPool:
         allow_redirects: bool = True,
         max_redirects: int = 30,
         keep_identity_headers: bool = False,
+        keep_page: bool = False,
     ) -> BrowserResponse:
         timeout_ms = int(timeout_s * 1000)
         request_headers = self._build_request_headers(
@@ -1183,7 +1296,9 @@ class BrowserFetchPool:
                 # Drive the provider's search UI like a human: often the only
                 # thing that passes, and cheaper than a doomed warm-up plus
                 # a suspended engine.
-                human = await self._fetch_via_human_search(lane, url, timeout_s)
+                human = await self._fetch_via_human_search(
+                    lane, url, timeout_s, keep_page=keep_page
+                )
                 if human is not None:
                     return human
             warmed = await self._warm_up_and_retry(
@@ -1196,10 +1311,12 @@ class BrowserFetchPool:
             # a JS redirect gate: render the page with the real JS engine,
             # the browser follows the redirect and lands on the content
             if self._human_fallback and method == "GET":
-                human = await self._fetch_via_human_search(lane, url, timeout_s)
+                human = await self._fetch_via_human_search(
+                    lane, url, timeout_s, keep_page=keep_page
+                )
                 if human is not None:
                     return human
-            rendered = await self._render_page(lane, url, timeout_s)
+            rendered = await self._render_page(lane, url, timeout_s, keep_page=keep_page)
             if rendered is not None:
                 return rendered
 
@@ -1218,16 +1335,20 @@ class BrowserFetchPool:
             cookies=cookies_map,
         )
 
-    async def _render_page(self, lane: _Lane, url: str, timeout_s: float):
+    async def _render_page(
+        self, lane: _Lane, url: str, timeout_s: float, keep_page: bool = False
+    ):
         """Render `url` in a real page (JS enabled) and return the final DOM.
 
         Used as last resort when a fetch-style request returned a challenge
         or a JS redirect gate. Returns a BrowserResponse of the rendered
-        content, or None when the navigation failed.
+        content, or None when the navigation failed. With ``keep_page`` the
+        page is handed to post-search browsing instead of being closed.
         """
         context = lane.context
         try:
             page = await context.new_page()
+            handed_over = False
             try:
                 response = await page.goto(
                     url, timeout=timeout_s * 1000, wait_until="commit"
@@ -1243,15 +1364,20 @@ class BrowserFetchPool:
                     pass
                 html_content = await page.content()
                 final_url = page.url
-                return BrowserResponse(
+                rendered = BrowserResponse(
                     status_code=status,
                     headers={"content-type": "text/html; charset=utf-8"},
                     content=html_content.encode("utf-8", errors="replace"),
                     url=final_url,
                     method="GET",
                 )
+                if keep_page and self._post_search_wanted(final_url):
+                    lane.serp_page = page
+                    handed_over = True
+                return rendered
             finally:
-                await page.close()
+                if not handed_over:
+                    await page.close()
         except Exception:  # pylint: disable=broad-except
             logger.warning("Render fallback failed for %s", url, exc_info=True)
             return None
@@ -1308,7 +1434,9 @@ class BrowserFetchPool:
             if not solved:
                 await asyncio.sleep(random.uniform(0.6, 1.2))  # noqa: S311
 
-    async def _fetch_via_human_search(self, lane: _Lane, url: str, timeout_s: float):
+    async def _fetch_via_human_search(
+        self, lane: _Lane, url: str, timeout_s: float, keep_page: bool = False
+    ):
         """Serve a GET search by driving the provider like a human.
 
         Used as the challenge fallback for challenged/interstitial GETs and,
@@ -1356,6 +1484,7 @@ class BrowserFetchPool:
             # process-wide lock, no cross-window click theft.
             async with human_session(lane.display) as pointer:
                 page = await lane.context.new_page()
+                handed_over = False
                 try:
                     try:
                         await page.goto(
@@ -1391,8 +1520,14 @@ class BrowserFetchPool:
                     rendered_html = (await page.content()).encode(
                         "utf-8", errors="replace"
                     )
+                    if keep_page:
+                        # the live results page becomes the starting point of
+                        # post-search browsing; the session closes it
+                        lane.serp_page = page
+                        handed_over = True
                 finally:
-                    await page.close()
+                    if not handed_over:
+                        await page.close()
         except Exception:  # pylint: disable=broad-except
             logger.warning("human search fallback failed for %s", url, exc_info=True)
             return None
@@ -1411,6 +1546,283 @@ class BrowserFetchPool:
                 method="GET",
             )
         return None
+
+    def _post_search_wanted(self, url: str) -> bool:
+        """Should this search get a follow-up browsing session?
+
+        Skipped when disabled, the pool is closing, or no lane would remain
+        idle for actual searches: browsing must never starve the pool.
+        """
+        return (
+            self._post_search
+            and not self._closed
+            and self._lane_cycle is not None
+            and self._lane_cycle.qsize() > 0
+            and _is_browsable_search_url(url)
+        )
+
+    async def _maybe_start_post_search_browsing(self, lane: _Lane, response) -> bool:
+        """Spawn the background imitation for a captured search response.
+
+        Returns True when the lane must stay checked out until the browsing
+        session hands it back. Never raises and never blocks the request:
+        the response is already captured, browsing is a bonus.
+        """
+        try:
+            if not (
+                isinstance(response, BrowserResponse)
+                and response.status_code == 200
+                and "text/html" in (response.headers.get("content-type") or "")
+            ):
+                await self._discard_serp_page(lane)
+                return False
+            if not self._post_search_wanted(response.url):
+                await self._discard_serp_page(lane)
+                return False
+            page, lane.serp_page = lane.serp_page, None
+            task = asyncio.create_task(
+                self._post_search_browsing_session(lane, page, response.url),
+                name=f"post-search-browsing-{lane.display or 'headless'}",
+            )
+            self._browsing_tasks.add(task)
+            task.add_done_callback(self._browsing_tasks.discard)
+            logger.info(
+                "post-search browsing: lane %s stays on %s",
+                lane.display or "headless",
+                response.url,
+            )
+            return True
+        except Exception:  # pylint: disable=broad-except
+            logger.debug("post-search browsing spawn failed", exc_info=True)
+            return False
+
+    async def _discard_serp_page(self, lane: _Lane) -> None:
+        page, lane.serp_page = lane.serp_page, None
+        if page is not None:
+            try:
+                await page.close()
+            except Exception:  # pylint: disable=broad-except
+                pass
+
+    async def _post_search_browsing_session(
+        self, lane: _Lane, page, serp_url: str
+    ) -> None:
+        """Imitate a reader continuing past the results page.
+
+        Runs while the lane stays checked out: click an organic result,
+        scroll and drift the pointer over it, return to the results, maybe
+        visit more. On completion the page is closed and the lane returns
+        to the cycle.
+        """
+        # pylint: disable=import-outside-toplevel
+        from searx.network.human_input import HumanInputError, human_session
+
+        started = time.monotonic()
+        visits = 0
+        try:
+            try:
+                async with human_session(lane.display) as pointer:
+                    visits = await self._browse_serp(lane, page, serp_url, pointer)
+            except HumanInputError:
+                # headless lane: CDP-trusted input instead of XTEST
+                visits = await self._browse_serp(lane, page, serp_url, None)
+        except asyncio.CancelledError:
+            logger.debug("post-search browsing cancelled on lane %s", lane.display)
+            raise
+        except Exception:  # pylint: disable=broad-except
+            logger.debug(
+                "post-search browsing failed on lane %s", lane.display, exc_info=True
+            )
+        finally:
+            await self._discard_serp_page(lane)
+            if not self._closed and self._lane_cycle is not None:
+                try:
+                    self._lane_cycle.put_nowait(lane)
+                except Exception:  # pylint: disable=broad-except
+                    pass
+            logger.info(
+                "post-search browsing done on lane %s: %d visit(s) in %.0fs",
+                lane.display or "headless",
+                visits,
+                time.monotonic() - started,
+            )
+
+    async def _browse_serp(self, lane: _Lane, page, serp_url: str, pointer) -> int:
+        """Click through result pages; returns the number of visits made."""
+        if self._closed:
+            return 0
+        if page is None:
+            page = await lane.context.new_page()
+            lane.serp_page = page
+            try:
+                await page.goto(serp_url, timeout=20000, wait_until="domcontentloaded")
+            except Exception:  # pylint: disable=broad-except
+                logger.debug(
+                    "post-search browsing: results page %s failed to open", serp_url
+                )
+                return 0
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=10000)
+        except Exception:  # pylint: disable=broad-except
+            pass
+        try:
+            raw_hrefs = await page.eval_on_selector_all(
+                "a[href]", "els => els.map(e => e.getAttribute('href'))"
+            )
+        except Exception:  # pylint: disable=broad-except
+            return 0
+        links = _browsable_links(raw_hrefs, page.url)
+        if not links:
+            logger.debug(
+                "post-search browsing: no result links found on %s", page.url
+            )
+            return 0
+        random.shuffle(links)
+        deadline = time.monotonic() + _POST_SEARCH_BUDGET_S
+        visits_left = 1 + random.randint(*_POST_SEARCH_EXTRA_VISITS)
+        visits = 0
+        for raw_href in links:
+            if visits_left <= 0 or time.monotonic() > deadline - 15.0:
+                break
+            if await self._visit_result_page(page, pointer, raw_href, deadline):
+                visits += 1
+                visits_left -= 1
+        return visits
+
+    async def _visit_result_page(self, page, pointer, raw_href: str, deadline: float) -> bool:
+        """One result click-through: open, dwell, return to the results."""
+        # pylint: disable=import-outside-toplevel
+        from searx.network.human_input import _human_click_locator, _human_idle
+
+        serp_url = page.url
+        locator = _link_locator(page, raw_href)
+        try:
+            await locator.scroll_into_view_if_needed(timeout=4000)
+        except Exception:  # pylint: disable=broad-except
+            return False
+        if pointer is not None:
+            clicked = await _human_click_locator(locator, pointer)
+        else:
+            clicked = await self._cdp_click(page, locator)
+        if not clicked:
+            return False
+        opened = await self._wait_click_target(page, serp_url, deadline)
+        if opened is None:
+            return False
+        if _is_challenge_url(opened.url):
+            # a rebuffed click-through: back to the results, no dwelling
+            await self._return_to_serp(page, opened, serp_url)
+            return False
+        dwell = min(
+            random.uniform(*_POST_SEARCH_DWELL_RANGE),
+            max(5.0, deadline - time.monotonic()),
+        )
+        await self._dwell_on_page(opened, pointer, dwell)
+        await self._return_to_serp(page, opened, serp_url)
+        if pointer is not None:
+            await _human_idle(pointer, random.uniform(1.0, 4.0))
+        else:
+            await asyncio.sleep(random.uniform(1.0, 4.0))
+        return True
+
+    @staticmethod
+    async def _wait_click_target(page, serp_url: str, deadline: float):
+        """What the click did: a new tab, a same-tab navigation, or nothing."""
+        before = {p for p in page.context.pages if not p.is_closed()}
+        for _ in range(20):
+            await asyncio.sleep(0.5)
+            fresh = [
+                p for p in page.context.pages if p not in before and not p.is_closed()
+            ]
+            if fresh:
+                target = fresh[0]
+                try:
+                    await target.wait_for_url(
+                        lambda url: url != "about:blank", timeout=8000
+                    )
+                except Exception:  # pylint: disable=broad-except
+                    pass
+                if target.url == "about:blank":
+                    return None  # opened but never navigated: dead tab
+                return target
+            if page.url != serp_url:
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=10000)
+                except Exception:  # pylint: disable=broad-except
+                    pass
+                return page
+            if time.monotonic() > deadline:
+                return None
+        return None
+
+    @staticmethod
+    async def _return_to_serp(page, opened, serp_url: str) -> None:
+        """Back on the results page: close the tab, or go back in history."""
+        if opened is not page:
+            try:
+                await opened.close()
+            except Exception:  # pylint: disable=broad-except
+                pass
+            return
+        try:
+            await page.go_back(timeout=15000, wait_until="domcontentloaded")
+        except Exception:  # pylint: disable=broad-except
+            pass
+        if page.url != serp_url:
+            try:
+                await page.goto(serp_url, timeout=15000, wait_until="domcontentloaded")
+            except Exception:  # pylint: disable=broad-except
+                pass
+
+    @staticmethod
+    async def _cdp_click(page, locator) -> bool:
+        """Headless fallback: CDP-trusted click at the element center."""
+        try:
+            box = await locator.bounding_box()
+        except Exception:  # pylint: disable=broad-except
+            return False
+        if not box or box["width"] <= 1 or box["height"] <= 1:
+            return False
+        await page.mouse.move(
+            box["x"] + box["width"] / 2,
+            box["y"] + box["height"] / 2,
+            steps=random.randint(8, 20),
+        )
+        await asyncio.sleep(random.uniform(0.08, 0.3))
+        await page.mouse.down()
+        await asyncio.sleep(random.uniform(0.04, 0.12))
+        await page.mouse.up()
+        return True
+
+    @staticmethod
+    async def _dwell_on_page(page, pointer, seconds: float) -> None:
+        """Read a page: wheel scrolls with idle hand drifts in between."""
+        # pylint: disable=import-outside-toplevel
+        from searx.network.human_input import _human_idle
+
+        if pointer is None:
+            end = time.monotonic() + seconds
+            viewport = page.viewport_size or {"width": 1280, "height": 720}
+            while time.monotonic() < end:
+                await page.mouse.wheel(0, random.randint(300, 900))
+                await asyncio.sleep(random.uniform(0.6, 1.6))
+                if random.random() < 0.5:
+                    await page.mouse.move(
+                        random.uniform(0, viewport["width"]),
+                        random.uniform(0, viewport["height"]),
+                        steps=random.randint(5, 15),
+                    )
+            return
+        await _human_idle(pointer, random.uniform(0.8, 2.0))  # first look
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            pointer.scroll(-random.randint(2, 6))  # scroll down
+            await asyncio.sleep(random.uniform(0.6, 1.6))
+            if random.random() < 0.3:
+                pointer.scroll(random.randint(1, 3))  # re-read a little
+                await asyncio.sleep(random.uniform(0.3, 0.9))
+            if random.random() < 0.5:
+                await _human_idle(pointer, random.uniform(0.7, 1.8))
 
     async def _warm_up_and_retry(
         self, lane: _Lane, method: str, url: str, *, request_kwargs: dict
@@ -1507,6 +1919,7 @@ def get_browser_fetch_pool() -> BrowserFetchPool:
             human_fallback=get_setting("outgoing.browser_human_fallback", True),
             max_stealth=get_setting("outgoing.browser_max_stealth", False),
             profile_dir=get_setting("outgoing.browser_profile_dir", "") or None,
+            post_search_browsing=get_setting("outgoing.browser_post_search_browsing", False),
         )
     return _POOL
 
