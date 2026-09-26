@@ -407,6 +407,28 @@ def test_browsable_links_keeps_google_goto_wrappers():
     assert out == ["/goto?url=CAESZAHrOzAVHB0og9NqrORWjur2zmOTzwdJe1Vj5Y"]
 
 
+def test_browsable_links_drops_google_translate_targets():
+    serp = "https://www.google.com/search?q=linux"
+    out = browser_module._browsable_links(
+        [
+            "https://energysavingtrust-org-uk.translate.goog/advice/x",  # translate
+            "https://translate.google.com/translate?u=x",  # legacy translate
+            "https://example.org/page",
+        ],
+        serp,
+    )
+    assert out == ["https://example.org/page"]
+
+
+def test_is_google_translate_url():
+    assert browser_module._is_google_translate_url(
+        "https://www-iea-org.translate.goog/reports/x?_x_tr_sl=en"
+    )
+    assert browser_module._is_google_translate_url("https://translate.google.com/x")
+    assert not browser_module._is_google_translate_url("https://example.org/x")
+    assert not browser_module._is_google_translate_url(None)
+
+
 def test_browsable_links_dedups_identical_wrappers_and_keeps_first_raw():
     serp = "https://duckduckgo.com/?q=linux&ia=web"
     wrap = "//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2F&rut=abc"

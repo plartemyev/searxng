@@ -401,6 +401,20 @@ def _is_challenge_url(url: str | None) -> bool:
     return "/sorry" in lowered or "unusual traffic" in lowered
 
 
+def _is_google_translate_url(url: str | None) -> bool:
+    """Is this a Google Translate wrapper URL?
+
+    Google serves auto-translated copies of foreign-language results on
+    ``<host>.translate.goog`` (and legacy ``translate.google.com``). The
+    translation runs on Google's servers per page view, which is heavy
+    compute spent on our behalf; this deployment does not use it. Result
+    links that lead there are skipped for post-search browsing, and callers
+    that need the real target rewrite the URL to the original host.
+    """
+    host = (urlsplit(url or "").hostname or "").lower()
+    return host.endswith(".translate.goog") or host == "translate.google.com"
+
+
 def _homepage_url_from_search_url(url: str) -> str:
     """The provider front page, carrying the engine URL's locale parameters.
 
@@ -539,6 +553,9 @@ def _browsable_links(hrefs, serp_url: str) -> list[str]:
         resolved = urljoin(serp_url, raw)
         parts = urlsplit(resolved)
         if parts.scheme not in ("http", "https") or not parts.hostname:
+            continue
+        if _is_google_translate_url(resolved):
+            # a Google Translate copy: never a click target here
             continue
         if _registrable_site(parts.hostname) == base_site:
             tail = f"{parts.path}?{parts.query}"
@@ -926,10 +943,60 @@ class _Lane:
         self.browser = browser
         self.context = context
         self.display = display
+        # flock handle for the lane's persistent profile (see
+        # _acquire_profile_lock); None for ephemeral lanes
+        self.profile_lock = None
         # SERP page handed over by a human-path fetch for post-search
         # browsing; the browsing session consumes (and closes) it.
         self.serp_page = None
         self.lock = asyncio.Lock()
+
+
+def _acquire_profile_lock(profile_path: str, lane_index: int):
+    """Cross-process exclusivity for a persistent Chromium profile dir.
+
+    The profile dir can live on a docker volume shared with other browser
+    operators (e.g. Onyx's crawler workers). Chromium keeps a SingletonLock
+    per profile, so a second browser on the same dir would corrupt it; an
+    flock on a sibling lockfile lets a lane whose profile is in use run
+    with an ephemeral context instead. The caller holds the returned handle
+    for the browser's lifetime.
+    """
+    import fcntl
+
+    try:
+        handle = open(profile_path + ".lock", "a", encoding="utf-8")  # noqa: SIM115
+    except OSError as err:
+        logger.warning(
+            "lane %d profile lock file unusable (%s); running ephemeral",
+            lane_index, err,
+        )
+        return None
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as err:
+        handle.close()
+        logger.warning(
+            "lane %d profile is held by another process (%s); running"
+            " ephemeral", lane_index, err,
+        )
+        return None
+    return handle
+
+
+def _release_profile_lock(handle) -> None:
+    if handle is None:
+        return
+    try:
+        import fcntl
+
+        fcntl.flock(handle, fcntl.LOCK_UN)
+    except OSError:  # pylint: disable=broad-except
+        pass
+    try:
+        handle.close()
+    except OSError:
+        pass
 
 
 class BrowserFetchPool:
@@ -1047,8 +1114,11 @@ class BrowserFetchPool:
         if self._proxy:
             launch_kwargs["proxy"] = {"server": self._proxy}
         geo = await loop.run_in_executor(None, _detect_ip_locale)
+        profile_lock = None
         profile_path = self._lane_profile_dir(lane_index)
         if profile_path:
+            profile_lock = _acquire_profile_lock(profile_path, lane_index)
+        if profile_lock is not None and profile_path:
             # persistent profile: cookies, storage and earned clearances
             # survive lane crashes and process restarts
             context = await self._playwright.chromium.launch_persistent_context(
@@ -1056,12 +1126,16 @@ class BrowserFetchPool:
             )
             browser = context.browser
         else:
+            _release_profile_lock(profile_lock)
+            profile_lock = None
             browser = await self._playwright.chromium.launch(**launch_kwargs)
             context = await browser.new_context(
                 **self._context_kwargs(geo)
             )
         await context.add_init_script(_stealth_init_script(_language_tags(geo["accept_language"])))
-        return _Lane(browser, context, display)
+        lane = _Lane(browser, context, display)
+        lane.profile_lock = profile_lock
+        return lane
 
     def _context_kwargs(self, geo: dict) -> dict:
         """Context options matching the IP-derived identity. The UA is left
@@ -1108,6 +1182,8 @@ class BrowserFetchPool:
             # the contexts still exist
             await asyncio.gather(*list(self._browsing_tasks), return_exceptions=True)
         for lane in self._lanes:
+            _release_profile_lock(lane.profile_lock)
+            lane.profile_lock = None
             try:
                 await lane.context.close()
             except Exception:  # pylint: disable=broad-except
@@ -1167,10 +1243,13 @@ class BrowserFetchPool:
                 await lane.browser.close()
             except Exception:  # pylint: disable=broad-except
                 pass
+        _release_profile_lock(lane.profile_lock)
+        lane.profile_lock = None
         replacement = await self._launch_lane(lane_index, _discover_chromium())
         lane.browser = replacement.browser
         lane.context = replacement.context
         lane.display = replacement.display
+        lane.profile_lock = replacement.profile_lock
 
     async def close(self):
         if self._closed:
@@ -1437,7 +1516,7 @@ class BrowserFetchPool:
         parse a silent zero-results success out of it.
         """
         # pylint: disable=import-outside-toplevel
-        from searx.network.human_input import _debug_dump, human_clear_challenge
+        from searx.network.human_input import _debug_dump, debug_trace_enabled, human_clear_challenge
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + max(8.0, min(timeout_s, 30.0))
@@ -1457,11 +1536,12 @@ class BrowserFetchPool:
             )
             # trace the stuck page: without a dump this failure mode is
             # invisible in engine stats
-            try:
-                png = await page.screenshot()
-                _debug_dump("stuck_home", 0, png, page.url)
-            except Exception:  # pylint: disable=broad-except
-                pass
+            if debug_trace_enabled():
+                try:
+                    png = await page.screenshot()
+                    _debug_dump("stuck_home", 0, png, page.url)
+                except Exception:  # pylint: disable=broad-except
+                    pass
             return False
 
         # phase 2: challenges on the arrival page
@@ -1510,6 +1590,7 @@ class BrowserFetchPool:
         # pylint: disable=import-outside-toplevel
         from searx.network.human_input import (
             _debug_dump,
+            debug_trace_enabled,
             human_clear_challenge,
             human_read_results,
             human_search_on_page,
@@ -1576,18 +1657,19 @@ class BrowserFetchPool:
                     rendered_html = (await page.content()).encode(
                         "utf-8", errors="replace"
                     )
-                    # TEMPORARY (diagnostics): trace exactly what the engine
-                    # is asked to parse
-                    try:
-                        _debug_dump(
-                            "capture",
-                            0,
-                            await page.screenshot(),
-                            rendered_url,
-                            html=rendered_html.decode("utf-8", errors="replace"),
-                        )
-                    except Exception:  # pylint: disable=broad-except
-                        pass
+                    if debug_trace_enabled():
+                        # diagnostics: trace exactly what the engine is
+                        # asked to parse
+                        try:
+                            _debug_dump(
+                                "capture",
+                                0,
+                                await page.screenshot(),
+                                rendered_url,
+                                html=rendered_html.decode("utf-8", errors="replace"),
+                            )
+                        except Exception:  # pylint: disable=broad-except
+                            pass
                     if keep_page:
                         # the live results page becomes the starting point of
                         # post-search browsing; the session closes it
@@ -1785,6 +1867,16 @@ class BrowserFetchPool:
             return False
         opened = await self._wait_click_target(page, before, serp_url, deadline)
         if opened is None:
+            return False
+        if _is_google_translate_url(opened.url):
+            # the wrapper landed on a Google Translate copy: its translation
+            # already happened server-side, so stop here -- no dwell, no more
+            # traffic through Google's translation stack
+            logger.debug(
+                "post-search browsing: google translate target skipped (%s)",
+                opened.url[:80],
+            )
+            await self._return_to_serp(page, opened, serp_url)
             return False
         if _is_challenge_url(opened.url):
             # a rebuffed click-through: back to the results, no dwelling
@@ -2016,6 +2108,9 @@ def get_browser_fetch_pool() -> BrowserFetchPool:
             profile_dir=get_setting("outgoing.browser_profile_dir", "") or None,
             post_search_browsing=get_setting("outgoing.browser_post_search_browsing", False),
         )
+        from searx.network.human_input import set_debug_trace
+
+        set_debug_trace(get_setting("outgoing.browser_debug_trace", False))
     return _POOL
 
 

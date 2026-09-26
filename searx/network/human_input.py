@@ -462,11 +462,13 @@ async def human_search_on_page(page, query: str, pointer: _XPointer) -> bool:
         return False
 
     await _human_type(page, query, pointer)
-    # TEMPORARY (diagnostics): confirm the keystrokes really reached the box
+    # The empty-box warning is an operational signal (clicks landing wrong);
+    # the typed value itself only matters when tracing is on.
     try:
         typed = await input_loc.evaluate("el => el.value")
         if typed:
-            logger.debug("human search: typed %r", typed)
+            if _TRACE_STATE["enabled"]:
+                logger.debug("human search: typed %r", typed)
         else:
             logger.warning(
                 "human search: the search box stayed empty on %s", page.url
@@ -485,7 +487,8 @@ async def human_search_on_page(page, query: str, pointer: _XPointer) -> bool:
             state = await button_loc.evaluate(
                 "el => ({disabled: el.disabled, name: el.name || ''})"
             )
-            logger.debug("human search: submit control %s", state)
+            if _TRACE_STATE["enabled"]:
+                logger.debug("human search: submit control %s", state)
         except Exception:  # pylint: disable=broad-except
             pass
         await _human_click_locator(button_loc, pointer)
@@ -810,10 +813,27 @@ async def _click_first_visible(frame_loc, selectors: tuple[str, ...], pointer) -
 
 
 # TEMPORARY (2026-09-26): dump what the vision model actually receives, for
-# diagnosing wrong tile answers. Active only while /tmp/captcha_debug exists.
+# diagnosing wrong tile answers. Gated by outgoing.browser_debug_trace.
+# Diagnostic tracing (DOM captures, typed-value logs) is off by default.
+# Enable with outgoing.browser_debug_trace in the settings; the dumps then
+# land in /tmp/captcha_debug (the directory must exist as well).
+_TRACE_STATE = {"enabled": False}
+
+
+def set_debug_trace(enabled: bool) -> None:
+    """Switch diagnostic tracing on or off (settings-driven)."""
+    _TRACE_STATE["enabled"] = bool(enabled)
+
+
+def debug_trace_enabled() -> bool:
+    return _TRACE_STATE["enabled"]
+
+
 def _debug_dump(profile_name: str, round_index: int, png: bytes, instruction: str, html: str = '') -> None:
     import os
 
+    if not _TRACE_STATE["enabled"]:
+        return
     dump_dir = '/tmp/captcha_debug'
     if not os.path.isdir(dump_dir) or not png:
         return
@@ -989,14 +1009,15 @@ async def _run_image_rounds(page, pointer, solver, max_rounds: int, found) -> bo
             else:
                 await asyncio.sleep(random.uniform(0.35, 0.95))  # noqa: S311
 
-        # TEMPORARY: selection state before the press -- selected tiles
-        # show overlays and the press clears them
-        try:
-            sel_png = await _iframe_screenshot(page, profile)
-            if sel_png:
-                _debug_dump(profile.name + '_sel', round_index, sel_png, page.url)
-        except Exception:  # pylint: disable=broad-except
-            pass
+        # pre-press screenshot: selected tiles show overlays and the press
+        # clears them; post-press: the error banner shows on a reject
+        if _TRACE_STATE["enabled"]:
+            try:
+                sel_png = await _iframe_screenshot(page, profile)
+                if sel_png:
+                    _debug_dump(profile.name + '_sel', round_index, sel_png, page.url)
+            except Exception:  # pylint: disable=broad-except
+                pass
 
         # hover the button a moment before pressing it
         await asyncio.sleep(random.uniform(0.6, 1.4))  # noqa: S311
@@ -1009,13 +1030,13 @@ async def _run_image_rounds(page, pointer, solver, max_rounds: int, found) -> bo
         if not clicked:
             logger.warning('human input: no VERIFY/SKIP button found in %s challenge', profile.name)
             return False
-        # TEMPORARY: post-press state -- the error banner shows on a reject
-        try:
-            post_png = await _iframe_screenshot(page, profile)
-            if post_png:
-                _debug_dump(profile.name + '_post', round_index, post_png, page.url)
-        except Exception:  # pylint: disable=broad-except
-            pass
+        if _TRACE_STATE["enabled"]:
+            try:
+                post_png = await _iframe_screenshot(page, profile)
+                if post_png:
+                    _debug_dump(profile.name + '_post', round_index, post_png, page.url)
+            except Exception:  # pylint: disable=broad-except
+                pass
         logger.info('human input: pressed VERIFY for round %s, page %s', round_index, page.url)
 
         # the press consumes the slide; grid re-reads above are free
