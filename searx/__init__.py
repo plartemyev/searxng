@@ -58,8 +58,13 @@ def init_settings():
     if sxng_debug:
         _logging_config_debug()
     else:
-        logging.basicConfig(level=LOG_LEVEL_PROD, format=LOG_FORMAT_PROD)
-        logging.root.setLevel(level=LOG_LEVEL_PROD)
+        # production mode: WARNING by default; SEARXNG_LOG_LEVEL raises the
+        # visibility of the operational INFO lines (pool up, human search
+        # flow, crawl routing) without the full DEBUG wire noise
+        log_level_name = os.environ.get('SEARXNG_LOG_LEVEL', 'WARNING').upper()
+        log_level = getattr(logging, log_level_name, logging.WARNING)
+        logging.basicConfig(level=log_level, format=LOG_FORMAT_PROD)
+        logging.root.setLevel(level=log_level)
         logging.getLogger('werkzeug').setLevel(level=LOG_LEVEL_PROD)
         logger.info(msg)
 

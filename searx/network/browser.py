@@ -1669,6 +1669,8 @@ class BrowserFetchPool:
                         "challenge": _looks_like_unresolved_challenge_body(
                             html_text.encode("utf-8", errors="replace")
                         ),
+                        "lane": lane.display or "headless",
+                        "affinity": affinity,
                     }
                 finally:
                     await page.close()
@@ -1698,6 +1700,8 @@ class BrowserFetchPool:
                         response.status, response.headers
                     ),
                     "content": body,
+                    "lane": lane.display or "headless",
+                    "affinity": _affinity,
                 }
         finally:
             self._return_lane(lane)

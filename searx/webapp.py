@@ -646,6 +646,7 @@ def crawl():
             )
             response.headers['X-Final-URL'] = result['final_url']
             response.headers['X-Crawl-Status'] = str(result['status'] or 0)
+            response.headers['X-Crawl-Lane'] = result['lane']
             if result['challenge']:
                 response.headers['X-Crawl-Challenge'] = '1'
             return response
@@ -656,6 +657,8 @@ def crawl():
             'final_url': result['final_url'],
             'status': result['status'],
             'challenge': result['challenge'],
+            'lane': result['lane'],
+            'affinity': result['affinity'],
             'html': result['html'],
         })
     except crawl.CrawlBodyTooLarge as e:
