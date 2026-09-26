@@ -663,7 +663,7 @@ def crawl():
     except crawl.CrawlError as e:
         return jsonify({'error': str(e)}), 400
     except Exception as e:  # pylint: disable=broad-except
-        app.logger.warning('crawl of %s failed: %s', url[:200], e)
+        app.logger.warning('crawl of %s failed: %s', url[:200], e, exc_info=True)
         return jsonify({'error': 'crawl failed'}), 502
 
 

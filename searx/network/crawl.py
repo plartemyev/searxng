@@ -10,6 +10,7 @@ off by default (``outgoing.browser_crawl_endpoint``).
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import ipaddress
 import socket
 from urllib.parse import urlsplit
@@ -61,7 +62,10 @@ def render_page(
     future = asyncio.run_coroutine_threadsafe(
         get_browser_fetch_pool().crawl_render(url, timeout_s=timeout_s), get_loop()
     )
-    return future.result(timeout_s + 90.0)
+    try:
+        return future.result(timeout_s + 90.0)
+    except concurrent.futures.TimeoutError as err:
+        raise CrawlError("crawl timed out waiting for a browser lane") from err
 
 
 def fetch_bytes(
@@ -80,4 +84,7 @@ def fetch_bytes(
         ),
         get_loop(),
     )
-    return future.result(timeout_s + 90.0)
+    try:
+        return future.result(timeout_s + 90.0)
+    except concurrent.futures.TimeoutError as err:
+        raise CrawlError("crawl timed out waiting for a browser lane") from err
