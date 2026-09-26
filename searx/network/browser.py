@@ -62,6 +62,7 @@ import subprocess
 import threading
 import time
 from types import SimpleNamespace
+from collections import deque
 from urllib.parse import parse_qsl, parse_qs, urlencode, urljoin, urlsplit, urlunparse
 from lxml import html
 from searx.exceptions import (
@@ -1029,6 +1030,9 @@ class _Lane:
         self.busy = False
         # last return-to-cycle time (monotonic); drives idle reaping
         self.last_used = time.monotonic()
+        # result URLs this lane's searches returned (most recent last);
+        # a later crawl of one of them routes back to this lane
+        self.serp_urls = deque(maxlen=100)
         # SERP page handed over by a human-path fetch for post-search
         # browsing; the browsing session consumes (and closes) it.
         self.serp_page = None
@@ -1110,12 +1114,15 @@ class BrowserFetchPool:
         self._playwright = None
         self._closed = False
         self._reaper_task: asyncio.Task | None = None
+        self._init_done = False
 
     async def _init(self):
-        if self._lanes:
+        if self._init_done:
             return
         async with self._init_lock:
-            if self._lanes:
+            # re-check under the lock: a concurrent caller may have finished
+            # the whole init while this one waited for the lock
+            if self._init_done:
                 return
             try:
                 from playwright.async_api import async_playwright
@@ -1137,13 +1144,25 @@ class BrowserFetchPool:
 
             try:
                 self._playwright = await async_playwright().start()
-                for lane_index in range(self._pool_size):
-                    self._lanes.append(
-                        await self._launch_lane(lane_index, executable_path)
+                # one geo lookup for all lanes (cached in process memory);
+                # parallel launches would each miss the cache and re-fetch
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, _detect_ip_locale)
+                # launch the lanes in parallel: a serial cold start costs
+                # 10-20s per persistent-profile lane and blows the engine
+                # budget for the first search after a container restart
+                self._lanes.extend(
+                    await asyncio.gather(
+                        *(
+                            self._launch_lane(lane_index, executable_path)
+                            for lane_index in range(self._pool_size)
+                        )
                     )
+                )
                 self._lane_cycle = asyncio.Queue()
                 for lane in self._lanes:
                     self._lane_cycle.put_nowait(lane)
+                self._init_done = True
                 if self._profile_dir:
                     self._reaper_task = asyncio.create_task(self._reap_loop())
                 logger.info(
@@ -1295,6 +1314,7 @@ class BrowserFetchPool:
                     pass
         self._lanes.clear()
         self._lane_cycle = None
+        self._init_done = False
         if self._playwright is not None:
             try:
                 await self._playwright.stop()
@@ -1454,6 +1474,7 @@ class BrowserFetchPool:
                             lane, url, timeout_s, keep_page=keep_page
                         )
                         if human is not None:
+                            self._record_serp_urls(lane, url, human)
                             browsing = await self._maybe_start_post_search_browsing(
                                 lane, human
                             )
@@ -1477,6 +1498,7 @@ class BrowserFetchPool:
                     keep_identity_headers=keep_identity_headers,
                     keep_page=keep_page,
                 )
+                self._record_serp_urls(lane, url, response)
                 browsing = await self._maybe_start_post_search_browsing(lane, response)
                 return response
         finally:
@@ -1495,14 +1517,98 @@ class BrowserFetchPool:
 
     # -- page crawling -------------------------------------------------------
 
-    async def _crawl_checkout(self) -> "_Lane":
-        """Check a lane out for a crawl, same lifecycle as a search fetch."""
+    _SERP_HREF_RE = re.compile(r'href="([^"]+)"', re.IGNORECASE)
+
+    def _record_serp_urls(self, lane: _Lane, request_url: str, response) -> None:
+        """Remember the result links a lane's search returned (last 100).
+
+        Only organic-looking links are kept: off-site URLs and the engine's
+        own outbound wrappers (/goto, /url?q=, /ck/a, ...) -- exactly what a
+        reader or a crawler would visit. A later crawl request matching one
+        of them is routed back to this lane, so the identity that found a
+        link is the one that visits it.
+        """
+        try:
+            if response is None or response.status_code != 200:
+                return
+            if not _search_query_from_url(request_url):
+                return
+            base = response.url
+            html_text = response.text or ""
+        except Exception:  # pylint: disable=broad-except
+            return
+        if not base or not html_text:
+            return
+        base_site = _registrable_site(urlsplit(base).hostname)
+        recorded = []
+        for raw in self._SERP_HREF_RE.findall(html_text):
+            resolved = urljoin(base, raw.strip()).split("#", 1)[0]
+            parts = urlsplit(resolved)
+            if parts.scheme not in ("http", "https") or not parts.hostname:
+                continue
+            if _registrable_site(parts.hostname) == base_site:
+                tail = f"{parts.path}?{parts.query}"
+                if not any(hint in tail for hint in _REDIRECT_HINTS):
+                    continue
+            if resolved not in recorded:
+                recorded.append(resolved)
+        if recorded:
+            lane.serp_urls.extend(recorded)
+            logger.debug(
+                "lane %s: %d result URL(s) remembered (search %s)",
+                lane.display or "headless", len(recorded), request_url[:80],
+            )
+
+    def _lane_for_serp_url(self, url: str) -> "_Lane | None":
+        """The lane whose recent searches returned this URL, if any."""
+        normalized = (url or "").split("#", 1)[0]
+        matches = [lane for lane in self._lanes if normalized in lane.serp_urls]
+        if not matches:
+            return None
+        # freshest memory first
+        matches.sort(key=lambda lane: lane.last_used, reverse=True)
+        return matches[0]
+
+    def _claim_lane_now(self, preferred: _Lane) -> "_Lane | None":
+        """Take a specific lane out of the free cycle, if it is free now."""
+        cycle = self._lane_cycle
+        if cycle is None:
+            return None
+        skipped = []
+        found = None
+        while True:
+            try:
+                lane = cycle.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if lane is preferred:
+                found = lane
+                break
+            skipped.append(lane)
+        for lane in skipped:
+            cycle.put_nowait(lane)
+        if found is not None:
+            found.busy = True
+            found.last_used = time.monotonic()
+        return found
+
+    async def _checkout_for_crawl(self, url: str) -> tuple["_Lane", bool]:
         await self._init()
         await self._ensure_browser_alive()
+        preferred = self._lane_for_serp_url(url)
+        if preferred is not None:
+            lane = self._claim_lane_now(preferred)
+            if lane is not None:
+                logger.info(
+                    "crawl of %s routed to lane %s: its search returned this URL",
+                    url[:100], lane.display or "headless",
+                )
+                return lane, True
+            # the finding lane is busy: fall through to the normal cycle
         lane = await self._lane_cycle.get()
         lane.busy = True
         lane.last_used = time.monotonic()
-        return lane
+        return lane, False
 
     async def crawl_render(self, url: str, *, timeout_s: float = 30.0) -> dict:
         """Navigate a page in a lane browser and return the rendered DOM.
@@ -1514,7 +1620,9 @@ class BrowserFetchPool:
         (the translation service stays unused).
         """
         url = unwrap_google_translate_url(url)
-        lane = await self._crawl_checkout()
+        lane, affinity = await self._checkout_for_crawl(url)
+        if affinity:
+            logger.debug("affinity crawl on lane %s", lane.display or "headless")
         try:
             async with lane.lock:
                 page = await lane.context.new_page()
@@ -1573,7 +1681,7 @@ class BrowserFetchPool:
         Returns a dict with ``final_url``, ``status``, ``content_type`` and
         ``content`` (bytes, capped at ``max_bytes``).
         """
-        lane = await self._crawl_checkout()
+        lane, _affinity = await self._checkout_for_crawl(url)
         try:
             async with lane.lock:
                 response = await lane.context.request.get(

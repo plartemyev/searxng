@@ -440,6 +440,69 @@ def test_unwrap_google_translate_url():
     assert unwrap_google_translate_url("https://example.org/x") == "https://example.org/x"
 
 
+def test_lane_serp_url_affinity_routing():
+    """A crawl of a URL a lane's search returned routes back to that lane."""
+    from types import SimpleNamespace as NS
+
+    pool = browser_module.BrowserFetchPool(pool_size=2)
+    lane_a = browser_module._Lane(None, None, ":110")
+    lane_b = browser_module._Lane(None, None, ":111")
+    pool._lanes = [lane_a, lane_b]
+    pool._lane_cycle = __import__("asyncio").Queue()
+    for lane in pool._lanes:
+        pool._lane_cycle.put_nowait(lane)
+
+    target = "https://www.google.com/goto?url=CAESZAHrOzAVHB0og9NqrORWjur2zmOTzwdJe1Vj5Y"
+    lane_b.serp_urls.append(target)
+
+    assert pool._lane_for_serp_url(target) is lane_b
+    assert pool._lane_for_serp_url("https://unrelated.example.org/x") is None
+
+    # claim the finding lane: it must come out of the cycle, the other lane
+    # must stay queued, and the claimed lane must be marked busy
+    claimed = pool._claim_lane_now(lane_b)
+    assert claimed is lane_b
+    assert lane_b.busy is True
+    assert pool._lane_cycle.qsize() == 1
+    assert pool._lane_cycle.get_nowait() is lane_a
+
+
+def test_record_serp_urls_keeps_organic_links_only():
+    from types import SimpleNamespace as NS
+
+    pool = browser_module.BrowserFetchPool(pool_size=1)
+    lane = browser_module._Lane(None, None, ":110")
+    response = NS(
+        status_code=200,
+        url="https://www.google.com/search?q=test",
+        text=(
+            '<a href="/goto?url=CAESZAHrOzA">t</a>'
+            '<a href="https://example.org/page">t</a>'
+            '<a href="/search?q=related">t</a>'
+            '<a href="/preferences">t</a>'
+            '<a href="/goto?url=CAESZAHrOzA">dup</a>'
+        ),
+    )
+    pool._record_serp_urls(lane, "https://www.google.com/search?q=test", response)
+    assert list(lane.serp_urls) == [
+        "https://www.google.com/goto?url=CAESZAHrOzA",
+        "https://example.org/page",
+    ]
+
+
+def test_record_serp_urls_ignores_non_search_and_errors():
+    from types import SimpleNamespace as NS
+
+    pool = browser_module.BrowserFetchPool(pool_size=1)
+    lane = browser_module._Lane(None, None, ":110")
+    ok = NS(status_code=200, url="https://example.org/page", text='<a href="https://x.org/a">')
+    pool._record_serp_urls(lane, "https://example.org/page", ok)
+    assert not lane.serp_urls  # not a search URL
+    err = NS(status_code=500, url="https://www.google.com/search?q=x", text='<a href="https://x.org/a">')
+    pool._record_serp_urls(lane, "https://www.google.com/search?q=x", err)
+    assert not lane.serp_urls  # failed search
+
+
 def test_is_google_translate_url():
     assert browser_module._is_google_translate_url(
         "https://www-iea-org.translate.goog/reports/x?_x_tr_sl=en"
