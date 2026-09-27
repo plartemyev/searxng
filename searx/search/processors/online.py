@@ -247,6 +247,23 @@ class OnlineProcessor(EngineProcessor):
         response.search_params = params
         return self.engine.response(response)
 
+    def _serp_cache_record(
+        self, result_container: "ResultContainer", search_results: "EngineResults|None"
+    ):
+        """Hand this engine's parsed results to the SERP cache capture.
+
+        Only successful, non-empty responses are recorded: an engine that
+        errored or returned nothing must not poison a cache entry. The
+        buffer is absent unless the search flow enabled caching.
+        """
+        blocks = getattr(result_container, "serp_cache_blocks", None)
+        if blocks is None or not search_results:
+            return
+        try:
+            blocks[self.engine.name] = list(search_results)
+        except Exception:  # pylint: disable=broad-except
+            self.logger.debug("serp-cache: recording results failed", exc_info=True)
+
     def search(  # pyright: ignore[reportIncompatibleMethodOverride]
         self,
         query: str,
@@ -260,6 +277,7 @@ class OnlineProcessor(EngineProcessor):
         try:
             # send requests and parse the results
             search_results = self._search_basic(query, params)
+            self._serp_cache_record(result_container, search_results)
             self.extend_container(result_container, start_time, search_results)
         except ssl.SSLError as e:
             # requests timeout (connect or read)

@@ -1102,6 +1102,9 @@ class _Lane:
         # SERP page handed over by a human-path fetch for post-search
         # browsing; the browsing session consumes (and closes) it.
         self.serp_page = None
+        # the post-search browsing session currently holding this lane,
+        # if any; a pending crawl with affinity here cancels it
+        self.browsing_task: asyncio.Task | None = None
         self.lock = asyncio.Lock()
 
 
@@ -1153,6 +1156,52 @@ def _release_profile_lock(handle) -> None:
         pass
 
 
+class _LaneScheduler:
+    """Per-lane work registry shared by searches, crawls and browsing.
+
+    Searches and crawls register while they wait for a lane and unregister
+    once they hold one; a lane's post-search browsing session is the
+    lowest-priority background work. The registry is what makes
+    preemption preemptive: browsing sessions poll it at every tick point
+    (after each SERP, crawl, page visit, pacing wait) and yield the lane
+    when real work is pending.
+
+    Priorities: search (any lane) > crawl (affinity lane preferred) >
+    browsing visit (pinned to its lane).
+    """
+
+    def __init__(self):
+        # searches waiting for any lane
+        self._search_waits = 0
+        # crawls waiting: keyed by affinity lane id, None for no affinity
+        self._crawl_waits: dict[int | None, int] = {}
+
+    def enter_search(self) -> None:
+        self._search_waits += 1
+
+    def exit_search(self) -> None:
+        self._search_waits = max(0, self._search_waits - 1)
+
+    def enter_crawl(self, affinity_lane: "_Lane | None") -> None:
+        key = id(affinity_lane) if affinity_lane is not None else None
+        self._crawl_waits[key] = self._crawl_waits.get(key, 0) + 1
+
+    def exit_crawl(self, affinity_lane: "_Lane | None") -> None:
+        key = id(affinity_lane) if affinity_lane is not None else None
+        self._crawl_waits[key] = max(0, self._crawl_waits.get(key, 0) - 1)
+
+    def pending_work(self) -> bool:
+        """Any search or crawl waiting for a lane (browsing must defer)."""
+        return self._search_waits > 0 or any(self._crawl_waits.values())
+
+    def work_pending_for(self, lane: "_Lane") -> bool:
+        """Work that this browsing lane should yield for: any waiting
+        search, plus crawls that either prefer this lane or take any."""
+        if self._search_waits > 0 or self._crawl_waits.get(None, 0) > 0:
+            return True
+        return self._crawl_waits.get(id(lane), 0) > 0
+
+
 class BrowserFetchPool:
     """Pool of masqueraded browser contexts bound to the asyncio loop.
 
@@ -1183,6 +1232,7 @@ class BrowserFetchPool:
         self._origin_last: dict[str, float] = {}
         self._browsing_tasks: set[asyncio.Task] = set()
         self._browsing_started: dict[asyncio.Task, float] = {}
+        self._scheduler = _LaneScheduler()
         self._lanes: list[_Lane] = []
         self._lane_cycle: asyncio.Queue | None = None
         self._init_lock = asyncio.Lock()
@@ -1567,6 +1617,34 @@ class BrowserFetchPool:
 
     # -- lane acquisition -----------------------------------------------------
 
+    def _abandon_browsing(self, lane: _Lane, reason: str) -> bool:
+        """Stop the browsing session on ``lane`` in favor of real work.
+
+        The session's ``finally`` block closes the SERP page and returns
+        the lane to the cycle. Returns False when no live session exists.
+        """
+        task = lane.browsing_task
+        if task is None or task.done():
+            return False
+        logger.info(
+            "abandoning post-search browsing on lane %s: %s",
+            lane.display or "headless",
+            reason,
+        )
+        task.cancel()
+        return True
+
+    def _browsing_must_yield(self, lane: _Lane) -> bool:
+        """A tick-point check: should this browsing session hand the lane
+        over? True when a search or a matching crawl is waiting."""
+        if not self._scheduler.work_pending_for(lane):
+            return False
+        logger.info(
+            "post-search browsing on lane %s yields: higher-priority work pending",
+            lane.display or "headless",
+        )
+        return True
+
     def _preempt_oldest_browsing(self) -> bool:
         """Cancel the longest-running background browsing session.
 
@@ -1670,8 +1748,14 @@ class BrowserFetchPool:
         await self._origin_gate(url)
 
         # One lane per in-flight request: wait (bounded) for the next free
-        # lane, preempting a background browsing session when needed.
-        lane = await self._wait_for_free_search_lane()
+        # lane, preempting a background browsing session when needed. The
+        # wait is registered with the scheduler so browsing sessions see
+        # it and yield early (search outranks everything).
+        self._scheduler.enter_search()
+        try:
+            lane = await self._wait_for_free_search_lane()
+        finally:
+            self._scheduler.exit_search()
         lane.busy = True
         lane.last_used = time.monotonic()
         # Decided up front so the interactive path knows to hand its page
@@ -1845,10 +1929,47 @@ class BrowserFetchPool:
         # origin before any lane is taken (never consumes pool capacity)
         await self._origin_gate(url)
         preferred = self._lane_for_serp_url(url)
+        # register the wait so browsing sessions yield for this crawl
+        # (affinity lane preferred, any lane otherwise)
+        self._scheduler.enter_crawl(preferred)
+        try:
+            return await self._checkout_for_crawl_registered(url, preferred)
+        finally:
+            self._scheduler.exit_crawl(preferred)
+
+    async def _checkout_for_crawl_registered(
+        self, url: str, preferred: "_Lane | None"
+    ) -> tuple["_Lane", bool, bool]:
         if preferred is not None:
             if preferred.busy and self._lane_is_alive(preferred):
-                # the finding lane is mid-request or browsing: the crawl
-                # rides along on the same browser and identity
+                browsing_task = preferred.browsing_task
+                if browsing_task is not None and not browsing_task.done():
+                    # preemption: the crawl outranks this SERP's browsing
+                    # session -- abandon it and take the lane when the
+                    # session's cleanup hands it back
+                    self._abandon_browsing(
+                        preferred, f"crawl affinity: {url[:80]}"
+                    )
+                    deadline = time.monotonic() + _CRAWL_LANE_WAIT_S
+                    while time.monotonic() < deadline:
+                        lane = self._claim_lane_now(preferred)
+                        if lane is not None:
+                            logger.info(
+                                "crawl of %s took affinity lane %s after"
+                                " abandoning browsing",
+                                url, lane.display or "headless",
+                            )
+                            return lane, True, False
+                        await asyncio.sleep(0.2)
+                    # the session's cleanup raced long: ride along instead
+                    logger.info(
+                        "crawl of %s rides the busy affinity lane %s"
+                        " (abandon did not free it in time)",
+                        url, preferred.display or "headless",
+                    )
+                    return preferred, True, True
+                # the finding lane is mid-request: the crawl rides along on
+                # the same browser and identity
                 logger.info(
                     "crawl of %s rides the busy affinity lane %s", url, preferred.display or "headless",
                 )
@@ -2372,20 +2493,35 @@ class BrowserFetchPool:
         the response is already captured, browsing is a bonus.
         """
         try:
-            if not (
-                isinstance(response, BrowserResponse)
-                and response.status_code == 200
-                and "text/html" in (response.headers.get("content-type") or "")
-            ):
-                await self._discard_serp_page(lane)
-                return False
-            if not self._post_search_wanted(response.url):
+            if not self._scheduler.pending_work():
+                if not (
+                    isinstance(response, BrowserResponse)
+                    and response.status_code == 200
+                    and "text/html" in (response.headers.get("content-type") or "")
+                ):
+                    await self._discard_serp_page(lane)
+                    return False
+                if not self._post_search_wanted(response.url):
+                    await self._discard_serp_page(lane)
+                    return False
+            else:
+                # a search or crawl is already waiting for a lane: skip the
+                # imitation entirely and hand the lane straight back
+                logger.info(
+                    "post-search browsing skipped on lane %s: higher-priority"
+                    " work pending",
+                    lane.display or "headless",
+                )
                 await self._discard_serp_page(lane)
                 return False
             page, lane.serp_page = lane.serp_page, None
             task = asyncio.create_task(
                 self._post_search_browsing_session(lane, page, response.url),
                 name=f"post-search-browsing-{lane.display or 'headless'}",
+            )
+            lane.browsing_task = task
+            task.add_done_callback(
+                lambda _t, _lane=lane: setattr(_lane, "browsing_task", None)
             )
             self._browsing_tasks.add(task)
             self._browsing_started[task] = time.monotonic()
@@ -2491,7 +2627,11 @@ class BrowserFetchPool:
         for raw_href in links:
             if visits_left <= 0 or time.monotonic() > deadline - 15.0:
                 break
-            if await self._visit_result_page(page, pointer, raw_href, deadline):
+            # tick point: yield the lane when a search or a matching crawl
+            # is waiting (the session's finally returns the lane)
+            if self._browsing_must_yield(lane):
+                break
+            if await self._visit_result_page(lane, page, pointer, raw_href, deadline):
                 visits += 1
                 visits_left -= 1
                 # the visit paced itself with its dwell; record it so a
@@ -2499,7 +2639,9 @@ class BrowserFetchPool:
                 self._origin_note(urljoin(serp_url, raw_href))
         return visits
 
-    async def _visit_result_page(self, page, pointer, raw_href: str, deadline: float) -> bool:
+    async def _visit_result_page(
+        self, lane: _Lane, page, pointer, raw_href: str, deadline: float
+    ) -> bool:
         """One result click-through: open, dwell, return to the results."""
         # pylint: disable=import-outside-toplevel
         from searx.network.human_input import _human_click_locator, _human_idle
@@ -2556,6 +2698,11 @@ class BrowserFetchPool:
             "post-search browsing: visiting %s for %.0fs", opened.url[:100], dwell
         )
         await self._dwell_on_page(opened, pointer, dwell)
+        # tick point after the pacing wait: a waiting search or crawl takes
+        # the lane now, before this session picks another result
+        if self._browsing_must_yield(lane):
+            await self._return_to_serp(page, opened, serp_url)
+            return True
         await self._return_to_serp(page, opened, serp_url)
         if pointer is not None:
             await _human_idle(pointer, random.uniform(1.0, 4.0))
