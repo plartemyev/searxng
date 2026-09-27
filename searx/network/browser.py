@@ -1276,6 +1276,11 @@ class BrowserFetchPool:
         # _init_lock across lane restarts, and asyncio.Lock is not reentrant
         self._driver_lock = asyncio.Lock()
         self._playwright = None
+        # set when the playwright instance was rebuilt after its driver
+        # died: every lane launched from the dead instance keeps reporting
+        # itself connected forever (the flag is local), so the lanes must
+        # be force-restarted instead of trusted
+        self._lanes_stale = False
         self._closed = False
         self._reaper_task: asyncio.Task | None = None
         self._init_done = False
@@ -1414,6 +1419,39 @@ class BrowserFetchPool:
             from playwright.async_api import async_playwright
 
             self._playwright = await async_playwright().start()
+            # every existing lane was launched from the dead instance: its
+            # browser objects keep reporting themselves connected forever,
+            # so the lanes must be force-restarted, not trusted
+            self._lanes_stale = True
+
+    @staticmethod
+    def _driver_died(exc: BaseException) -> bool:
+        """Whether an operation failed because the node driver is gone.
+
+        The driver is one shared process: when the container OOM-kills it,
+        playwright's local flags keep every browser reporting connected --
+        only the raised error reveals the death.
+        """
+        return "Connection closed while reading from the driver" in str(exc)
+
+    async def _heal_after_driver_death(self) -> None:
+        """Rebuild the playwright instance and restart every lane.
+
+        All lanes share one node driver process: when it dies, none of them
+        can serve a page, while every aliveness flag still lies. Rebuild the
+        instance first (lane launches need it), then force-restart each lane
+        on the fresh instance.
+        """
+        async with self._init_lock:
+            if not self._lanes_stale:
+                return
+            logger.warning("Rebuilding the browser pool after the driver died")
+            for lane in self._lanes:
+                try:
+                    await self._restart_lane(lane)
+                except Exception:  # pylint: disable=broad-except
+                    logger.exception("Lane restart failed after the driver died")
+            self._lanes_stale = False
 
     async def _launch_lane(self, lane_index: int, executable_path: str | None) -> _Lane:
         """Launch one lane: its own browser process on its own X display."""
@@ -1607,6 +1645,11 @@ class BrowserFetchPool:
         the whole pool. A lane reaped by the idle reaper (context closed to
         release its profile lock) relaunches through the same path.
         """
+        if self._lanes_stale:
+            # the playwright instance was rebuilt after its driver died:
+            # the aliveness flags below belong to the dead instance and lie
+            await self._heal_after_driver_death()
+            return
         if all(self._lane_is_alive(lane) for lane in self._lanes):
             return
         async with self._init_lock:
@@ -1880,6 +1923,12 @@ class BrowserFetchPool:
                 self._record_serp_urls(lane, url, response)
                 browsing = await self._maybe_start_post_search_browsing(lane, response)
                 return response
+        except Exception as e:  # pylint: disable=broad-except
+            if self._driver_died(e):
+                # the shared node driver is gone: rebuild the pool so later
+                # requests start fresh instead of failing the same way
+                await self._heal_after_driver_death()
+            raise
         finally:
             if not browsing:
                 self._return_lane(lane)
@@ -2583,8 +2632,12 @@ class BrowserFetchPool:
                 finally:
                     if not handed_over:
                         await page.close()
-        except Exception:  # pylint: disable=broad-except
+        except Exception as e:  # pylint: disable=broad-except
             logger.warning("human search fallback failed for %s", url, exc_info=True)
+            if self._driver_died(e):
+                # the whole pool rides one dead node process: rebuild it now
+                # so the next request starts fresh instead of failing too
+                await self._heal_after_driver_death()
             return None
 
         if rendered_html:

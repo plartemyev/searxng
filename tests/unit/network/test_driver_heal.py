@@ -105,3 +105,54 @@ def test_concurrent_restarts_build_one_driver(pool, fake_playwright):
     _run(check)
     factory.return_value.start.assert_awaited_once()
     assert pool._playwright is instance
+
+
+def test_driver_death_is_recognized_by_message():
+    dead = Exception("BrowserContext.new_page: Connection closed while reading from the driver")
+    assert BrowserFetchPool._driver_died(dead)
+    assert not BrowserFetchPool._driver_died(Exception("Target closed"))
+    assert not BrowserFetchPool._driver_died(Exception("chromium missing"))
+
+
+def test_rebuild_marks_lanes_stale(pool, fake_playwright):
+    factory, instance = fake_playwright
+    dead = MagicMock()
+    dead.stop = AsyncMock()
+    pool._playwright = dead
+
+    async def check():
+        await pool._restart_playwright()
+
+    _run(check)
+    assert pool._lanes_stale
+
+
+def test_ensure_alive_restarts_lanes_that_lie(pool, fake_playwright):
+    # after a driver death every lane still reports itself connected:
+    # the stale flag, not the flag check, must drive the restart
+    liar = MagicMock()
+    liar.browser.is_connected.return_value = True
+    pool._lanes = [liar]
+    pool._lanes_stale = True
+    pool._restart_lane = AsyncMock()
+
+    async def check():
+        await pool._ensure_browser_alive()
+
+    _run(check)
+    pool._restart_lane.assert_awaited_once_with(liar)
+    assert not pool._lanes_stale
+
+
+def test_heal_without_stale_lanes_is_noop(pool, fake_playwright):
+    liar = MagicMock()
+    liar.browser.is_connected.return_value = True
+    pool._lanes = [liar]
+    pool._lanes_stale = False
+    pool._restart_lane = AsyncMock()
+
+    async def check():
+        await pool._heal_after_driver_death()
+
+    _run(check)
+    pool._restart_lane.assert_not_awaited()
