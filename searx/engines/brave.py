@@ -126,7 +126,10 @@ from dateutil import parser
 
 from searx import locales, logger
 from searx.enginelib.traits import EngineTraits
-from searx.exceptions import SearxEngineResponseException
+from searx.exceptions import (
+    SearxEngineResponseException,
+    SearxEngineTooManyRequestsException,
+)
 from searx.result_types import EngineResults, MainResult, Video
 from searx.result_types.image import Image
 from searx.utils import html_to_text, js_obj_str_to_json_str, js_obj_str_to_python
@@ -245,9 +248,17 @@ def extract_json_data(text: str) -> dict[str, t.Any]:
     #    form: null,
     #    error: null
     # });
-    start = text.index("data: [{")
-    newline = text.index("\n", start)
-    end = text.rindex("}}]", start, newline)
+    try:
+        start = text.index("data: [{")
+        newline = text.index("\n", start)
+        end = text.rindex("}}]", start, newline)
+    except ValueError as e:
+        # no app-state script at all: the page is not a search response
+        # (challenge interstitial, hard block) -- a parse error would
+        # misclassify it and retry into the same wall
+        raise SearxEngineTooManyRequestsException(
+            "Brave served a page without search data (challenge or block)"
+        ) from e
     js_obj_str = "{" + text[start:end] + "}}]}"
     # js_obj_str = js_obj_str.replace("\xa0", "")  # remove ASCII for &nbsp;
     # js_obj_str = js_obj_str.replace(r"\u003C", "<").replace(r"\u003c", "<")  # fix broken HTML tags in strings
@@ -348,6 +359,14 @@ def _get_response_data(json_data: dict[str, t.Any], category: str | None = None)
     # Brave’s structure is mostly consistent but has a couple of quirks:
     # - most categories live under data[1].data.body.response.<category>
     # - news omits the intermediate "body" key
+    for node in json_data.get("data") or []:
+        if isinstance(node, dict) and isinstance(node.get("data"), dict) and node["data"].get("challengeSet"):
+            # rate-limited: the shell renders with a challenge payload and
+            # no response node -- suspend the engine instead of raising a
+            # structure error that retries into the same 429
+            raise SearxEngineTooManyRequestsException(
+                "Brave rate-limited the query (challenge page served)"
+            )
     try:
         data: dict[str, t.Any] = json_data["data"][1]["data"]
 

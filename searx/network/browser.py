@@ -64,6 +64,8 @@ import time
 from html import unescape as _html_unescape
 from types import SimpleNamespace
 from collections import deque
+from collections.abc import Awaitable, Callable
+from typing import TypeVar
 from urllib.parse import parse_qsl, parse_qs, urlencode, urljoin, urlsplit, urlunparse
 from lxml import html
 from searx.exceptions import (
@@ -73,6 +75,8 @@ from searx.exceptions import (
 from searx.extended_types import SXNG_URL
 
 logger = logging.getLogger("searx.network.browser")
+
+_LaunchT = TypeVar("_LaunchT")
 
 # Grace period after a challenge navigation to let challenge JS settle.
 _BOT_CHALLENGE_GRACE_MS = 5000
@@ -1268,6 +1272,9 @@ class BrowserFetchPool:
         self._lanes: list[_Lane] = []
         self._lane_cycle: asyncio.Queue | None = None
         self._init_lock = asyncio.Lock()
+        # playwright rebuilds use their own lock: _ensure_browser_alive holds
+        # _init_lock across lane restarts, and asyncio.Lock is not reentrant
+        self._driver_lock = asyncio.Lock()
         self._playwright = None
         self._closed = False
         self._reaper_task: asyncio.Task | None = None
@@ -1372,6 +1379,42 @@ class BrowserFetchPool:
             return None
         return path
 
+    async def _launch_with_driver_heal(
+        self, launch_factory: Callable[[], Awaitable[_LaunchT]]
+    ) -> _LaunchT:
+        """Run one browser launch, rebuilding the playwright driver if it died.
+
+        The driver is a single node process shared by every lane: when the
+        container OOM-kills it, every launch fails with ``Connection closed
+        while reading from the driver`` and lane restarts would loop forever
+        on the dead instance. Rebuild it once, then retry the same launch.
+        """
+        try:
+            return await launch_factory()
+        except Exception as e:  # pylint: disable=broad-except
+            if "Connection closed while reading from the driver" not in str(e):
+                raise
+            logger.warning("Playwright driver process is dead; rebuilding it")
+            await self._restart_playwright()
+            return await launch_factory()
+
+    async def _restart_playwright(self) -> None:
+        """Recreate the shared playwright instance after its driver died."""
+        dead = self._playwright
+        async with self._driver_lock:
+            if self._playwright is not dead:
+                # another task already rebuilt the driver while we waited
+                return
+            if dead is not None:
+                try:
+                    await dead.stop()
+                except Exception:  # pylint: disable=broad-except
+                    pass
+                self._playwright = None
+            from playwright.async_api import async_playwright
+
+            self._playwright = await async_playwright().start()
+
     async def _launch_lane(self, lane_index: int, executable_path: str | None) -> _Lane:
         """Launch one lane: its own browser process on its own X display."""
         loop = asyncio.get_running_loop()
@@ -1407,14 +1450,18 @@ class BrowserFetchPool:
                     pass
             # persistent profile: cookies, storage and earned clearances
             # survive lane crashes and process restarts
-            context = await self._playwright.chromium.launch_persistent_context(
-                profile_path, **launch_kwargs, **self._context_kwargs(geo)
+            context = await self._launch_with_driver_heal(
+                lambda: self._playwright.chromium.launch_persistent_context(
+                    profile_path, **launch_kwargs, **self._context_kwargs(geo)
+                )
             )
             browser = context.browser
         else:
             _release_profile_lock(profile_lock)
             profile_lock = None
-            browser = await self._playwright.chromium.launch(**launch_kwargs)
+            browser = await self._launch_with_driver_heal(
+                lambda: self._playwright.chromium.launch(**launch_kwargs)
+            )
             context = await browser.new_context(
                 **self._context_kwargs(geo)
             )
