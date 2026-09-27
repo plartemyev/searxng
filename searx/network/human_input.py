@@ -36,13 +36,16 @@ __all__ = [
     "human_read_results",
     "human_solve_challenge",
     "human_solve_image_challenge",
+    "human_solve_brave_captcha",
     "human_clear_challenge",
 ]
 
 import asyncio
 import random
+import re
 import time
 from contextlib import asynccontextmanager
+from urllib.parse import urlsplit
 
 from searx import logger
 
@@ -104,6 +107,13 @@ _CHALLENGE_PAGE_MARKERS = (
     "checking your browser",
     "verify you are human",
     "cf-chl",
+    # Brave's own challenge (/captcha): a canvas puzzle with a slider knob,
+    # mounted by their SPA -- no third-party iframe ever appears. "/captcha"
+    # matches the challenge route; the two strings are the widget's own text
+    # ("Drag the slider" is the knob's aria-label).
+    "/captcha",
+    "verifying you're not a bot",
+    "drag the slider",
 )
 
 
@@ -270,19 +280,27 @@ async def human_like_real_mouse_move(
     start: tuple[int, int],
     end: tuple[int, int],
     steps: int = 0,
+    control_jitter: tuple[int, int] = (400, 200),
 ) -> tuple[int, int]:
     """Move the real X pointer from ``start`` to ``end`` like a human hand.
 
     Quadratic Bezier path through a random control point, 30..200 steps,
     per-step jitter, 1-5ms between steps (the await lets the event loop
-    breathe while the pointer moves).
+    breathe while the pointer moves). ``control_jitter`` bounds how far the
+    control point may stray from the path midpoint: a pressed-drag needs a
+    tight curve (the widget tracks the pointer exactly), a free move can
+    swing wide.
     """
     start_ts = time.monotonic()
     if not steps:
         steps = random.randint(30, 200)  # noqa: S311
     # Control point with a slight offset to create a curve.
-    mid_x = (start[0] + end[0]) / 2 + random.randint(-400, 400)  # noqa: S311
-    mid_y = (start[1] + end[1]) / 2 + random.randint(-200, 200)  # noqa: S311
+    mid_x = (start[0] + end[0]) / 2 + random.randint(  # noqa: S311
+        -control_jitter[0], control_jitter[0]
+    )
+    mid_y = (start[1] + end[1]) / 2 + random.randint(  # noqa: S311
+        -control_jitter[1], control_jitter[1]
+    )
     control = (mid_x, mid_y)
     final_x, final_y = end
     for i in range(steps + 1):
@@ -1092,14 +1110,252 @@ async def human_solve_image_challenge(page, pointer, *, solver=None, max_rounds:
     return await _run_image_rounds(page, pointer, solver, max_rounds, found)
 
 
+# --------------------------------------------------------------------------
+# Brave's own challenge (/captcha): PoW first, slider second
+#
+# Brave challenges flagged clients with its own SPA page instead of a
+# third-party widget: an invisible WASM proof-of-work runs on load and
+# reloads the search on success; only a refused PoW mounts the slider
+# (a canvas puzzle with a drag knob). Detection is DOM-based (no iframe
+# ever appears), the drag is real X input, and the vision model is only
+# asked where the puzzle gap sits when plain end-drags are refused.
+# --------------------------------------------------------------------------
+
+_BRAVE_CARD_SELECTORS = (
+    ".captcha-card",
+    ".captcha-wrapper",
+)
+_BRAVE_SLIDER_SELECTORS = (
+    ".captcha-slider-button",
+    "button[aria-label='Drag the slider']",
+)
+_BRAVE_TRACK_SELECTOR = ".captcha-slider"
+_BRAVE_CANVAS_SELECTOR = "canvas.captcha-canvas"
+_BRAVE_POW_WAIT_S = 12.0
+_BRAVE_CLEAR_WAIT_S = 8.0
+_BRAVE_DRAG_ATTEMPTS = 3
+
+
+def _on_brave_challenge_route(url: str | None) -> bool:
+    """Is this URL Brave's challenge route and nothing else?
+
+    Exact path match: a page whose URL merely contains "captcha" (a
+    wikipedia article, a help centre) is not the challenge, and mistaking
+    one for it would stall the lane in the PoW wait for nothing.
+    """
+    path = urlsplit(url or "").path.lower()
+    return path == "/captcha" or path.startswith("/captcha/")
+
+
+async def _brave_widget_visible(page) -> bool:
+    """Is Brave's challenge widget mounted right now?"""
+    return (
+        await _find_visible(page, _BRAVE_CARD_SELECTORS + _BRAVE_SLIDER_SELECTORS)
+        is not None
+    )
+
+
+async def _brave_wait_cleared(page, timeout_s: float | None = None) -> bool:
+    """Poll until the challenge widget disappears (verify + reload)."""
+    if timeout_s is None:
+        timeout_s = _BRAVE_CLEAR_WAIT_S
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if not await _brave_widget_visible(page):
+            return True
+        await asyncio.sleep(0.4)
+    return False
+
+
+async def _brave_drag_slider(page, pointer: _XPointer, target_fraction: float) -> bool:
+    """Press the knob, drag it to ``target_fraction`` of the track, release.
+
+    The widget positions the knob with translateX(fraction * track): the
+    drag end maps the fraction onto the knob's travel range. Every move is
+    real X input with the button held down.
+    """
+    knob = await _find_visible(page, _BRAVE_SLIDER_SELECTORS)
+    if knob is None:
+        return False
+    try:
+        knob_box = await knob.bounding_box()
+        track = await _find_visible(page, (_BRAVE_TRACK_SELECTOR,))
+        track_box = await track.bounding_box() if track is not None else None
+    except Exception:  # pylint: disable=broad-except
+        return False
+    if not knob_box or not track_box:
+        return False
+
+    fraction = min(1.0, max(0.0, target_fraction))
+    start_x = knob_box['x'] + knob_box['width'] / 2
+    start_y = knob_box['y'] + knob_box['height'] / 2
+    travel = max(0.0, track_box['width'] - knob_box['width'])
+    end_x = track_box['x'] + knob_box['width'] / 2 + fraction * travel
+    end_y = start_y
+
+    press_x, press_y = await _to_screen(page, pointer, start_x, start_y)
+    await human_like_real_mouse_move(pointer, pointer.position(), (press_x, press_y))
+    await asyncio.sleep(random.uniform(0.1, 0.35))  # noqa: S311 -- aim
+    pointer.mouse_down()
+    await asyncio.sleep(random.uniform(0.05, 0.15))  # noqa: S311 -- grip
+    release_x, release_y = await _to_screen(
+        page, pointer, end_x, end_y + random.uniform(-2.0, 2.0)  # noqa: S311
+    )
+    # a held-down drag needs a tight curve: the widget tracks the pointer,
+    # a wide swing would drag the piece backwards past its start
+    await human_like_real_mouse_move(
+        pointer, (press_x, press_y), (release_x, release_y), control_jitter=(12, 30)
+    )
+    await asyncio.sleep(random.uniform(0.08, 0.25))  # noqa: S311
+    pointer.mouse_up()
+    return True
+
+
+async def _brave_gap_fraction(page, solver) -> float | None:
+    """Ask the vision model where the puzzle gap sits, as a width fraction."""
+    canvas = page.locator(_BRAVE_CANVAS_SELECTOR).first
+    try:
+        png = await canvas.screenshot(timeout=5000)
+    except Exception:  # pylint: disable=broad-except
+        return None
+    prompt = (
+        'This image is a slider captcha canvas: the picture contains a '
+        'notch/gap the slider piece must move into. Reply with only the '
+        'horizontal position of the gap as a fraction of the image width '
+        '(a number between 0 and 1).'
+    )
+    try:
+        answer = solver.chat_vision(prompt, [png])
+    except Exception:  # pylint: disable=broad-except
+        return None
+    match = re.search(r"\d+(?:\.\d+)?", answer)
+    if not match:
+        return None
+    try:
+        fraction = float(match.group(0))
+    except ValueError:
+        return None
+    if 1.0 < fraction <= 100.0:
+        # "45" means 45 percent, not 45 times the width
+        fraction = fraction / 100.0
+    return min(0.95, max(0.05, fraction))
+
+
+async def _brave_challenge_present(page, settle_ms: int) -> bool:
+    """Is this Brave's challenge at all? Bails fast when it is not.
+
+    The widget mounts a moment after the shell loads; a page that never
+    shows it and never takes the /captcha route is not this challenge
+    (google's /sorry reaches here through human_clear_challenge too).
+    """
+    deadline = time.monotonic() + max(1.5, settle_ms / 1000)
+    while time.monotonic() < deadline:
+        if await _brave_widget_visible(page):
+            return True
+        if _on_brave_challenge_route(page.url):
+            return True
+        await asyncio.sleep(0.3)
+    return False
+
+
+async def _brave_wait_slider(page):
+    """Give the client-side PoW its chance, then return the slider.
+
+    The widget unmounting is the cleared signal: on PoW success the SPA
+    reloads the search URL and the caller's URL poll takes over from
+    there. Returns None when the PoW cleared the challenge or when no
+    slider ever mounted.
+    """
+    pow_deadline = time.monotonic() + _BRAVE_POW_WAIT_S
+    while time.monotonic() < pow_deadline:
+        if not await _brave_widget_visible(page):
+            logger.info('human input: brave challenge cleared without input (PoW)')
+            return None
+        slider = await _find_visible(page, _BRAVE_SLIDER_SELECTORS)
+        if slider is not None:
+            return slider
+        await asyncio.sleep(random.uniform(0.6, 1.1))  # noqa: S311
+    logger.warning('human input: brave challenge never mounted a slider')
+    return None
+
+
+def _brave_vision_solver():
+    # pylint: disable=import-outside-toplevel
+    from searx.network.captcha_vision import get_vision_solver
+
+    return get_vision_solver()
+
+
+async def _brave_drag_attempts(page, pointer: _XPointer) -> bool:
+    """Drag the slider: end-drag first, then vision-read gap positions."""
+    solver = None
+    for attempt in range(1, _BRAVE_DRAG_ATTEMPTS + 1):
+        fraction = 1.0  # a plain "slide to verify" drag reaches the track end
+        if attempt > 1:
+            # end-drags refused: the puzzle wants the piece aligned with its
+            # gap; read the gap position off the canvas
+            if solver is None:
+                solver = _brave_vision_solver()
+            if solver is None:
+                logger.warning(
+                    'human input: brave slider end-drag refused and no '
+                    'vision solver configured'
+                )
+                return False
+            gap = await _brave_gap_fraction(page, solver)
+            if gap is None:
+                return False
+            fraction = gap
+        if not await _brave_drag_slider(page, pointer, fraction):
+            return False
+        if await _brave_wait_cleared(page):
+            logger.info(
+                'human input: brave slider solved (attempt %s, fraction %.2f)',
+                attempt,
+                fraction,
+            )
+            return True
+        await asyncio.sleep(random.uniform(1.0, 2.0))  # noqa: S311
+    logger.warning(
+        'human input: brave slider not solved after %s drags', _BRAVE_DRAG_ATTEMPTS
+    )
+    return False
+
+
+async def human_solve_brave_captcha(
+    page, pointer: _XPointer, *, settle_ms: int = 12000
+) -> bool:
+    """Solve Brave's own challenge: wait out the PoW, drag the slider.
+
+    Called by :py:func:`human_clear_challenge` after the iframe-based
+    passes found nothing. On a real challenge the WASM proof-of-work often
+    clears it alone -- only a refused PoW mounts the slider, which is then
+    dragged with real X input; when end-drags are refused the vision model
+    reads the gap position off the canvas.
+    """
+    await page.bring_to_front()
+    if not await _brave_challenge_present(page, settle_ms):
+        return False
+    slider = await _brave_wait_slider(page)
+    if slider is None:
+        # PoW cleared it (widget gone) or it never mounted a slider
+        return not await _brave_widget_visible(page)
+    return await _brave_drag_attempts(page, pointer)
+
+
 async def human_clear_challenge(page, pointer, *, settle_ms: int = 6000) -> bool:
     """Clear a challenge interstitial, checkbox first, vision second.
 
     Wraps :py:func:`human_solve_challenge` (the checkbox click) and
     :py:func:`human_solve_image_challenge` (the grid escalation the click
-    often triggers). Both are always evaluated: a clicked checkbox and a
-    subsequently mounted grid belong to the same challenge.
+    often triggers), then :py:func:`human_solve_brave_captcha` (Brave's own
+    widget, which has no iframe for the checkbox pass to find). All are
+    always evaluated: a clicked checkbox and a subsequently mounted grid
+    belong to the same challenge, and Brave's widget only shows up once the
+    iframe passes have come up empty.
     """
     clicked = await human_solve_challenge(page, pointer, settle_ms=settle_ms)
     vision_solved = await human_solve_image_challenge(page, pointer)
-    return clicked or vision_solved
+    if clicked or vision_solved:
+        return True
+    return await human_solve_brave_captcha(page, pointer, settle_ms=settle_ms)

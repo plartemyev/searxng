@@ -387,6 +387,10 @@ _CF_CHALLENGE_BODY_MARKERS = (
     # fallback runs instead of the engine parsing the sorry page
     "unusual traffic from your computer network",
     "/sorry/index",
+    # Brave's challenge shell: the challengeSet payload lives inside a
+    # script (stripped above), but its noscript notice survives and marks
+    # the page even when it is served with HTTP 200
+    "decided to schedule a captcha",
 )
 _SCRIPT_BLOCK_RE = re.compile(r"<script\b.*?</script>", re.IGNORECASE | re.DOTALL)
 
@@ -433,7 +437,14 @@ def _is_api_url(url: str) -> bool:
 def _is_challenge_url(url: str | None) -> bool:
     """Is this URL a challenge / rate-limit interstitial?"""
     lowered = (url or "").lower()
-    return "/sorry" in lowered or "unusual traffic" in lowered
+    if "/sorry" in lowered or "unusual traffic" in lowered:
+        return True
+    # Brave mounts its own challenge on the /captcha route (its slider
+    # puzzle); match the path exactly so unrelated pages whose URL merely
+    # contains "captcha" (wikipedia articles, help centres) are not
+    # misread as challenges
+    parts = urlsplit(url or "")
+    return parts.path == "/captcha" or parts.path.startswith("/captcha/")
 
 
 def _is_google_translate_url(url: str | None) -> bool:
