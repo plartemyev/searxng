@@ -153,6 +153,32 @@ class TestResultSerialization:
         assert isinstance(loaded[0], LegacyResult)
         assert loaded[0]["title"] == "t"
 
+    def test_unrebuildable_block_degrades_to_live_fetch(self, cache, monkeypatch):
+        """A poisoned block must never fail the search: the engine is
+        simply fetched live instead."""
+        monkeypatch.setattr(serp_cache, "get_cache", lambda: cache)
+        query = _query()
+        entry = serp_cache._CacheEntry(
+            serp_cache.canonical_key(query), query, {"google": [{"__type": "legacy"}]}
+        )
+        # a result whose normalization explodes (list where a URL should be)
+        entry.blocks = {"google": [{"__type": "legacy", "url": "https://a.example", "parsed_url": ["x"] * 6}]}
+        cache.store(entry)
+
+        ctx = serp_cache.request_context(query)
+        container = SimpleNamespace(serp_cache_blocks=None, extend=None)
+        remaining = []
+
+        def exploding_extend(name, results):
+            raise AttributeError("'list' object has no attribute 'netloc'")
+
+        container.extend = exploding_extend
+        requests = [("google", "lorem ipsum", {})]
+        remaining = ctx.apply(container, requests)
+        assert [r[0] for r in remaining] == ["google"]
+        # and the refetched engine is captured again (partial hits self-heal)
+        assert container.serp_cache_blocks == {}
+
     def test_unrebuildable_type_degrades_to_legacy(self):
         dumped = [{"__type": "NoSuchType", "url": "https://a.example"}]
         loaded = serp_cache.load_results(dumped)

@@ -42,7 +42,7 @@ if t.TYPE_CHECKING:
 
 log = logger.getChild("serp_cache")
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # fingerprint of one result item: a tagged struct ("Image", "Answer", ..)
 # or a legacy free-form dict
@@ -317,29 +317,45 @@ class RequestContext:
     def apply(
         self, result_container: "ResultContainer", requests: list[tuple[str, str, dict]]
     ) -> list[tuple[str, str, dict]]:
-        """Replay cached blocks; return the requests still to be sent."""
+        """Replay cached blocks; return the requests still to be sent.
+
+        Replays are fault-isolated per engine: a block that cannot be
+        rebuilt degrades to a live fetch of that engine, never to a failed
+        search.
+        """
+        replayed: list[str] = []
+        remaining: list[tuple[str, str, dict]] = []
         if self.entry is not None:
-            remaining = []
-            replayed = []
             for request in requests:
                 engine_name = request[0]
                 block = self.entry.blocks.get(engine_name)
                 if block is None:
                     remaining.append(request)
-                else:
+                    continue
+                try:
                     result_container.extend(engine_name, load_results(block))
                     replayed.append(engine_name)
+                except Exception:  # pylint: disable=broad-except
+                    log.warning(
+                        "serp-cache: replay of %s failed; fetching live",
+                        engine_name,
+                        exc_info=True,
+                    )
+                    remaining.append(request)
             if replayed:
                 log.info(
                     "serp-cache: HIT key=%s replayed=%s fetching=%d",
                     self.key, ",".join(replayed), len(remaining),
                 )
-            if not remaining:
-                self.stored = True  # nothing new to write
-            return remaining
-        # fresh request: attach the capture buffer the processors fill in
-        result_container.serp_cache_blocks = {}
-        return requests
+        else:
+            remaining = requests
+        if remaining:
+            # capture what the fan-out produces so finish can store or
+            # merge the missing engine blocks (partial hits self-heal)
+            result_container.serp_cache_blocks = {}
+        else:
+            self.stored = True  # nothing new to write
+        return remaining
 
     def finish(self, result_container: "ResultContainer") -> None:
         """Store/merge the entry from the engine blocks the run produced."""
