@@ -19,6 +19,7 @@ from searx.engines import load_engines
 from searx.external_bang import get_bang_url
 from searx.metrics import initialize as initialize_metrics, counter_inc
 from searx.network import initialize as initialize_network, check_network_configuration
+from searx.network import serp_cache
 from searx.results import ResultContainer
 from searx.search.processors import PROCESSORS
 from searx.search.processors.abstract import RequestParams
@@ -163,9 +164,20 @@ class Search:
         """
         requests, self.actual_timeout = self._get_requests()
 
+        cache_ctx = None
+        if requests:
+            # best-effort: a matching fresh entry replays the cached
+            # per-engine results without touching any engine or lane
+            cache_ctx = serp_cache.request_context(self.search_query)
+            if cache_ctx is not None:
+                requests = cache_ctx.apply(self.result_container, requests)
+
         # send all search-request
         if requests:
             self.search_multiple_requests(requests)
+
+        if cache_ctx is not None:
+            cache_ctx.finish(self.result_container)
 
         # return results, suggestions, answers and infoboxes
         return True
