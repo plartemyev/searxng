@@ -59,10 +59,11 @@ class FakePointer:
 class FakeLocator:
     """A fixed or scripted element: box, visibility, optional hide hook."""
 
-    def __init__(self, box=None, visible=True, on_hidden=None):
+    def __init__(self, box=None, visible=True, on_hidden=None, page=None):
         self._box = box
         self._visible = visible
         self._on_hidden = on_hidden
+        self.page = page
 
     @property
     def first(self):
@@ -85,6 +86,9 @@ class FakeLocator:
     async def bounding_box(self):
         return self._box
 
+    async def inner_text(self):
+        return self._text
+
     async def screenshot(self, **_kwargs):
         return b"canvas-png"
 
@@ -94,8 +98,11 @@ class FakePage:
         self.url = url
         self.locators = {}
 
-    def add(self, selector, box=None, visible=True):
-        self.locators[selector] = FakeLocator(box=box, visible=visible)
+    def add(self, selector, box=None, visible=True, text=""):
+        locator = FakeLocator(box=box, visible=visible, page=self)
+        locator._text = text  # noqa: SLF001 -- test fake wiring
+        self.locators[selector] = locator
+        return locator
 
     def remove(self, *selectors):
         for selector in selectors:
@@ -275,6 +282,67 @@ def test_no_vision_solver_aborts_after_refused_end_drag(fast_sleep):
     downs = [event for event in pointer.events if event[0] == "down"]
     ups = [event for event in pointer.events if event[0] == "up"]
     assert len(downs) == 1 and len(ups) == 1  # end-drag ran, then gave up
+
+
+def test_verify_click_clears_pow(fast_sleep):
+    page = FakePage(url="https://search.brave.com/search?q=x")
+    card = page.add(
+        ".captcha-card", box={"x": 400.0, "y": 300.0, "width": 400.0, "height": 300.0}
+    )
+    page.add(
+        ".captcha-actions button.kind--filled",
+        box={"x": 564.0, "y": 499.0, "width": 312.0, "height": 44.0},
+        text="Verify",
+    )
+    pointer = FakePointer()
+    original_down, original_up = pointer.mouse_down, pointer.mouse_up
+
+    def down():
+        original_down()
+        # the PoW accepts: the SPA reloads and the card unmounts
+        card._visible = False
+        page.url = "https://search.brave.com/search?q=x&_rr=1"
+
+    pointer.mouse_down = down
+    pointer.mouse_up = original_up
+
+    async def check():
+        with patch.object(human_input, "_BRAVE_POW_WAIT_S", 3.0):
+            solved = await human_solve_brave_captcha(page, pointer)
+        assert solved
+
+    _run(check)
+    downs = [event for event in pointer.events if event[0] == "down"]
+    ups = [event for event in pointer.events if event[0] == "up"]
+    assert len(downs) == 1 and len(ups) == 1  # exactly one Verify click
+    moves = [event for event in pointer.events if event[0] == "move"]
+    click_x, click_y = moves[-1][1], moves[-1][2]
+    # button center on screen: (564 + 156, 499 + 22 + 80)
+    assert 716 <= click_x <= 724
+    assert 597 <= click_y <= 605
+
+
+def test_switch_captcha_button_is_not_clicked(fast_sleep):
+    page = FakePage(url="https://search.brave.com/search?q=x")
+    card = page.add(
+        ".captcha-card", box={"x": 400.0, "y": 300.0, "width": 400.0, "height": 300.0}
+    )
+    # the escalation button matches the selector but not the text guard
+    page.add(
+        ".captcha-actions button.kind--filled",
+        box={"x": 564.0, "y": 499.0, "width": 312.0, "height": 44.0},
+        text="Switch to traditional CAPTCHA",
+    )
+    pointer = FakePointer()
+
+    async def check():
+        with patch.object(human_input, "_BRAVE_POW_WAIT_S", 1.0):
+            solved = await human_solve_brave_captcha(page, pointer)
+        # nothing cleared and nothing was clicked: unsolved, no escalation
+        assert not solved
+
+    _run(check)
+    assert pointer.events == []
 
 
 def test_clear_challenge_delegates_to_brave():

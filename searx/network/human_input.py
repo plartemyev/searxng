@@ -1134,6 +1134,12 @@ _BRAVE_CANVAS_SELECTOR = "canvas.captcha-canvas"
 _BRAVE_POW_WAIT_S = 12.0
 _BRAVE_CLEAR_WAIT_S = 8.0
 _BRAVE_DRAG_ATTEMPTS = 3
+# the PoW stage's Verify button ("Switch to traditional CAPTCHA" sits in
+# the same actions row and must not be clicked -- the text guard below)
+_BRAVE_VERIFY_SELECTORS = (
+    "button[name='captcha-button']",
+    ".captcha-actions button.kind--filled",
+)
 
 
 def _on_brave_challenge_route(url: str | None) -> bool:
@@ -1258,24 +1264,49 @@ async def _brave_challenge_present(page, settle_ms: int) -> bool:
     return False
 
 
-async def _brave_wait_slider(page):
-    """Give the client-side PoW its chance, then return the slider.
+async def _brave_verify_button(page):
+    """The PoW stage's Verify button, when the challenge is at that stage.
 
-    The widget unmounting is the cleared signal: on PoW success the SPA
-    reloads the search URL and the caller's URL poll takes over from
-    there. Returns None when the PoW cleared the challenge or when no
-    slider ever mounted.
+    The actions row also holds "Switch to traditional CAPTCHA" -- only a
+    button whose text starts with "Verify" counts.
     """
-    pow_deadline = time.monotonic() + _BRAVE_POW_WAIT_S
-    while time.monotonic() < pow_deadline:
+    for selector in _BRAVE_VERIFY_SELECTORS:
+        locator = page.locator(selector).first
+        try:
+            if not await locator.is_visible():
+                continue
+            text = (await locator.inner_text()).strip().lower()
+        except Exception:  # pylint: disable=broad-except
+            continue
+        if text.startswith('verify'):
+            return locator
+    return None
+
+
+async def _brave_pow_stage(page, pointer: _XPointer):
+    """Click Verify and wait out the proof-of-work.
+
+    The challenge first asks for a click (the PoW does not run on load):
+    on acceptance the SPA reloads the search and the card unmounts; on a
+    refusal the slider mounts instead. Returns the slider locator, or None
+    when the challenge cleared (or went away without needing input).
+    """
+    deadline = time.monotonic() + _BRAVE_POW_WAIT_S
+    clicked = False
+    while time.monotonic() < deadline:
         if not await _brave_widget_visible(page):
-            logger.info('human input: brave challenge cleared without input (PoW)')
+            logger.info('human input: brave challenge cleared (PoW accepted)')
             return None
         slider = await _find_visible(page, _BRAVE_SLIDER_SELECTORS)
         if slider is not None:
             return slider
-        await asyncio.sleep(random.uniform(0.6, 1.1))  # noqa: S311
-    logger.warning('human input: brave challenge never mounted a slider')
+        if not clicked:
+            button = await _brave_verify_button(page)
+            if button is not None:
+                logger.info('human input: clicking the brave challenge Verify button')
+                clicked = await _human_click_locator(button, pointer)
+        await asyncio.sleep(random.uniform(0.8, 1.4))  # noqa: S311
+    logger.warning('human input: brave challenge stayed on its Verify screen')
     return None
 
 
@@ -1325,20 +1356,21 @@ async def _brave_drag_attempts(page, pointer: _XPointer) -> bool:
 async def human_solve_brave_captcha(
     page, pointer: _XPointer, *, settle_ms: int = 12000
 ) -> bool:
-    """Solve Brave's own challenge: wait out the PoW, drag the slider.
+    """Solve Brave's own challenge: click Verify, wait out the PoW, drag.
 
     Called by :py:func:`human_clear_challenge` after the iframe-based
-    passes found nothing. On a real challenge the WASM proof-of-work often
-    clears it alone -- only a refused PoW mounts the slider, which is then
-    dragged with real X input; when end-drags are refused the vision model
-    reads the gap position off the canvas.
+    passes found nothing. The challenge first asks for a Verify click
+    (the PoW does not run on load); when the PoW is accepted the search
+    reloads and the card unmounts, when it is refused a slider puzzle
+    mounts -- dragged with real X input, with the vision model reading
+    the gap position off the canvas when end-drags are refused.
     """
     await page.bring_to_front()
     if not await _brave_challenge_present(page, settle_ms):
         return False
-    slider = await _brave_wait_slider(page)
+    slider = await _brave_pow_stage(page, pointer)
     if slider is None:
-        # PoW cleared it (widget gone) or it never mounted a slider
+        # PoW accepted (card unmounted) or no slider ever mounted
         return not await _brave_widget_visible(page)
     return await _brave_drag_attempts(page, pointer)
 

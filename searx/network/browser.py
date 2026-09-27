@@ -2492,7 +2492,12 @@ class BrowserFetchPool:
         parse a silent zero-results success out of it.
         """
         # pylint: disable=import-outside-toplevel
-        from searx.network.human_input import _debug_dump, debug_trace_enabled, human_clear_challenge
+        from searx.network.human_input import (
+            _brave_widget_visible,
+            _debug_dump,
+            debug_trace_enabled,
+            human_clear_challenge,
+        )
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + max(8.0, min(timeout_s, 30.0))
@@ -2532,7 +2537,10 @@ class BrowserFetchPool:
                 except Exception:  # pylint: disable=broad-except
                     pass
                 if not _is_challenge_url(page.url):
-                    return True
+                    # Brave challenges render inline on the search URL (no
+                    # route change): the widget in the DOM is the only tell
+                    if not await _brave_widget_visible(page):
+                        return True
             solved = await human_clear_challenge(
                 page, pointer, settle_ms=_BOT_CHALLENGE_GRACE_MS
             )
