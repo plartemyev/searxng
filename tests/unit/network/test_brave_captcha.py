@@ -289,10 +289,17 @@ def test_verify_click_clears_pow(fast_sleep):
     card = page.add(
         ".captcha-card", box={"x": 400.0, "y": 300.0, "width": 400.0, "height": 300.0}
     )
+    # the lane locale is the IP's geo: on this deployment the label is Thai
     page.add(
         ".captcha-actions button.kind--filled",
         box={"x": 564.0, "y": 499.0, "width": 312.0, "height": 44.0},
-        text="Verify",
+        text="ยืนยัน",
+    )
+    # the escalation button next to it must stay untouched
+    page.add(
+        ".default-captcha-button",
+        box={"x": 564.0, "y": 560.0, "width": 312.0, "height": 36.0},
+        text="สลับไปใช้ CAPTCHA แบบดั้งเดิม",
     )
     pointer = FakePointer()
     original_down, original_up = pointer.mouse_down, pointer.mouse_up
@@ -322,15 +329,16 @@ def test_verify_click_clears_pow(fast_sleep):
     assert 597 <= click_y <= 605
 
 
-def test_switch_captcha_button_is_not_clicked(fast_sleep):
+def test_escalation_button_is_never_clicked(fast_sleep):
+    # only the secondary "Switch to traditional CAPTCHA" button is mounted:
+    # nothing matches the verify selectors, so no click and no escalation
     page = FakePage(url="https://search.brave.com/search?q=x")
-    card = page.add(
+    page.add(
         ".captcha-card", box={"x": 400.0, "y": 300.0, "width": 400.0, "height": 300.0}
     )
-    # the escalation button matches the selector but not the text guard
     page.add(
-        ".captcha-actions button.kind--filled",
-        box={"x": 564.0, "y": 499.0, "width": 312.0, "height": 44.0},
+        ".default-captcha-button",
+        box={"x": 564.0, "y": 560.0, "width": 312.0, "height": 36.0},
         text="Switch to traditional CAPTCHA",
     )
     pointer = FakePointer()
@@ -338,7 +346,6 @@ def test_switch_captcha_button_is_not_clicked(fast_sleep):
     async def check():
         with patch.object(human_input, "_BRAVE_POW_WAIT_S", 1.0):
             solved = await human_solve_brave_captcha(page, pointer)
-        # nothing cleared and nothing was clicked: unsolved, no escalation
         assert not solved
 
     _run(check)

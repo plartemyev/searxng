@@ -1134,8 +1134,10 @@ _BRAVE_CANVAS_SELECTOR = "canvas.captcha-canvas"
 _BRAVE_POW_WAIT_S = 12.0
 _BRAVE_CLEAR_WAIT_S = 8.0
 _BRAVE_DRAG_ATTEMPTS = 3
-# the PoW stage's Verify button ("Switch to traditional CAPTCHA" sits in
-# the same actions row and must not be clicked -- the text guard below)
+# the PoW stage's Verify button. The i18n follows the lane locale, so the
+# text is not a test -- the discriminator is structural: the Verify button
+# is the actions row's only kind--filled button ("Switch to traditional
+# CAPTCHA" renders with the secondary styling).
 _BRAVE_VERIFY_SELECTORS = (
     "button[name='captcha-button']",
     ".captcha-actions button.kind--filled",
@@ -1267,19 +1269,18 @@ async def _brave_challenge_present(page, settle_ms: int) -> bool:
 async def _brave_verify_button(page):
     """The PoW stage's Verify button, when the challenge is at that stage.
 
-    The actions row also holds "Switch to traditional CAPTCHA" -- only a
-    button whose text starts with "Verify" counts.
+    The i18n follows the lane's locale (a Thai IP gets "ยืนยัน"), so the
+    text cannot be the test: the Verify button is the actions row's only
+    ``kind--filled`` button -- "Switch to traditional CAPTCHA" renders
+    with the secondary styling instead.
     """
     for selector in _BRAVE_VERIFY_SELECTORS:
         locator = page.locator(selector).first
         try:
-            if not await locator.is_visible():
-                continue
-            text = (await locator.inner_text()).strip().lower()
+            if await locator.is_visible():
+                return locator
         except Exception:  # pylint: disable=broad-except
             continue
-        if text.startswith('verify'):
-            return locator
     return None
 
 
