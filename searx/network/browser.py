@@ -1442,8 +1442,19 @@ class BrowserFetchPool:
         instance first (lane launches need it), then force-restart each lane
         on the fresh instance.
         """
+        await self._restart_playwright()
+        await self._restart_stale_lanes()
+
+    async def _restart_stale_lanes(self) -> None:
+        """Force-restart every lane after the playwright instance was rebuilt.
+
+        The old lanes keep reporting themselves connected (the connected
+        flag is local to the dead transport), so the stale marker -- not an
+        aliveness check -- drives this.
+        """
         async with self._init_lock:
             if not self._lanes_stale:
+                # another task healed the pool while we waited for the lock
                 return
             logger.warning("Rebuilding the browser pool after the driver died")
             for lane in self._lanes:
@@ -1648,7 +1659,7 @@ class BrowserFetchPool:
         if self._lanes_stale:
             # the playwright instance was rebuilt after its driver died:
             # the aliveness flags below belong to the dead instance and lie
-            await self._heal_after_driver_death()
+            await self._restart_stale_lanes()
             return
         if all(self._lane_is_alive(lane) for lane in self._lanes):
             return

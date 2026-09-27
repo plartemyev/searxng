@@ -144,7 +144,7 @@ def test_ensure_alive_restarts_lanes_that_lie(pool, fake_playwright):
     assert not pool._lanes_stale
 
 
-def test_heal_without_stale_lanes_is_noop(pool, fake_playwright):
+def test_stale_lane_restart_without_stale_is_noop(pool, fake_playwright):
     liar = MagicMock()
     liar.browser.is_connected.return_value = True
     pool._lanes = [liar]
@@ -152,7 +152,37 @@ def test_heal_without_stale_lanes_is_noop(pool, fake_playwright):
     pool._restart_lane = AsyncMock()
 
     async def check():
-        await pool._heal_after_driver_death()
+        await pool._restart_stale_lanes()
 
     _run(check)
     pool._restart_lane.assert_not_awaited()
+
+
+def test_heal_rebuilds_instance_and_lanes(pool, fake_playwright):
+    factory, instance = fake_playwright
+    dead = MagicMock()
+    dead.stop = AsyncMock()
+    pool._playwright = dead
+    liar = MagicMock()
+    liar.browser.is_connected.return_value = True
+    pool._lanes = [liar]
+    pool._restart_lane = AsyncMock(side_effect=_capture_restart(pool))
+
+    async def check():
+        await pool._heal_after_driver_death()
+
+    _run(check)
+    # instance rebuilt, every lane restarted on it, marker cleared
+    dead.stop.assert_awaited_once()
+    assert pool._playwright is instance
+    pool._restart_lane.assert_awaited_once_with(liar)
+    assert not pool._lanes_stale
+
+
+def _capture_restart(pool):
+    async def _restart(lane):
+        # a restarted lane belongs to the fresh instance and reports alive
+        lane.browser.is_connected.return_value = True
+        return None
+
+    return _restart
