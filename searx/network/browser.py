@@ -1819,6 +1819,43 @@ class BrowserFetchPool:
 
     _SERP_HREF_RE = re.compile(r'href="([^"]+)"', re.IGNORECASE)
 
+    @staticmethod
+    def _unwrap_serp_href(url: str) -> str | None:
+        """The real target behind a search engine's outbound wrapper.
+
+        Lane memory must remember the URL a crawler will ask for: the
+        parser resolves wrappers server-side, so the JSON results carry
+        the resolved target while the SERP DOM carries the wrapper. The
+        common schemes are deterministic:
+        - duckduckgo: /l/?uddg=<urlencoded target>
+        - google: /url?q=<target> (or ?url=)
+        - bing: ?u=a1<base64url(target)>
+        brave/mojeek/... link directly and pass through unchanged.
+        """
+        try:
+            parts = urlsplit(url)
+            qs = parse_qs(parts.query)
+            host = (parts.hostname or "").lower()
+            if host.endswith("duckduckgo.com") and parts.path.startswith("/l/"):
+                target = qs.get("uddg", [None])[0]
+                return target
+            if (host == "google.com" or host.endswith(".google.com")) and parts.path == "/url":
+                return qs.get("q", qs.get("url", [None]))[0]
+            if (host == "bing.com" or host.endswith(".bing.com")) and "u" in qs:
+                u = qs["u"][0]
+                if u.startswith("a1"):
+                    import base64
+                    import re as _re
+
+                    raw = u[2:]
+                    if not _re.fullmatch(r"[A-Za-z0-9_-]+", raw):
+                        return None
+                    raw += "=" * (-len(raw) % 4)
+                    return base64.urlsafe_b64decode(raw).decode("utf-8", errors="replace")
+        except Exception:  # pylint: disable=broad-except
+            return None
+        return None
+
     def _record_serp_urls(self, lane: _Lane, request_url: str, response) -> None:
         """Remember the result links a lane's search returned (last 100).
 
@@ -1859,6 +1896,16 @@ class BrowserFetchPool:
                     continue
             if resolved not in recorded:
                 recorded.append(resolved)
+            # also remember the resolved target: crawls ask for the URL the
+            # parser produced, not for the engine's outbound wrapper
+            target = self._unwrap_serp_href(resolved)
+            if target and target not in recorded:
+                try:
+                    tparts = urlsplit(target)
+                    if tparts.scheme in ("http", "https") and tparts.hostname:
+                        recorded.append(target)
+                except ValueError:
+                    pass
         if recorded:
             lane.serp_urls.extend(recorded)
             logger.info(
