@@ -233,6 +233,12 @@ class SerpCache:
             payload = zstd.ZstdCompressor(level=_compression_level()).compress(
                 json.dumps(envelope, separators=_JSON_SEPARATORS).encode("utf-8")
             )
+        except Exception:  # pylint: disable=broad-except
+            # a serializable-envelope guarantee is the caller's job; a
+            # cache must never take the search down with it
+            log.warning("serp-cache: envelope serialization failed", exc_info=True)
+            return
+        try:
             self._conn.execute(
                 "INSERT OR REPLACE INTO serp_cache"
                 " (key, query, lang, pageno, created_at, expires_at, payload)"
@@ -339,11 +345,14 @@ class RequestContext:
         blocks = getattr(result_container, "serp_cache_blocks", None)
         if blocks is None:
             return
-        fresh = {
-            name: dump
-            for name, dump in blocks.items()
-            if name and dump
-        }
+        fresh: dict[str, list[dict]] = {}
+        for name, raw_results in blocks.items():
+            if not name or not raw_results:
+                continue
+            try:
+                fresh[name] = dump_results(raw_results)
+            except Exception:  # pylint: disable=broad-except
+                log.debug("serp-cache: serializing %s failed", name, exc_info=True)
         if not fresh:
             return
         if self.entry is not None:

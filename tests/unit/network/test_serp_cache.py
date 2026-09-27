@@ -207,6 +207,8 @@ class TestRequestContext:
 
     def test_miss_writes_entry_on_finish(self, cache, monkeypatch):
         monkeypatch.setattr(serp_cache, "get_cache", lambda: cache)
+        from searx.result_types import Image  # pylint: disable=import-outside-toplevel
+
         query = _query()
         key = serp_cache.canonical_key(query)
 
@@ -215,9 +217,13 @@ class TestRequestContext:
         requests = [("google", "lorem ipsum", {})]
         assert [r[0] for r in ctx.apply(container, requests)] == ["google"]
 
-        container.serp_cache_blocks = {"google": [{"url": "https://a.example"}]}
+        # production stores RAW result objects (msgspec structs), not dicts
+        raw = Image(title="a", url="https://a.example", img_src="https://a.example")
+        container.serp_cache_blocks = {"google": [raw]}
         ctx.finish(container)
-        assert cache.lookup(key).blocks["google"]
+        loaded = cache.lookup(key)
+        assert loaded.blocks["google"]
+        assert loaded.blocks["google"][0]["__type"] == "Image"
 
     def test_empty_blocks_are_not_cached(self, cache, monkeypatch):
         monkeypatch.setattr(serp_cache, "get_cache", lambda: cache)
