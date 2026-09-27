@@ -685,7 +685,7 @@ def _canonical_serp_url(url: str) -> str:
         essential = [(k, v) for k, v in parse_qsl(parts.query) if k in keep]
         if not essential:
             return url
-        return urlunparse(parts._replace(query=urlencode(essential)))
+        return parts._replace(query=urlencode(essential)).geturl()
     except Exception:  # pylint: disable=broad-except
         return url
 
