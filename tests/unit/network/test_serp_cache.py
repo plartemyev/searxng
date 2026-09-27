@@ -154,17 +154,22 @@ class TestResultSerialization:
         assert loaded[0]["title"] == "t"
 
     def test_container_managed_keys_are_stripped(self):
-        """engines/parsed_url are rebuilt by the container: a snapshot that
-        carries them (e.g. a set -> list) must not crash the replay."""
+        """A snapshot carrying container-managed keys (a set -> list for
+        engines, a SplitResult -> list for parsed_url) must not poison the
+        rebuilt item: LegacyResult re-derives both with proper types."""
         from searx.result_types import LegacyResult  # pylint: disable=import-outside-toplevel
 
         dumped = serp_cache.dump_results(
-            [{"url": "https://a.example", "engines": {"brave"}, "parsed_url": None}]
+            [{"url": "https://a.example", "engines": {"brave"}, "parsed_url": ["x"] * 6}]
         )
         loaded = serp_cache.load_results(dumped)
-        assert isinstance(loaded[0], LegacyResult)
-        assert "engines" not in loaded[0]
-        assert "parsed_url" not in loaded[0]
+        item = loaded[0]
+        assert isinstance(item, LegacyResult)
+        # re-derived with proper types, not the poisoned list
+        assert isinstance(item["engines"], set)
+        assert item["engines"] == set()
+        assert item["parsed_url"] is None
+        assert item["url"] == "https://a.example"
 
     def test_unrebuildable_block_degrades_to_live_fetch(self, cache, monkeypatch):
         """A poisoned block must never fail the search: the engine is
