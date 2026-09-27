@@ -114,6 +114,20 @@ def dump_results(results: "EngineResults") -> list[dict]:
     return dumped
 
 
+# container-managed fields: rebuilt by ResultContainer.extend /
+# normalize_result_fields, must not be carried through the cache
+_CONTAINER_MANAGED_KEYS = ("parsed_url", "engines")
+
+
+def _legacy_snapshot(snapshot: dict) -> "LegacyResult":
+    # pylint: disable=import-outside-toplevel
+    from searx.result_types import LegacyResult
+
+    return LegacyResult(
+        {k: v for k, v in snapshot.items() if k not in _CONTAINER_MANAGED_KEYS}
+    )
+
+
 def load_results(blocks: list[dict]) -> "list[Result | LegacyResult]":
     """Rebuild result items from their cached snapshots.
 
@@ -129,17 +143,17 @@ def load_results(blocks: list[dict]) -> "list[Result | LegacyResult]":
         snapshot = dict(snapshot)
         type_name = snapshot.pop("__type", _LEGACY_TAG)
         if type_name == _LEGACY_TAG:
-            results.append(LegacyResult(snapshot))
+            results.append(_legacy_snapshot(snapshot))
             continue
         result_cls = getattr(ResultList.types, type_name, None)
         if result_cls is None:
-            results.append(LegacyResult(snapshot))
+            results.append(_legacy_snapshot(snapshot))
             continue
         try:
             results.append(msgspec.convert(snapshot, result_cls, strict=False))
         except Exception:  # pylint: disable=broad-except
             log.debug("serp-cache: could not rebuild a %s", type_name)
-            results.append(LegacyResult(snapshot))
+            results.append(_legacy_snapshot(snapshot))
     return results
 
 

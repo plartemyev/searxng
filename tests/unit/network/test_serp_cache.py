@@ -153,6 +153,19 @@ class TestResultSerialization:
         assert isinstance(loaded[0], LegacyResult)
         assert loaded[0]["title"] == "t"
 
+    def test_container_managed_keys_are_stripped(self):
+        """engines/parsed_url are rebuilt by the container: a snapshot that
+        carries them (e.g. a set -> list) must not crash the replay."""
+        from searx.result_types import LegacyResult  # pylint: disable=import-outside-toplevel
+
+        dumped = serp_cache.dump_results(
+            [{"url": "https://a.example", "engines": {"brave"}, "parsed_url": None}]
+        )
+        loaded = serp_cache.load_results(dumped)
+        assert isinstance(loaded[0], LegacyResult)
+        assert "engines" not in loaded[0]
+        assert "parsed_url" not in loaded[0]
+
     def test_unrebuildable_block_degrades_to_live_fetch(self, cache, monkeypatch):
         """A poisoned block must never fail the search: the engine is
         simply fetched live instead."""
