@@ -29,3 +29,18 @@ class TestUnwrapSerpHref:
     def test_garbage_is_safe(self):
         assert unwrap("https://www.bing.com/ck/a?u=a1%%%broken") is None
         assert unwrap("not a url at all") is None
+
+
+class TestCanonicalSerpUrl:
+    def test_google_goto_keeps_only_token(self):
+        from searx.network.browser import _canonical_serp_url
+
+        noisy = (
+            "https://www.google.com/goto?url=CAESYwHr&sa=U&ved=2ahUKEwj&usg=AOvVaw"
+        )
+        assert _canonical_serp_url(noisy) == "https://www.google.com/goto?url=CAESYwHr"
+
+    def test_plain_urls_pass_through(self):
+        from searx.network.browser import _canonical_serp_url
+
+        assert _canonical_serp_url("https://example.org/a?b=1") == "https://example.org/a?b=1"

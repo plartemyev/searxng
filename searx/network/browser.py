@@ -658,6 +658,38 @@ def _registrable_site(host: str | None) -> str:
     return ".".join(labels[-2:])
 
 
+def _canonical_serp_url(url: str) -> str:
+    """The stable form of a SERP wrapper link: scheme, host, path and the
+    one query parameter that carries the destination.
+
+    The SERP DOM decorates wrappers with volatile tracking parameters
+    (``sa``, ``ved``, ``usg``, ...), while the parsed results the crawlers
+    ask for carry the bare form. Storing the bare form is what lets a
+    crawl of a parsed result match the lane memory at all.
+    """
+    try:
+        parts = urlsplit(url)
+        host = (parts.hostname or "").lower()
+        path = parts.path
+        keep: tuple[str, ...] | None = None
+        if (host == "google.com" or host.endswith(".google.com")) and (
+            path == "/goto" or path == "/url"
+        ):
+            keep = ("url", "q")
+        elif host.endswith("duckduckgo.com") and path.startswith("/l/"):
+            keep = ("uddg",)
+        elif (host == "bing.com" or host.endswith(".bing.com")) and path.startswith("/ck/"):
+            keep = ("u",)
+        if not keep:
+            return url
+        essential = [(k, v) for k, v in parse_qsl(parts.query) if k in keep]
+        if not essential:
+            return url
+        return urlunparse(parts._replace(query=urlencode(essential)))
+    except Exception:  # pylint: disable=broad-except
+        return url
+
+
 def _bing_wrapper_target(resolved: str) -> str | None:
     """Decoded target of a bing ``/ck/a`` wrapper link, when parseable.
 
@@ -1906,6 +1938,11 @@ class BrowserFetchPool:
                         recorded.append(target)
                 except ValueError:
                     pass
+            # and the bare wrapper form (tracking params stripped): the
+            # parsed results carry it, undecodable wrappers included
+            canonical = _canonical_serp_url(resolved)
+            if canonical != resolved and canonical not in recorded:
+                recorded.append(canonical)
         if recorded:
             lane.serp_urls.extend(recorded)
             logger.info(
