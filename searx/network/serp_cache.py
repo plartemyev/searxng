@@ -106,6 +106,9 @@ def dump_results(results: "EngineResults") -> list[dict]:
         except Exception:  # pylint: disable=broad-except
             log.debug("serp-cache: undumpable result item skipped", exc_info=True)
             continue
+        # parsed_url is a urllib SplitResult (JSON-unfriendly) and fully
+        # derived from url: drop it, normalization rebuilds it on load
+        snapshot.pop("parsed_url", None)
         snapshot["__type"] = type(item).__name__
         dumped.append(snapshot)
     return dumped
