@@ -57,19 +57,19 @@ def _data_dir() -> str:
 
 
 def enabled() -> bool:
-    return bool(get_setting("search_cache.enabled", False))
+    return bool(get_setting("outgoing.search_cache.enabled", False))
 
 
 def _ttl_seconds() -> float:
-    return max(1.0, float(get_setting("search_cache.ttl_seconds", 24 * 3600)))
+    return max(1.0, float(get_setting("outgoing.search_cache.ttl_seconds", 24 * 3600)))
 
 
 def _prune_interval() -> int:
-    return max(1, int(get_setting("search_cache.prune_interval_writes", 50)))
+    return max(1, int(get_setting("outgoing.search_cache.prune_interval_writes", 50)))
 
 
 def _compression_level() -> int:
-    return max(1, min(22, int(get_setting("search_cache.compression_level", 3))))
+    return max(1, min(22, int(get_setting("outgoing.search_cache.compression_level", 3))))
 
 
 def canonical_key(search_query: "SearchQuery") -> str:
@@ -276,7 +276,7 @@ def get_cache() -> SerpCache | None:
         return None
     if _cache is None:
         path = str(
-            get_setting("search_cache.path")
+            get_setting("outgoing.search_cache.path")
             or os.path.join(_data_dir(), "serp_cache.sqlite3")
         )
         try:
