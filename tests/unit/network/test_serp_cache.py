@@ -269,7 +269,9 @@ class TestRequestContext:
         assert loaded.blocks["google"]
         assert loaded.blocks["google"][0]["__type"] == "Image"
 
-    def test_empty_blocks_are_not_cached(self, cache, monkeypatch):
+    def test_empty_success_is_cached(self, cache, monkeypatch):
+        """A niche engine that legitimately returns zero results must be
+        part of the entry: otherwise every hit refetches it live."""
         monkeypatch.setattr(serp_cache, "get_cache", lambda: cache)
         query = _query()
         key = serp_cache.canonical_key(query)
@@ -279,7 +281,9 @@ class TestRequestContext:
         ctx.apply(container, [("google", "lorem ipsum", {})])
         container.serp_cache_blocks = {"google": []}
         ctx.finish(container)
-        assert cache.lookup(key) is None
+        loaded = cache.lookup(key)
+        assert loaded is not None
+        assert loaded.blocks["google"] == []
 
     def test_broken_cache_never_breaks_the_search(self, monkeypatch, tmp_path):
         """An unreadable store path degrades to no caching, not to errors."""

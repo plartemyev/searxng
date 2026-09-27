@@ -380,7 +380,7 @@ class RequestContext:
             return
         fresh: dict[str, list[dict]] = {}
         for name, raw_results in blocks.items():
-            if not name or not raw_results:
+            if not name:
                 continue
             try:
                 fresh[name] = dump_results(raw_results)

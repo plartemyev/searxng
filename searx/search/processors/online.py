@@ -252,12 +252,14 @@ class OnlineProcessor(EngineProcessor):
     ):
         """Hand this engine's parsed results to the SERP cache capture.
 
-        Only successful, non-empty responses are recorded: an engine that
-        errored or returned nothing must not poison a cache entry. The
-        buffer is absent unless the search flow enabled caching.
+        A successful response is recorded even when it parsed to zero
+        results (niche engines on narrow queries): the cache must cover
+        the whole engine set or every hit degenerates into a live
+        refetch. Only engines that errored are left out. The buffer is
+        absent unless the search flow enabled caching.
         """
         blocks = getattr(result_container, "serp_cache_blocks", None)
-        if blocks is None or not search_results:
+        if blocks is None or search_results is None:
             return
         try:
             blocks[self.engine.name] = list(search_results)
