@@ -1036,6 +1036,36 @@ def _detect_ip_locale() -> dict:
     return _ip_locale_cache
 
 
+# A meta charset declaration, in either attribute order (bing writes
+# `<meta content="...charset=utf-8" http-equiv="content-type">`) and as the
+# HTML5 shorthand (`<meta charset="utf-8">`). Matched on the raw bytes so it
+# works whatever the document encoding is: charset names are ASCII.
+_META_TAG_RE = re.compile(rb"<meta[^>]{0,400}>", re.IGNORECASE)
+_META_CHARSET_RE = re.compile(rb"""charset\s*=\s*["']?\s*([A-Za-z0-9._:-]+)""", re.IGNORECASE)
+
+
+def _sniff_meta_charset(head: bytes) -> str | None:
+    """The charset the page declares itself, or None.
+
+    Only consulted when the HTTP headers carry no charset: the header wins
+    per the HTTP spec. Scans the leading tags only -- the declaration must
+    sit in the document head to mean anything.
+    """
+    for meta in _META_TAG_RE.findall(head):
+        match = _META_CHARSET_RE.search(meta)
+        if match:
+            try:
+                name = match.group(1).decode("ascii")
+            except UnicodeDecodeError:
+                continue
+            if name.lower() in ("unicode", "utf-8", "utf8"):
+                # a bogus 'unicode' declaration must not shadow the
+                # utf-8 fallback below (Python rejects it)
+                return "utf-8"
+            return name
+    return None
+
+
 class BrowserResponse:
     """Duck-typed replacement for :class:`SXNG_Response` (curl_cffi).
 
@@ -1105,8 +1135,16 @@ class BrowserResponse:
         return json.loads(self.text, **kwargs)
 
     def html(self):
-        """Parses the result into a HTML document via :py:obj:`lxml.html`."""
-        return html.fromstring(self.content)
+        """Parses the result into a HTML document via :py:obj:`lxml.html`.
+
+        Mirrors upstream :py:obj:`searx.extended_types.SXNG_Response.html`:
+        the parser gets the decoded text, never raw bytes. On bytes,
+        libxml2 guesses the encoding itself and its sniffer misses
+        declarations like bing's
+        ``<meta content="...charset=utf-8" http-equiv="content-type">`` --
+        non-ASCII results then garble (UTF-8 read back as Latin-1).
+        """
+        return html.fromstring(self._decoded_text())
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -1683,11 +1721,19 @@ class BrowserFetchPool:
         if all(self._lane_is_alive(lane) for lane in self._lanes):
             return
         async with self._init_lock:
-            for lane in self._lanes:
-                if self._lane_is_alive(lane):
-                    continue
-                logger.warning("Lane's browser process is gone; restarting the lane")
-                await self._restart_lane(lane)
+            # re-check under the lock: a concurrent fetch may have restarted
+            # the dead lanes while this caller waited for the lock
+            dead = [lane for lane in self._lanes if not self._lane_is_alive(lane)]
+            if not dead:
+                return
+            # launch in parallel: a serial restart costs 10-20s per
+            # persistent-profile lane and blows the engine budget of the
+            # whole burst that arrives after an idle reap (same rationale
+            # as the parallel launch in _init)
+            logger.warning(
+                "Restarting %d dead browser lane(s) in parallel", len(dead)
+            )
+            await asyncio.gather(*(self._restart_lane(lane) for lane in dead))
 
     @staticmethod
     def _lane_is_alive(lane: _Lane) -> bool:
