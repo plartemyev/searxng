@@ -1,19 +1,24 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""Masqueraded Chromium fetch pool for engine requests.
+"""Masqueraded Firefox fetch pool for engine requests.
 
 When ``outgoing.using_browser`` is enabled in settings.yml, engine HTTP
-requests are served by a real, Playwright-driven Chromium instead of the
+requests are served by a real, Playwright-driven Firefox instead of the
 curl_cffi client. The browser is tuned to look like a user-started browser
 (the same posture the Onyx web crawler uses):
 
-- a distro-packaged Chromium binary (not Playwright's bundled fork, which
-  ships automation-friendly defaults detectors fingerprint)
-- Playwright's automation-flavored default launch args stripped
+- a distro-packaged Firefox binary (not Playwright's bundled fork, which
+  ships automation-friendly defaults detectors fingerprint), driven over
+  Firefox's native WebDriver BiDi protocol via Playwright's ``moz-firefox``
+  channel -- no patched browser build involved
 - headed under auto-started Xvfb displays, one per lane (headless is a
   strong bot signal even in "new" headless mode)
-- UA and Client Hints derived from the real binary version, and a page-side
-  init script aligning ``navigator.platform``, WebGL vendor/renderer,
-  plugins and ``userAgentData`` with those claims
+- the binary's own user agent (SearXNG's native UA persona is already
+  Firefox), and a page-side init script aligning ``navigator.webdriver``,
+  ``navigator.languages`` and WebGL vendor/renderer claims with the
+  Linux-desktop persona
+
+A distro Chromium binary is used instead when no Firefox is present (the
+original fleet posture), so older images keep working.
 
 GET requests use a fetch-style ``context.request.get`` (browser TLS stack +
 cookie jar, no page render). On a bot challenge (Cloudflare interstitial,
@@ -92,6 +97,12 @@ _CHROMIUM_CANDIDATE_PATHS = (
     "/usr/bin/google-chrome",
 )
 
+_FIREFOX_CANDIDATE_PATHS = (
+    "/usr/bin/firefox",
+    "/usr/bin/firefox-developer-edition",
+    "/usr/bin/firefox-nightly",
+)
+
 _XVFB_BASE_DISPLAY = 99
 _XVFB_GEOMETRY = "1440x900x24"
 
@@ -108,14 +119,14 @@ _PR_SET_MEMORY_MERGE = 67  # linux/prctl.h, kernel >= 6.4
 def _enable_ksm_merge() -> bool:
     """Mark this process tree mergeable for the host's ksmd.
 
-    The six headed Chromium lanes duplicate large anonymous regions (V8
+    The six headed browser lanes duplicate large anonymous regions (browser
     startup heaps, decoded static assets, idle reader tabs); KSM merges
     those pages host-side. The flag lives on the mm and is inherited
-    through fork, so one call before the lanes launch covers Chromium,
-    Xvfb, and their helpers. Chromium never calls madvise(MERGEABLE)
-    itself, and the KSM switch is host-global, so without this the
-    daemon has nothing to scan. Harmless no-op when the kernel is older
-    than 6.4 or KSM is disabled on the host.
+    through fork, so one call before the lanes launch covers the browsers,
+    Xvfb, and their helpers. Neither Firefox nor Chromium calls
+    madvise(MERGEABLE) itself, and the KSM switch is host-global, so
+    without this the daemon has nothing to scan. Harmless no-op when the
+    kernel is older than 6.4 or KSM is disabled on the host.
     """
     try:
         import ctypes
@@ -138,15 +149,36 @@ class CrawlBodyTooLarge(BrowserFetchError):
     """Raised when a crawled body exceeds the configured size cap."""
 
 
-def _discover_chromium():
-    """Locate a Chromium binary: explicit env config, then distro paths."""
-    env_path = os.environ.get("SEARXNG_CHROMIUM_EXECUTABLE_PATH")
+def _discover_browser() -> tuple[str, str | None]:
+    """Locate the pool's browser binary: ``(kind, path)``.
+
+    ``kind`` is ``"firefox"`` or ``"chromium"`` and selects the Playwright
+    browser type and launch posture. A distro Firefox is the fleet's
+    persona (SearXNG's native UA persona is Firefox, and Firefox has no
+    Client-Hint surface to keep aligned); a distro Chromium is the
+    fallback. ``path`` is None when nothing was found, in which case the
+    caller warns and Playwright falls back to its own bundled browser.
+
+    ``SEARXNG_BROWSER_EXECUTABLE_PATH`` (or the legacy
+    ``SEARXNG_CHROMIUM_EXECUTABLE_PATH``) pins an explicit binary;
+    ``SEARXNG_BROWSER_KIND`` pins the kind when the file name is not
+    recognizable.
+    """
+    env_path = os.environ.get("SEARXNG_BROWSER_EXECUTABLE_PATH") or os.environ.get(
+        "SEARXNG_CHROMIUM_EXECUTABLE_PATH"
+    )
     if env_path and os.path.isfile(env_path):
-        return env_path
+        kind = os.environ.get("SEARXNG_BROWSER_KIND", "").strip().lower()
+        if kind not in ("firefox", "chromium"):
+            kind = "firefox" if "firefox" in os.path.basename(env_path) else "chromium"
+        return kind, env_path
+    for candidate in _FIREFOX_CANDIDATE_PATHS:
+        if os.path.isfile(candidate):
+            return "firefox", candidate
     for candidate in _CHROMIUM_CANDIDATE_PATHS:
         if os.path.isfile(candidate):
-            return candidate
-    return None
+            return "chromium", candidate
+    return "firefox", None
 
 
 def _lane_display_number(lane_index: int) -> int:
@@ -160,11 +192,36 @@ def _cleanup_stale_x_locks(display_number: int) -> None:
     The container filesystem survives restarts while processes do not: a
     stale lock for the display makes a freshly started Xvfb exit at once,
     and a stale socket then looks like a working display.
+
+    A lock held by a LIVE X server is not stale: removing its socket file
+    would not disturb the server or its existing clients (the socket
+    binding survives in kernel space), but every future client -- this
+    pool's own human input layer included -- could no longer connect. That
+    is exactly what happens when a second pool process in the same
+    container (debug probe, Onyx worker) calls ensure_display on a display
+    this pool already serves. X lock files record the server's PID, and
+    the cmdline check guards against PID reuse, so a live server's
+    display is left alone and the second Xvfb fails to bind (harmless:
+    the caller falls back to headless).
     """
+    lock_path = f"/tmp/.X{display_number}-lock"  # noqa: S108
     stale_paths = (
-        f"/tmp/.X{display_number}-lock",  # noqa: S108
+        lock_path,
         f"/tmp/.X11-unix/X{display_number}",  # noqa: S108
     )
+    try:
+        with open(lock_path, encoding="ascii") as lock_file:
+            owner_pid = int(lock_file.read().strip())
+    except (OSError, ValueError):
+        owner_pid = None
+    if owner_pid is not None:
+        try:
+            with open(f"/proc/{owner_pid}/cmdline", "rb") as proc_file:
+                owner_cmd = proc_file.read().decode("utf-8", errors="replace")
+            if "Xvfb" in owner_cmd or "Xorg" in owner_cmd:
+                return  # live X server owns this display: leave it alone
+        except OSError:
+            pass  # PID gone: the lock is genuinely stale
     for path in stale_paths:
         try:
             os.remove(path)
@@ -269,7 +326,9 @@ def ensure_display(lane_index: int = 0):
 
 # Playwright's default launch args tilt toward automation and test farms.
 # Dropping these makes the launched browser arg-for-arg closer to a
-# user-started one.
+# user-started one. (Chromium only: the Firefox/BiDi launch path adds no
+# automation-flavored args of its own, so there is nothing to strip --
+# see _LAUNCH_ARGS_FIREFOX.)
 _OMIT_DEFAULT_ARGS = [
     "--enable-automation",
     "--disable-background-networking",
@@ -324,15 +383,77 @@ _LAUNCH_ARGS = [
     "--window-size=1440,900",
 ]
 
+# Firefox launch args. Playwright's moz-firefox (WebDriver BiDi) path
+# already adds only neutral args (--remote-debugging-port=0, --foreground,
+# --profile <dir>), and unknown Chromium flags would just be ignored by
+# Firefox -- so the list stays minimal. Firefox understands --window-size
+# natively (same rationale as for Chromium above: the physical window must
+# match the space the human input layer maps page coordinates into).
+_LAUNCH_ARGS_FIREFOX = [
+    "--window-size=1440,900",
+]
 
-def _stealth_init_script(language_tags: list[str]) -> str:
+# Prefs layered over Playwright's moz-firefox profile builder. Playwright
+# writes a test-farm profile (see its firefoxPrefs.ts): timers zeroed, ETP
+# off, distro add-ons blocked, cosmetic animations cut. Several of those
+# are timing/behavior fingerprints a page can read, and one blocks the
+# fleet's uBlock Origin. These overrides move the profile back to what a
+# distro Firefox install runs as; the automation-safe bits (crash reporter
+# off, updates off, first-run pages off) stay as Playwright set them.
+_FIREFOX_USER_PREFS = {
+    # The Arch firefox-ublock-origin package installs uBlock as a
+    # distribution extension; Playwright disables exactly those for tests.
+    "extensions.installDistroAddons": True,
+    # Stock ETP posture (Total Cookie Protection on, the release default);
+    # Playwright sets cookieBehavior0 / -tp so tests don't fight cookie
+    # partitioning.
+    "browser.contentblocking.features.standard": (
+        "tp,tpPrivate,cookieBehavior5,-cm,-fp"
+    ),
+    # Stock background-timer budgets: Playwright zeroes both, and a page
+    # probing Worker/setTimeout timing in a background tab reads the zero.
+    "dom.min_background_timeout_value": 1000,
+    "dom.min_background_timeout_value_without_budget_throttling": 10000,
+    # Stock Safe Browsing and popup blocker (Playwright turns both off for
+    # deterministic tests; a real desktop runs them, and the Safe Browsing
+    # list traffic is part of a normal browser's network look).
+    "browser.safebrowsing.downloads.enabled": True,
+    "browser.safebrowsing.malware.enabled": True,
+    "browser.safebrowsing.phishing.enabled": True,
+    "dom.disable_open_during_load": True,
+    # Stock cosmetics/network behavior that Playwright disabled.
+    "javascript.options.showInConsole": False,
+    "toolkit.cosmeticAnimations.enabled": True,
+    "network.http.speculative-parallel-limit": 6,
+}
+
+
+def _stealth_init_script(browser_kind: str, language_tags: list[str]) -> str:
     """Init script with anti-automation patches only.
 
-    The lane presents the binary's real identity (distro Chromium, Linux,
-    IP-derived locale): kernel, TLS stack and Client-Hint headers already
-    say Linux Chrome, so anything claimed in JS must agree -- a Windows
-    persona here would be contradicted on the wire by every other layer.
+    The lane presents the binary's real identity (distro Firefox or
+    Chromium, Linux, IP-derived locale): kernel, TLS stack and UA already
+    say what the binary is, so anything claimed in JS must agree -- a
+    Windows persona here would be contradicted on the wire by every other
+    layer. The one lie is the GPU: the VM renders via llvmpipe (a classic
+    bot signal), so the unmasked WebGL vendor/renderer are claimed as a
+    common desktop GPU of the platform -- ANGLE/NVIDIA strings for
+    Chromium, Mesa/Intel strings for Firefox (Firefox does not wrap GL in
+    ANGLE; its renderer strings carry no "ANGLE (" prefix).
     """
+    if browser_kind == "firefox":
+        gl_claims = """
+        if (param === 37445) return 'Mesa';
+        if (param === 37446) {
+            return 'Mesa Intel(R) UHD Graphics 620 (KBL GT2)';
+        }"""
+    else:
+        gl_claims = """
+        if (param === 37445) return 'Google Inc. (NVIDIA)';
+        if (param === 37446) {
+            return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1650/PCIe/SSE2,'
+                   + ' OpenGL 4.5.0 NVIDIA 550.107.02)';
+        }"""
     return """
     Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
     Object.defineProperty(navigator, 'languages',
@@ -342,17 +463,15 @@ def _stealth_init_script(language_tags: list[str]) -> str:
         proto.getParameter = function (param) {
             // UNMASKED_VENDOR_WEBGL / UNMASKED_RENDERER_WEBGL: the VM has
             // no GPU and would report llvmpipe, a classic bot signal.
-            if (param === 37445) return 'Google Inc. (NVIDIA)';
-            if (param === 37446) {
-                return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1650/PCIe/SSE2,'
-                       + ' OpenGL 4.5.0 NVIDIA 550.107.02)';
-            }
+            __GL_CLAIMS__
             return orig.call(this, param);
         };
     };
     if (window.WebGLRenderingContext) patchGL(WebGLRenderingContext.prototype);
     if (window.WebGL2RenderingContext) patchGL(WebGL2RenderingContext.prototype);
-    """.replace("__LANGUAGES__", json.dumps(language_tags))
+    """.replace("__LANGUAGES__", json.dumps(language_tags)).replace(
+        "__GL_CLAIMS__", gl_claims
+    )
 
 
 def _language_tags(accept_language: str) -> list[str]:
@@ -1171,7 +1290,7 @@ class _Lane:
     """One browser process on its own X display, serving one request.
 
     One browser per lane (not one browser with N contexts) is what makes
-    per-lane displays possible: a Chromium process binds a single display.
+    per-lane displays possible: a browser process binds a single display.
     In exchange, a lane crash takes down only its own lane. ``browser`` may
     be None for a persistent-context lane on some playwright versions; the
     context is then the aliveness signal.
@@ -1181,6 +1300,9 @@ class _Lane:
         self.browser = browser
         self.context = context
         self.display = display
+        # "firefox" or "chromium" -- the binary kind this lane launched
+        # (selects relaunch posture and the stealth init persona)
+        self.browser_kind = "firefox"
         # flock handle for the lane's persistent profile (see
         # _acquire_profile_lock); None for ephemeral lanes
         self.profile_lock = None
@@ -1202,13 +1324,14 @@ class _Lane:
 
 
 def _acquire_profile_lock(profile_path: str, lane_index: int):
-    """Cross-process exclusivity for a persistent Chromium profile dir.
+    """Cross-process exclusivity for a persistent browser profile dir.
 
     The profile dir can live on a docker volume shared with other browser
-    operators (e.g. Onyx's crawler workers). Chromium keeps a SingletonLock
-    per profile, so a second browser on the same dir would corrupt it; an
-    flock on a sibling lockfile lets a lane whose profile is in use run
-    with an ephemeral context instead. The caller holds the returned handle
+    operators (e.g. Onyx's crawler workers). Browsers keep a singleton lock
+    per profile (Chromium's SingletonLock, Firefox's lock/.parentlock), so
+    a second browser on the same dir would corrupt it; an flock on a
+    sibling lockfile lets a lane whose profile is in use run with an
+    ephemeral context instead. The caller holds the returned handle
     for the browser's lifetime.
     """
     import fcntl
@@ -1359,12 +1482,14 @@ class BrowserFetchPool:
                     "pip install playwright"
                 ) from e
 
-            executable_path = _discover_chromium()
+            executable_path: str | None
+            browser_kind, executable_path = _discover_browser()
             if executable_path is None:
                 logger.warning(
-                    "No distro Chromium found (looked in %s); using Playwright's"
-                    " bundled browser, which is easier for bot detectors to"
-                    " fingerprint",
+                    "No distro Firefox or Chromium found (looked in %s and"
+                    " %s); using Playwright's bundled browser, which is"
+                    " easier for bot detectors to fingerprint",
+                    ", ".join(_FIREFOX_CANDIDATE_PATHS),
                     ", ".join(_CHROMIUM_CANDIDATE_PATHS),
                 )
 
@@ -1381,7 +1506,7 @@ class BrowserFetchPool:
                 self._lanes.extend(
                     await asyncio.gather(
                         *(
-                            self._launch_lane(lane_index, executable_path)
+                            self._launch_lane(lane_index, browser_kind, executable_path)
                             for lane_index in range(self._pool_size)
                         )
                     )
@@ -1393,9 +1518,10 @@ class BrowserFetchPool:
                 if self._profile_dir:
                     self._reaper_task = asyncio.create_task(self._reap_loop())
                 logger.info(
-                    "Browser fetch pool up: %d lane(s) on displays %s, chromium=%s",
+                    "Browser fetch pool up: %d lane(s) on displays %s, %s=%s",
                     len(self._lanes),
                     ",".join(lane.display or "headless" for lane in self._lanes),
+                    browser_kind,
                     self._lanes[0].browser.version if self._lanes[0].browser else "unknown",
                 )
             except Exception as e:
@@ -1416,8 +1542,13 @@ class BrowserFetchPool:
         the directory is not usable).
 
         One subdirectory per lane keeps the cookie jars fully isolated;
-        Chromium holds a singleton lock per profile, so the 1:1 mapping
+        browsers hold a singleton lock per profile, so the 1:1 mapping
         also prevents two browsers from ever sharing one jar.
+
+        NOTE: the per-lane subdirectories hold whatever browser kind this
+        image runs (Firefox profiles are not Chromium profiles). Switching
+        browser kinds means switching to a fresh volume -- the deployment's
+        experiment override mounts a separate one.
         """
         if not self._profile_dir:
             return None
@@ -1521,19 +1652,30 @@ class BrowserFetchPool:
                     logger.exception("Lane restart failed after the driver died")
             self._lanes_stale = False
 
-    async def _launch_lane(self, lane_index: int, executable_path: str | None) -> _Lane:
+    async def _launch_lane(
+        self, lane_index: int, browser_kind: str, executable_path: str | None
+    ) -> _Lane:
         """Launch one lane: its own browser process on its own X display."""
         loop = asyncio.get_running_loop()
         display = await loop.run_in_executor(None, ensure_display, lane_index)
         env = dict(os.environ)
         if display:
             env["DISPLAY"] = display
-        launch_kwargs = {
-            "headless": display is None,
-            "ignore_default_args": _OMIT_DEFAULT_ARGS,
-            "args": _LAUNCH_ARGS,
-            "env": env,
-        }
+        if browser_kind == "firefox":
+            launch_kwargs = {
+                "headless": display is None,
+                "channel": "moz-firefox",
+                "firefox_user_prefs": _FIREFOX_USER_PREFS,
+                "args": _LAUNCH_ARGS_FIREFOX,
+                "env": env,
+            }
+        else:
+            launch_kwargs = {
+                "headless": display is None,
+                "ignore_default_args": _OMIT_DEFAULT_ARGS,
+                "args": _LAUNCH_ARGS,
+                "env": env,
+            }
         if executable_path:
             launch_kwargs["executable_path"] = executable_path
         if self._proxy:
@@ -1544,20 +1686,29 @@ class BrowserFetchPool:
         if profile_path:
             profile_lock = _acquire_profile_lock(profile_path, lane_index)
         if profile_lock is not None and profile_path:
-            # The flock proves no live lane holds this profile, so any
-            # Chromium Singleton* symlinks left inside are from a dead
-            # container (e.g. OOM-killed). Chromium cannot verify a dead
-            # foreign hostname and would hang on its profile-in-use path,
-            # so remove them before relaunching.
-            for stale in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
-                try:
-                    os.remove(os.path.join(profile_path, stale))
-                except OSError:
-                    pass
+            if browser_kind == "firefox":
+                # Firefox pins a profile with `lock`/`.parentlock` symlinks;
+                # same stale-lock argument as the Chromium symlinks below.
+                for stale in ("lock", ".parentlock"):
+                    try:
+                        os.remove(os.path.join(profile_path, stale))
+                    except OSError:
+                        pass
+            else:
+                # The flock proves no live lane holds this profile, so any
+                # Chromium Singleton* symlinks left inside are from a dead
+                # container (e.g. OOM-killed). Chromium cannot verify a dead
+                # foreign hostname and would hang on its profile-in-use path,
+                # so remove them before relaunching.
+                for stale in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+                    try:
+                        os.remove(os.path.join(profile_path, stale))
+                    except OSError:
+                        pass
             # persistent profile: cookies, storage and earned clearances
             # survive lane crashes and process restarts
             context = await self._launch_with_driver_heal(
-                lambda: self._playwright.chromium.launch_persistent_context(
+                lambda: self._browser_type(browser_kind).launch_persistent_context(
                     profile_path, **launch_kwargs, **self._context_kwargs(geo)
                 )
             )
@@ -1566,22 +1717,35 @@ class BrowserFetchPool:
             _release_profile_lock(profile_lock)
             profile_lock = None
             browser = await self._launch_with_driver_heal(
-                lambda: self._playwright.chromium.launch(**launch_kwargs)
+                lambda: self._browser_type(browser_kind).launch(**launch_kwargs)
             )
             context = await browser.new_context(
                 **self._context_kwargs(geo)
             )
-        await context.add_init_script(_stealth_init_script(_language_tags(geo["accept_language"])))
+        await context.add_init_script(
+            _stealth_init_script(browser_kind, _language_tags(geo["accept_language"]))
+        )
         lane = _Lane(browser, context, display)
+        lane.browser_kind = browser_kind
         lane.profile_lock = profile_lock
         return lane
 
+    def _browser_type(self, browser_kind: str):
+        """Playwright's browser type object for the lane's binary kind."""
+        assert self._playwright is not None  # nosec - caller guarantees init
+        return (
+            self._playwright.firefox
+            if browser_kind == "firefox"
+            else self._playwright.chromium
+        )
+
     def _context_kwargs(self, geo: dict) -> dict:
         """Context options matching the IP-derived identity. The UA is left
-        at the binary's own value: kernel, TLS and Client-Hint headers say
-        Linux Chromium, so no override is needed or wanted."""
+        at the binary's own value: kernel, TLS and the UA header say what
+        the binary is (Firefox has no Client-Hint surface at all), so no
+        override is needed or wanted."""
         extra_headers = {
-            # Accept-Language only: Chromium sets Accept and the
+            # Accept-Language only: the browser sets Accept and the
             # Sec-Fetch-* headers per request itself. Forcing
             # navigation headers at context level stamps
             # "Sec-Fetch-Dest: document" onto every script and XHR,
@@ -1761,10 +1925,11 @@ class BrowserFetchPool:
                 await lane.browser.close()
             except Exception:  # pylint: disable=broad-except
                 pass
-        replacement = await self._launch_lane(lane_index, _discover_chromium())
+        replacement = await self._launch_lane(lane_index, lane.browser_kind, _discover_browser()[1])
         lane.browser = replacement.browser
         lane.context = replacement.context
         lane.display = replacement.display
+        lane.browser_kind = replacement.browser_kind
         lane.profile_lock = replacement.profile_lock
 
     async def close(self):
