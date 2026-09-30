@@ -1082,6 +1082,14 @@ class BrowserResponse:
             charset = (
                 content_type.split("charset=", 1)[1].split(";", 1)[0].strip().strip('"')
             )
+        if not charset:
+            # No header charset: trust the page's own declaration. Parsing
+            # raw bytes instead would leave the encoding to libxml2's
+            # sniffer, which misreads pages whose meta declaration it does
+            # not spot (e.g. bing's `<meta content="...charset=utf-8"
+            # http-equiv="content-type">`) and serves UTF-8 text as
+            # Latin-1 mojibake.
+            charset = _sniff_meta_charset(self.content[:4096])
         try:
             if charset:
                 return self.content.decode(charset, errors="replace")
