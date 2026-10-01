@@ -845,3 +845,106 @@ def test_ksm_merge_missing_libc_is_not_fatal(monkeypatch):
 
     monkeypatch.setattr("ctypes.CDLL", _boom, raising=True)
     assert browser_module._enable_ksm_merge() is False
+
+
+# --------------------------------------------------------------------------
+# solve-time pointer dwell (the human hand keeps drifting while the vision
+# votes run -- predominantly over the challenge widget)
+
+_PROFILE_STUB = SimpleNamespace(
+    frame_selectors=("iframe[src*='recaptcha/enterprise/bframe']",)
+)
+
+
+def _run(coro) -> None:
+    asyncio.run(coro)
+
+
+class _BoxedLocator:
+    def __init__(self, box):
+        self._box = box
+        self.first = self
+
+    async def is_visible(self):
+        return True
+
+    async def bounding_box(self):
+        return dict(self._box)
+
+
+class _DwellFakePage:
+    """Geometry provider for _to_screen / _viewport_size / widget box."""
+
+    def __init__(self, box):
+        self._box = box
+
+    def locator(self, _selector):
+        return _BoxedLocator(self._box)
+
+    async def evaluate(self, js):
+        if "outerWidth" in js:
+            # screen origin 0,0; 130px chrome (the Firefox CSD+toolbar)
+            return {"sx": 0, "sy": 0, "ow": 1280, "oh": 810, "iw": 1280, "ih": 680}
+        return [1280, 680]
+
+
+def test_dwell_drifts_predominantly_over_the_widget(monkeypatch):
+    async def check():
+        pointer = human_input_module._XPointer.__new__(human_input_module._XPointer)
+        pointer.size = lambda: (1440, 900)
+        pointer.position = lambda: (500, 400)
+        moves = []
+
+        def _move_to(x, y):
+            moves.append((x, y))
+
+        pointer.move_to = _move_to
+
+        async def fake_move(_p, _start, end, steps=0, control_jitter=(400, 200)):
+            moves.append(end)
+            if len(moves) >= 30:
+                stop.set()
+            return end
+
+        monkeypatch.setattr(
+            human_input_module, "human_like_real_mouse_move", fake_move
+        )
+
+        # widget box at viewport 300,150 size 400x500 -> screen y +130 chrome
+        stop = asyncio.Event()
+        page = _DwellFakePage({"x": 300, "y": 150, "width": 400, "height": 500})
+        await asyncio.wait_for(
+            human_input_module._human_dwell_over_widget(page, pointer, _PROFILE_STUB, stop),
+            timeout=30,
+        )
+
+        assert len(moves) >= 30
+        # every landing point stays on the physical screen
+        for x, y in moves:
+            assert 0 <= x < 1440 and 0 <= y < 900
+        # widget screen box: x 300..700, y 280..780 (viewport + 130px chrome);
+        # the middle-80% sampling inside it spans x 340..660, y 320..740.
+        def _in_widget(pt):
+            return 300 <= pt[0] <= 700 and 280 <= pt[1] <= 780
+
+        share = sum(1 for pt in moves if _in_widget(pt)) / len(moves)
+        assert share >= 0.55, f"widget share too low: {share:.2f}"
+
+    _run(check())
+
+
+def test_dwell_returns_promptly_when_stopped_upfront():
+    async def check():
+        pointer = human_input_module._XPointer.__new__(human_input_module._XPointer)
+        pointer.size = lambda: (1440, 900)
+        pointer.position = lambda: (500, 400)
+        pointer.move_to = lambda x, y: None
+        stop = asyncio.Event()
+        stop.set()
+        page = _DwellFakePage({"x": 300, "y": 150, "width": 400, "height": 500})
+        await asyncio.wait_for(
+            human_input_module._human_dwell_over_widget(page, pointer, _PROFILE_STUB, stop),
+            timeout=5,
+        )
+
+    _run(check())

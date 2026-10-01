@@ -325,10 +325,14 @@ class OpenAICompatVisionSolver:
         per_vote: list[set[int]] = []
         for vote in range(votes):
             # vote 0 pins the configured (usually greedy) temperature; the
-            # rest sample around it so the quorum can separate a stable
-            # answer from a flickering one
+            # rest sample at mildly rising temperatures so the quorum can
+            # separate a stable answer from a flickering one. The cap stays
+            # low: at 0.75-0.80 the local model flipped negated prompts
+            # (answered the direct question) and rambled preambles instead
+            # of answers -- decorrelation without wrecking instruction
+            # following.
             negate = vote % 2 == 1
-            temperature = self.cfg.temperature if vote == 0 else min(0.8, 0.25 * vote)
+            temperature = self.cfg.temperature if vote == 0 else min(0.55, 0.15 * vote)
             try:
                 answer = self.chat_vision(build_prompt(negate), images, temperature=temperature)
                 solution = parse(answer)

@@ -348,6 +348,96 @@ async def _human_idle(
         await human_like_real_mouse_move(pointer, anchor, target, steps=steps)
 
 
+async def _human_dwell_over_widget(
+    page,
+    pointer: _XPointer,
+    profile: '_ImageGridProfile',
+    stopped: asyncio.Event,
+    *,
+    widget_share: float = 0.8,
+) -> None:
+    """Idle-drift over the page while the vision solver thinks.
+
+    A solve holds the lane for minutes of model votes; a pointer frozen
+    for that whole span is its own tell, while a real hand keeps making
+    small corrections as the eyes work a puzzle. The pointer wanders in
+    short Bezier arcs with per-stop jitter -- predominantly over the
+    challenge widget (``widget_share`` of the stops: reading the puzzle),
+    occasionally elsewhere on the page. Runs until ``stopped`` is set;
+    any failure just ends the dwell (never the solve).
+    """
+    while not stopped.is_set():
+        try:
+            if random.random() < widget_share:  # noqa: S311
+                target = await _widget_screen_point(page, pointer, profile)
+            else:
+                target = None
+            if target is None:
+                # widget unknown or elsewhere-drift: roam the central page
+                vw, vh = await _viewport_size(page)
+                vx = random.uniform(vw * 0.15, vw * 0.85)  # noqa: S311
+                vy = random.uniform(vh * 0.15, vh * 0.85)  # noqa: S311
+                target = await _to_screen(page, pointer, vx, vy)
+            start = pointer.position()
+            if start != target:
+                await human_like_real_mouse_move(
+                    pointer, start, target, steps=random.randint(18, 42),  # noqa: S311
+                    control_jitter=(320, 170),
+                )
+            # per-stop jitter: small corrections while the eyes rest here
+            for _ in range(random.randint(1, 3)):  # noqa: S311
+                if stopped.is_set():
+                    return
+                jx, jy = _clamp(
+                    pointer,
+                    target[0] + random.uniform(-7, 7),  # noqa: S311
+                    target[1] + random.uniform(-7, 7),
+                )
+                pointer.move_to(jx, jy)
+                await asyncio.sleep(random.uniform(0.2, 0.9))  # noqa: S311
+            if random.random() < 0.4:  # noqa: S311 -- stillness is human too
+                await asyncio.sleep(random.uniform(0.4, 1.3))  # noqa: S311
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # pylint: disable=broad-except
+            logger.debug('human input: dwell drift ended', exc_info=True)
+            return
+
+
+async def _widget_screen_point(page, pointer: _XPointer, profile: '_ImageGridProfile'):
+    """A random screen point inside the challenge widget's box, or None.
+
+    The box is the IFRAME element's bounding box (viewport coordinates),
+    mapped to screen coordinates like every other click target; points
+    are drawn from the middle 80% of the box so the drift concentrates
+    on the puzzle without hugging its edges.
+    """
+    for frame_selector in profile.frame_selectors:
+        iframe_loc = page.locator(frame_selector).first
+        try:
+            if not await iframe_loc.is_visible():
+                continue
+            box = await iframe_loc.bounding_box()
+        except Exception:  # pylint: disable=broad-except
+            continue
+        if not box or box['width'] < 8 or box['height'] < 8:
+            continue
+        px = box['x'] + box['width'] * random.uniform(0.1, 0.9)  # noqa: S311
+        py = box['y'] + box['height'] * random.uniform(0.1, 0.9)  # noqa: S311
+        return await _to_screen(page, pointer, px, py)
+    return None
+
+
+async def _viewport_size(page) -> tuple[float, float]:
+    try:
+        size = await page.evaluate("() => [window.innerWidth, window.innerHeight]")
+        if isinstance(size, list) and len(size) == 2:
+            return float(size[0]), float(size[1])
+    except Exception:  # pylint: disable=broad-except
+        pass
+    return 1280.0, 680.0  # the fleet's default Firefox viewport
+
+
 async def _human_click(pointer: _XPointer, x: int, y: int) -> None:
     """Bezier-move the pointer to (x, y), hover, then press and release."""
     start = pointer.position()
@@ -990,10 +1080,26 @@ async def _run_image_rounds(page, pointer, solver, max_rounds: int, found) -> bo
             except Exception:  # pylint: disable=broad-except
                 grid_images = None
         try:
-            # blocking HTTP stays off the lane's event loop
-            solution = await asyncio.to_thread(
-                solver.solve_grid, png, grid_images, instruction, tile_count, rows, cols
+            # blocking HTTP stays off the lane's event loop; while the
+            # votes run (minutes on a local model) the pointer keeps
+            # drifting over the page -- predominantly over the widget,
+            # like a person holding the puzzle under their eyes
+            dwell_stop = asyncio.Event()
+            dwell_task = asyncio.create_task(
+                _human_dwell_over_widget(page, pointer, profile, dwell_stop)
             )
+            try:
+                solution = await asyncio.to_thread(
+                    solver.solve_grid, png, grid_images, instruction, tile_count, rows, cols
+                )
+            finally:
+                dwell_stop.set()
+                try:
+                    await dwell_task
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # pylint: disable=broad-except
+                    logger.debug('human input: dwell task failed', exc_info=True)
         except Exception:  # pylint: disable=broad-except
             logger.warning(
                 'human input: vision solver failed on %s image challenge',

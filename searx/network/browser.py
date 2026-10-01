@@ -1456,6 +1456,9 @@ class BrowserFetchPool:
         # _init_lock across lane restarts, and asyncio.Lock is not reentrant
         self._driver_lock = asyncio.Lock()
         self._playwright = None
+        # when the current playwright instance started: age at death is the
+        # one observable signature of driver exits (see _restart_playwright)
+        self._driver_started_at = time.monotonic()
         # set when the playwright instance was rebuilt after its driver
         # died: every lane launched from the dead instance keeps reporting
         # itself connected forever (the flag is local), so the lanes must
@@ -1496,6 +1499,7 @@ class BrowserFetchPool:
             try:
                 _enable_ksm_merge()
                 self._playwright = await async_playwright().start()
+                self._driver_started_at = time.monotonic()
                 # one geo lookup for all lanes (cached in process memory);
                 # parallel launches would each miss the cache and re-fetch
                 loop = asyncio.get_running_loop()
@@ -1587,7 +1591,10 @@ class BrowserFetchPool:
         except Exception as e:  # pylint: disable=broad-except
             if "Connection closed while reading from the driver" not in str(e):
                 raise
-            logger.warning("Playwright driver process is dead; rebuilding it")
+            logger.warning(
+                "Playwright driver process is dead (aged %.0fs); rebuilding it",
+                max(0.0, time.monotonic() - self._driver_started_at),
+            )
             await self._restart_playwright()
             return await launch_factory()
 
@@ -1607,6 +1614,7 @@ class BrowserFetchPool:
             from playwright.async_api import async_playwright
 
             self._playwright = await async_playwright().start()
+            self._driver_started_at = time.monotonic()
             # every existing lane was launched from the dead instance: its
             # browser objects keep reporting themselves connected forever,
             # so the lanes must be force-restarted, not trusted

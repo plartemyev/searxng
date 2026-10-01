@@ -830,11 +830,12 @@ def test_quorum_keeps_majority_tiles(fake_transport, monkeypatch):
         prompts.append(prompt)
         answer = answers[calls["n"]]
         calls["n"] += 1
-        # votes must sample at rising temperatures after the first
+        # votes must sample at rising temperatures after the first,
+        # capped low (0.55): high temperatures flipped negated prompts
         if calls["n"] == 1:
             assert temperature is None or temperature == 0.0
         else:
-            assert temperature >= 0.25
+            assert temperature == pytest.approx(min(0.55, 0.15 * (calls["n"] - 1)))
         return answer
 
     monkeypatch.setattr(solver_votes, "chat_vision", fake_chat)
