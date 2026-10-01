@@ -467,6 +467,10 @@ _FIREFOX_USER_PREFS = {
     "browser.safebrowsing.malware.enabled": True,
     "browser.safebrowsing.phishing.enabled": True,
     "dom.disable_open_during_load": True,
+    # Playwright enables Mozilla's in-page test utilities -- a
+    # `window.TestUtils` global on EVERY page, a one-line automation tell
+    # ("TestUtils" in window). Off, like every real browser.
+    "dom.testing.testutils.enabled": False,
     # Stock cosmetics/network behavior that Playwright disabled.
     "javascript.options.showInConsole": False,
     "toolkit.cosmeticAnimations.enabled": True,
@@ -507,18 +511,20 @@ def _stealth_init_script(browser_kind: str, language_tags: list[str]) -> str:
     // Firefox's accessor is configurable, so the prototype getter gets
     // redefined; the own property is then left ABSENT, exactly like a
     // real browser (an own 'webdriver' property is its own tell --
-    // Object.getOwnPropertyNames(navigator) exposes it).
+    // Object.getOwnPropertyNames(navigator) exposes it). The value is
+    // boolean FALSE, what a real uncontrolled Firefox reports -- a
+    // precise probe compares types, not just truthiness.
     const protoDesc = Object.getOwnPropertyDescriptor(
         Navigator.prototype, 'webdriver'
     );
     if (protoDesc && protoDesc.configurable) {
         Object.defineProperty(Navigator.prototype, 'webdriver', {
-            get: () => undefined,
+            get: () => false,
         });
     } else {
         // exotic engine: the instance shim still hides the common read,
         // at the cost of an own property
-        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+        Object.defineProperty(navigator, 'webdriver', {get: () => false});
     }
     Object.defineProperty(navigator, 'languages',
                           {get: () => __LANGUAGES__});
