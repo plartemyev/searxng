@@ -308,6 +308,7 @@ def ensure_display(lane_index: int = 0):
         if existing_display:
             return existing_display
     display = f":{_lane_display_number(lane_index)}"
+    spawn_wm = False
     with _xvfb_lock:
         process = _xvfb_processes.get(display)
         if process is not None and process.poll() is None:
@@ -346,20 +347,27 @@ def ensure_display(lane_index: int = 0):
                     "Started Xvfb on %s for lane %d", display, lane_index
                 )
                 _bootstrap_xauth()
-                _ensure_window_manager(display)
                 _xvfb_processes[display] = process
-                return display
+                spawn_wm = True
+                break
             time.sleep(0.1)
-        logger.warning(
-            "Xvfb on %s did not come up; falling back to headless browser",
-            display,
-        )
-        try:
-            process.kill()
-        except OSError:
-            pass
-        _xvfb_processes.pop(display, None)
-        return None
+        if not spawn_wm:
+            logger.warning(
+                "Xvfb on %s did not come up; falling back to headless browser",
+                display,
+            )
+            try:
+                process.kill()
+            except OSError:
+                pass
+            _xvfb_processes.pop(display, None)
+            return None
+    # the WM spawn takes _xvfb_lock itself: never call it while that lock
+    # is held (threading.Lock is not reentrant -- a nested acquire hangs
+    # the lane launch thread forever)
+    if spawn_wm:
+        _ensure_window_manager(display)
+    return display
 
 
 # Playwright's default launch args tilt toward automation and test farms.
