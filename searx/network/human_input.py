@@ -1088,18 +1088,24 @@ async def _run_image_rounds(page, pointer, solver, max_rounds: int, found) -> bo
             dwell_task = asyncio.create_task(
                 _human_dwell_over_widget(page, pointer, profile, dwell_stop)
             )
+            dwell_started = time.monotonic()
             try:
                 solution = await asyncio.to_thread(
                     solver.solve_grid, png, grid_images, instruction, tile_count, rows, cols
                 )
             finally:
                 dwell_stop.set()
+                dwell_for = time.monotonic() - dwell_started
                 try:
                     await dwell_task
                 except asyncio.CancelledError:
                     raise
                 except Exception:  # pylint: disable=broad-except
                     logger.debug('human input: dwell task failed', exc_info=True)
+                logger.info(
+                    'human input: pointer dwelt %.0fs during the vision votes',
+                    dwell_for,
+                )
         except Exception:  # pylint: disable=broad-except
             logger.warning(
                 'human input: vision solver failed on %s image challenge',
