@@ -4,3 +4,4 @@
 !container/entrypoint.sh
 !searx/**
 !requirements*.txt
+!container/node-driver-wrapper.sh
