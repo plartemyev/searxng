@@ -113,6 +113,16 @@ _XVFB_GEOMETRY = "1440x900x24"
 _xvfb_processes: dict[str, subprocess.Popen] = {}
 _xvfb_lock = threading.Lock()
 
+# openbox per pool-created display. Without a window manager GTK places
+# Firefox at (26,26) with a 1280x810 default size -- odd geometry, no
+# decorations and no focus management. A real desktop has a WM; openbox
+# (with the maximize-everything rc below) gives the browser the natural
+# maximized-on-desktop look and normal focus behavior. The human input
+# layer's coordinate math reads window geometry from JS, so it adapts to
+# whatever chrome the WM adds.
+_wm_processes: dict[str, subprocess.Popen] = {}
+_OPENBOX_RC = "/usr/local/searxng/openbox/rc.xml"
+
 _PR_SET_MEMORY_MERGE = 67  # linux/prctl.h, kernel >= 6.4
 
 
@@ -255,6 +265,33 @@ def _bootstrap_xauth():
         logger.warning("Could not create an empty Xauthority file at %s", xauth_path)
 
 
+def _ensure_window_manager(display: str) -> None:
+    """Start openbox on a pool-created display (once, kept while it lives).
+
+    Skipped for an operator-provided ``$DISPLAY`` (that desktop already
+    has a window manager) and when the config file is absent. A dead WM
+    is respawned on the next lane launch like a dead Xvfb.
+    """
+    with _xvfb_lock:
+        process = _wm_processes.get(display)
+        if process is not None and process.poll() is None:
+            return
+        if not os.path.isfile(_OPENBOX_RC):
+            return
+        try:
+            process = subprocess.Popen(  # pylint: disable=consider-using-with
+                ["openbox", "--config-file", _OPENBOX_RC],
+                env={**os.environ, "DISPLAY": display},
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            logger.warning("openbox failed to start on %s", display)
+            return
+        _wm_processes[display] = process
+        logger.info("Started openbox on %s", display)
+
+
 def ensure_display(lane_index: int = 0):
     """Return the X display for pool lane ``lane_index``, starting Xvfb.
 
@@ -309,6 +346,7 @@ def ensure_display(lane_index: int = 0):
                     "Started Xvfb on %s for lane %d", display, lane_index
                 )
                 _bootstrap_xauth()
+                _ensure_window_manager(display)
                 _xvfb_processes[display] = process
                 return display
             time.sleep(0.1)
@@ -455,7 +493,25 @@ def _stealth_init_script(browser_kind: str, language_tags: list[str]) -> str:
                    + ' OpenGL 4.5.0 NVIDIA 550.107.02)';
         }"""
     return """
-    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+    // BiDi sets the webdriver-active flag, visible through the navigator
+    // own property AND through Navigator.prototype's accessor -- a page
+    // can read the prototype descriptor and call its getter directly.
+    // Firefox's accessor is configurable, so the prototype getter gets
+    // redefined; the own property is then left ABSENT, exactly like a
+    // real browser (an own 'webdriver' property is its own tell --
+    // Object.getOwnPropertyNames(navigator) exposes it).
+    const protoDesc = Object.getOwnPropertyDescriptor(
+        Navigator.prototype, 'webdriver'
+    );
+    if (protoDesc && protoDesc.configurable) {
+        Object.defineProperty(Navigator.prototype, 'webdriver', {
+            get: () => undefined,
+        });
+    } else {
+        // exotic engine: the instance shim still hides the common read,
+        // at the cost of an own property
+        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+    }
     Object.defineProperty(navigator, 'languages',
                           {get: () => __LANGUAGES__});
     const patchGL = (proto) => {

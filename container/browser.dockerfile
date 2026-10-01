@@ -23,6 +23,13 @@ FROM docker.io/library/archlinux:base-devel
 #   the general Latin/Greek/Cyrillic coverage.
 # - noto-fonts-cjk: Simplified Chinese coverage for zh-CN searches.
 # - xorg-server-xvfb: one headed browser per lane on its own display.
+# - openbox: a window manager per lane display -- without one GTK places
+#   Firefox at (26,26) with a 1280x810 default (odd geometry, no
+#   decorations, no focus management); the pool's openbox rc maximizes
+#   the browser like a real desktop.
+# - ttf-dejavu noto-fonts-extra: a desktop-plausible installed font set
+#   (the base image's fontconfig has almost no fallbacks otherwise --
+#   a tiny font list is measurable from JS and unusual).
 # - tk: pyautogui/mouseinfo import tkinter at import time.
 # - mesa: software GL for Firefox's WebGL under Xvfb (no GPU here).
 RUN printf 'Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch\n' \
@@ -30,8 +37,8 @@ RUN printf 'Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch\n' \
     && pacman -Syu --noconfirm \
         firefox firefox-ublock-origin \
         otf-fira-sans otf-fira-mono \
-        noto-fonts noto-fonts-cjk \
-        xorg-server-xvfb tk mesa \
+        noto-fonts noto-fonts-cjk noto-fonts-extra ttf-dejavu \
+        xorg-server-xvfb openbox tk mesa \
         python python-pip \
     && rm -rf /var/cache/pacman/pkg/* /var/lib/pacman/sync/*
 
@@ -67,11 +74,35 @@ COPY requirements.txt ./
 # package set to break.
 RUN pip install --no-cache-dir --break-system-packages -r requirements.txt playwright pyautogui granian
 
+# Wrap the playwright node driver (see container/node-driver-wrapper.sh):
+# the driver exits silently on some failures and its stderr would be
+# lost; the wrapper logs every exit with its code to /tmp/node-driver.log
+# and enables node diagnostic reports for fatal errors / uncaught
+# exceptions (written to $NODE_REPORT_DIR).
+COPY container/node-driver-wrapper.sh /usr/local/share/node-driver-wrapper.sh
+ENV NODE_OPTIONS="--report-on-fatalerror --report-uncaught-exception" \
+    NODE_REPORT_DIR=/tmp/node-reports
+RUN d="$(python3 -c 'import playwright, os; print(os.path.join(os.path.dirname(playwright.__file__), "driver"))')" \
+    && mv "$d/node" "$d/node.real" \
+    && install -m 0755 /usr/local/share/node-driver-wrapper.sh "$d/node"
+
 COPY searx/ ./searx/
+# openbox rc: maximize every window on the lane displays (see
+# _ensure_window_manager in searx/network/browser.py)
+RUN mkdir -p openbox \
+    && printf '<?xml version="1.0" encoding="UTF-8"?>\n\
+<openbox_config xmlns="http://openbox.org/3.4/rc">\n\
+  <applications>\n\
+    <application class="*">\n\
+      <focus>yes</focus>\n\
+      <maximized>yes</maximized>\n\
+    </application>\n\
+  </applications>\n\
+</openbox_config>\n' > openbox/rc.xml
 # freeze the version: searx/version.py shells out to git (absent in the
 # image) when built from a checkout. GIT_URL must stay the official one:
 # Onyx's provider connection test asserts brand.GIT_URL equals it.
-RUN printf 'VERSION_STRING = "2026.9.30-browser-ff"\nVERSION_TAG = "2026.9.30"\nDOCKER_TAG = "browser"\nGIT_URL = "https://github.com/searxng/searxng"\nGIT_BRANCH = "master"\n' > searx/version.py
+RUN printf 'VERSION_STRING = "2026.10.1-browser-ff"\nVERSION_TAG = "2026.10.1"\nDOCKER_TAG = "browser"\nGIT_URL = "https://github.com/searxng/searxng"\nGIT_BRANCH = "master"\n' > searx/version.py
 RUN chown -R searxng:searxng /usr/local/searxng
 
 # Persistent per-lane Firefox profiles (outgoing.browser_profile_dir): the
