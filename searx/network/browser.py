@@ -151,6 +151,147 @@ def _enable_ksm_merge() -> bool:
         return False
 
 
+# Machine-global browser hardware the fleet provides itself: one PipeWire
+# stack (with its pulse-compatible socket) and one speech-dispatcher serve
+# every lane, like one desktop's sound server serves every window. Runtime
+# state lives in a private XDG_RUNTIME_DIR: browsers discover both servers
+# through it (libpulse: $XDG_RUNTIME_DIR/pulse/native; libspeechd:
+# $XDG_RUNTIME_DIR/speech-dispatcher/speechd.sock).
+_AUDIO_RUNTIME_DIR = "/tmp/pw-runtime"
+_AUDIO_STACK_LOG = "/tmp/pw-stack.log"
+_audio_stack_env: dict[str, str] | None = None
+
+
+def _ensure_audio_stack() -> None:
+    """Start the container's audio + speech stack once, before any browser.
+
+    Firefox reads two page-visible signals from the machine's sound
+    hardware. Without a sound server AudioContext reports a 44100 Hz null
+    device (real desktops run 48000 Hz), and without speech-dispatcher
+    speechSynthesis has zero voices (any desktop with a screen reader
+    stack has some). Both deltas are measurable container tells; this
+    closes them the way the Xvfb/openbox pair closes the display tells --
+    by providing the hardware a real desktop would have, not by patching
+    what pages read.
+
+    Everything here is best-effort and idempotent: on a host without the
+    binaries (or when something refuses to start) the pool logs one line
+    and lanes keep serving -- the old deviceless-container fingerprint is
+    the fallback, not a failure.
+    """
+    global _audio_stack_env
+    if _audio_stack_env is not None:
+        return
+    _audio_stack_env = {}
+    missing = [
+        name
+        for name in ("pipewire", "wireplumber", "pipewire-pulse", "dbus-daemon", "speech-dispatcher")
+        if shutil.which(name) is None
+    ]
+    if missing:
+        logger.info(
+            "Container audio stack not available (missing: %s); lanes run"
+            " without it",
+            ", ".join(missing),
+        )
+        return
+    try:
+        os.makedirs(_AUDIO_RUNTIME_DIR, mode=0o700, exist_ok=True)
+        env = dict(os.environ)
+        env["XDG_RUNTIME_DIR"] = _AUDIO_RUNTIME_DIR
+        env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={_AUDIO_RUNTIME_DIR}/bus"
+        env["LANG"] = env.get("LANG") or "C.UTF-8"
+
+        def spawn(args: list[str], name: str) -> subprocess.Popen | None:
+            try:
+                return subprocess.Popen(  # pylint: disable=consider-using-with
+                    args,
+                    env=env,
+                    stdout=open(_AUDIO_STACK_LOG, "ab"),  # noqa: SIM115
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+            except OSError as err:
+                logger.warning("Container audio stack: %s failed to start: %s", name, err)
+                return None
+
+        with open(os.devnull) as devnull:
+            # session bus first (PipeWire's portal/RT modules want it; a
+            # dbus-daemon --fork parented to us exits with the pool, the
+            # same lifecycle as Xvfb)
+            if not _audio_socket_ready(f"{_AUDIO_RUNTIME_DIR}/bus"):
+                dbus = subprocess.run(
+                    [
+                        "dbus-daemon",
+                        "--session",
+                        "--fork",
+                        f"--address=unix:path={_AUDIO_RUNTIME_DIR}/bus",
+                    ],
+                    env=env,
+                    stdout=devnull,
+                    stderr=devnull,
+                    check=False,
+                )
+                if dbus.returncode != 0:
+                    logger.warning("Container audio stack: session bus failed (%d)", dbus.returncode)
+        spawn(["pipewire"], "pipewire")
+        time.sleep(1.0)
+        spawn(["wireplumber"], "wireplumber")
+        time.sleep(0.5)
+        spawn(["pipewire-pulse"], "pipewire-pulse")
+        if not _audio_socket_ready(
+            f"{_AUDIO_RUNTIME_DIR}/pulse/native", timeout=5.0
+        ):
+            logger.warning(
+                "Container audio stack: pipewire-pulse socket never appeared;"
+                " browsers keep the deviceless audio fingerprint"
+            )
+        # speech-dispatcher: autospawn exists, but the fleet owns the
+        # lifecycle (own socket path, idle shutdown off, explicit module
+        # dir -- the compiled default scans upstream paths that Arch does
+        # not use, spawning broken module instances)
+        module_dir = "/usr/lib/speech-dispatcher/speech-dispatcher-modules"
+        if os.path.isdir(module_dir):
+            spawn(
+                [
+                    "speech-dispatcher",
+                    "-d",
+                    "-t",
+                    "0",
+                    "-m",
+                    module_dir,
+                ],
+                "speech-dispatcher",
+            )
+        else:
+            spawn(["speech-dispatcher", "-d", "-t", "0"], "speech-dispatcher")
+        # export to every lane launch: browsers must inherit the runtime
+        # dir or they cannot find either server
+        os.environ["XDG_RUNTIME_DIR"] = _AUDIO_RUNTIME_DIR
+        os.environ["DBUS_SESSION_BUS_ADDRESS"] = env["DBUS_SESSION_BUS_ADDRESS"]
+        _audio_stack_env = {
+            "XDG_RUNTIME_DIR": _AUDIO_RUNTIME_DIR,
+            "DBUS_SESSION_BUS_ADDRESS": env["DBUS_SESSION_BUS_ADDRESS"],
+        }
+        logger.info(
+            "Container audio stack up in %s (pipewire + speech-dispatcher)",
+            _AUDIO_RUNTIME_DIR,
+        )
+    except Exception as e:  # pylint: disable=broad-except
+        logger.warning("Container audio stack not started: %s", e)
+
+
+def _audio_socket_ready(path: str, timeout: float = 2.0) -> bool:
+    """Wait briefly for a unix socket to appear (Xvfb's socket wait, for
+    the audio servers)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if os.path.exists(path):
+            return True
+        time.sleep(0.1)
+    return os.path.exists(path)
+
+
 class BrowserFetchError(Exception):
     """Raised when the browser pool cannot serve a request."""
 
@@ -478,32 +619,23 @@ _FIREFOX_USER_PREFS = {
 }
 
 
-def _stealth_init_script(browser_kind: str, language_tags: list[str]) -> str:
+def _stealth_init_script(language_tags: list[str]) -> str:
     """Init script with anti-automation patches only.
 
     The lane presents the binary's real identity (distro Firefox or
     Chromium, Linux, IP-derived locale): kernel, TLS stack and UA already
     say what the binary is, so anything claimed in JS must agree -- a
     Windows persona here would be contradicted on the wire by every other
-    layer. The one lie is the GPU: the VM renders via llvmpipe (a classic
-    bot signal), so the unmasked WebGL vendor/renderer are claimed as a
-    common desktop GPU of the platform -- ANGLE/NVIDIA strings for
-    Chromium, Mesa/Intel strings for Firefox (Firefox does not wrap GL in
-    ANGLE; its renderer strings carry no "ANGLE (" prefix).
+    layer. The GPU is reported HONESTLY: the VM renders via Mesa llvmpipe
+    and every page-visible axis agrees (masked RENDERER, unmasked
+    vendor/renderer, extension list, line/point size ranges, canvas
+    rasterization). An earlier experiment claimed a desktop Intel iGPU
+    behind WEBGL_debug_renderer_info -- that produced a self-contradicting
+    fingerprint (Intel strings next to an llvmpipe extension list), which
+    scores strictly worse than the coherent "software-rendered VM box"
+    persona a scoring engine sees everywhere else anyway: VMs are ordinary
+    user traffic, hardware lies are not.
     """
-    if browser_kind == "firefox":
-        gl_claims = """
-        if (param === 37445) return 'Mesa';
-        if (param === 37446) {
-            return 'Mesa Intel(R) UHD Graphics 620 (KBL GT2)';
-        }"""
-    else:
-        gl_claims = """
-        if (param === 37445) return 'Google Inc. (NVIDIA)';
-        if (param === 37446) {
-            return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1650/PCIe/SSE2,'
-                   + ' OpenGL 4.5.0 NVIDIA 550.107.02)';
-        }"""
     return """
     // BiDi sets the webdriver-active flag, visible through the navigator
     // own property AND through Navigator.prototype's accessor -- a page
@@ -526,22 +658,88 @@ def _stealth_init_script(browser_kind: str, language_tags: list[str]) -> str:
         // at the cost of an own property
         Object.defineProperty(navigator, 'webdriver', {get: () => false});
     }
+    // Playwright's remote agent forces Mozilla's in-page test utilities
+    // onto every window (its requestGC calls TestUtils.gc()) -- a real
+    // browser has no window.TestUtils, and 'TestUtils' in window is a
+    // one-line automation detector. The property is configurable, so a
+    // delete removes it without a trace.
+    try { delete window.TestUtils; } catch (e) {}
     Object.defineProperty(navigator, 'languages',
                           {get: () => __LANGUAGES__});
-    const patchGL = (proto) => {
-        const orig = proto.getParameter;
-        proto.getParameter = function (param) {
-            // UNMASKED_VENDOR_WEBGL / UNMASKED_RENDERER_WEBGL: the VM has
-            // no GPU and would report llvmpipe, a classic bot signal.
-            __GL_CLAIMS__
-            return orig.call(this, param);
-        };
-    };
-    if (window.WebGLRenderingContext) patchGL(WebGLRenderingContext.prototype);
-    if (window.WebGL2RenderingContext) patchGL(WebGL2RenderingContext.prototype);
-    """.replace("__LANGUAGES__", json.dumps(language_tags)).replace(
-        "__GL_CLAIMS__", gl_claims
-    )
+    // WebGL stays untouched: the honest llvmpipe identity is coherent
+    // across every readable axis (see the docstring).
+    """.replace("__LANGUAGES__", json.dumps(language_tags))
+
+
+# One identity probe per lane launch, evaluated on about:blank (the stealth
+# init script is active there, so the numbers are exactly what a real visit
+# reads). The lane presents an identity -- geo locale/timezone, the binary's
+# own GL stack, the container's audio/speech hardware -- but a page sees much
+# more than the config says, and any axis that contradicts the persona
+# (timezone emulation silently unsupported, no codec behind a claimed
+# desktop, a deviceless-container audio rate) is a bot score on its own.
+# This probe makes those deltas a routine INFO line instead of an
+# interactive debugging session. The canvas hash is a djb2 of a drawn data
+# URL: stable enough per build to notice the page-visible rasterizer
+# changing, not meant as a global fingerprint to compare with other
+# machines. Voices are enumerated asynchronously by Firefox against
+# speech-dispatcher and may still be zero this early after launch; the
+# number matters for pages that read it later, not for this line.
+_IDENTITY_PROBE_JS = """
+() => {
+  const out = {};
+  const dtf = Intl.DateTimeFormat().resolvedOptions();
+  out.tz = dtf.timeZone;
+  out.tzoff = -new Date().getTimezoneOffset() / 60;
+  out.locale = dtf.locale;
+  out.lang = navigator.language;
+  out.cores = navigator.hardwareConcurrency;
+  out.screen = screen.width + 'x' + screen.height + 'x' + screen.colorDepth;
+  out.dpr = devicePixelRatio;
+  out.win = innerWidth + 'x' + outerWidth;
+  let h = 5381;
+  const c2 = document.createElement('canvas').getContext('2d');
+  if (c2) {
+    c2.fillStyle = '#f60';
+    c2.fillRect(0, 0, 120, 30);
+    c2.fillStyle = '#0f0';
+    c2.font = '16px Arial';
+    c2.fillText('identity-probe \\u0e01\\u0e23\\u0e30\\u0e1a\\u0e23\\u0e30\\u0e27\\u0e01', 4, 20);
+    const data = c2.canvas.toDataURL();
+    for (let i = 0; i < data.length; i++) {
+      h = ((h * 33) ^ data.charCodeAt(i)) >>> 0;
+    }
+  }
+  out.canvas = h.toString(16);
+  const glCanvas = document.createElement('canvas');
+  const gl = glCanvas.getContext('webgl2') || glCanvas.getContext('webgl');
+  if (gl) {
+    const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+    out.gl = dbg
+      ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL)
+      : gl.getParameter(gl.RENDERER);
+    out.glVer = gl.getParameter(gl.VERSION);
+    out.glExt = gl.getSupportedExtensions().length;
+    out.maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+  } else {
+    out.gl = 'NO-WEBGL';
+  }
+  out.codecs = 'avc1=' + MediaSource.isTypeSupported('video/mp4; codecs="avc1.42E01E"')
+    + ' aac=' + MediaSource.isTypeSupported('audio/mp4; codecs="mp4a.40.2"')
+    + ' opus=' + MediaSource.isTypeSupported('audio/webm; codecs="opus"');
+  try {
+    const actx = new AudioContext();
+    out.audio = actx.sampleRate + 'Hz/' + actx.state;
+    actx.close();
+  } catch (e) { out.audio = 'FAILED'; }
+  out.voices = speechSynthesis.getVoices().length;
+  out.fonts = ['Noto Sans Thai', 'Garuda', 'Loma', 'Arial',
+               'Liberation Sans', 'DejaVu Sans']
+    .map(f => f + '=' + document.fonts.check('12px "' + f + '"')).join(',');
+  out.plugins = navigator.plugins.length;
+  return out;
+}
+"""
 
 
 def _language_tags(accept_language: str) -> list[str]:
@@ -1573,6 +1771,9 @@ class BrowserFetchPool:
                 # one geo lookup for all lanes (cached in process memory);
                 # parallel launches would each miss the cache and re-fetch
                 loop = asyncio.get_running_loop()
+                # the audio/speech servers must exist before the first
+                # browser starts: Firefox probes them per process at launch
+                await loop.run_in_executor(None, _ensure_audio_stack)
                 await loop.run_in_executor(None, _detect_ip_locale)
                 # launch the lanes in parallel: a serial cold start costs
                 # 10-20s per persistent-profile lane and blows the engine
@@ -1801,12 +2002,37 @@ class BrowserFetchPool:
                 **self._context_kwargs(geo)
             )
         await context.add_init_script(
-            _stealth_init_script(browser_kind, _language_tags(geo["accept_language"]))
+            _stealth_init_script(_language_tags(geo["accept_language"]))
         )
         lane = _Lane(browser, context, display)
         lane.browser_kind = browser_kind
         lane.profile_lock = profile_lock
+        try:
+            # diagnostics must never hold a lane hostage: any failure here
+            # logs and the lane still enters the cycle
+            await asyncio.wait_for(self._probe_lane_identity(lane, lane_index), 30)
+        except Exception:  # pylint: disable=broad-except
+            logger.warning("lane %d identity probe failed", lane_index, exc_info=True)
         return lane
+
+    async def _probe_lane_identity(self, lane: _Lane, lane_index: int) -> None:
+        """Log what a page actually sees on this lane (see
+        ``_IDENTITY_PROBE_JS``). One page, opened and closed before the lane
+        enters the cycle, so it never competes with real traffic."""
+        page = await lane.context.new_page()
+        try:
+            # speechSynthesis reports its voices asynchronously
+            # (voiceschanged); a moment of grace turns the probe from
+            # always-zero into a usable signal
+            await page.wait_for_timeout(700)
+            probe = await page.evaluate(_IDENTITY_PROBE_JS)
+            logger.info(
+                "lane %d identity probe: %s",
+                lane_index,
+                " ".join(f"{key}={value}" for key, value in probe.items()),
+            )
+        finally:
+            await page.close()
 
     def _browser_type(self, browser_kind: str):
         """Playwright's browser type object for the lane's binary kind."""
@@ -2843,6 +3069,15 @@ class BrowserFetchPool:
             )
             if not solved:
                 await asyncio.sleep(random.uniform(0.6, 1.2))  # noqa: S311
+        # the settle budget is spent and the page still shows the challenge:
+        # without this line the failure is only visible by noticing the
+        # captured DOM is a /sorry page, not results
+        logger.warning(
+            "human search: challenge on %s NOT cleared within %.0fs of"
+            " settle -- capturing the challenge page for the engine",
+            page.url.split("?")[0][:120],
+            max(8.0, min(timeout_s, 30.0)),
+        )
         return True
 
     async def _fetch_via_human_search(
