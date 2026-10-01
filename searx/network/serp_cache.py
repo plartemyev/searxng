@@ -25,6 +25,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import threading
 import time
 import typing as t
 
@@ -177,6 +178,14 @@ class SerpCache:
     def __init__(self, path: str):
         self.path = path
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        # check_same_thread=False: the pool serves search workers on a
+        # ThreadPoolExecutor, so store()/lookup()/prune() arrive on
+        # different threads of one process. Every use of the connection
+        # must hold _lock: concurrent execute()/commit() on one shared
+        # connection corrupts its statement state and surfaces as
+        # sqlite3.InterfaceError "bad parameter or other API misuse"
+        # (observed as intermittent store failures under a search burst).
+        self._lock = threading.Lock()
         self._conn = sqlite3.connect(path, timeout=30, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=30000")
@@ -197,20 +206,22 @@ class SerpCache:
         self._writes_since_prune = 0
 
     def close(self) -> None:
-        try:
-            self._conn.close()
-        except Exception:  # pylint: disable=broad-except
-            pass
+        with self._lock:
+            try:
+                self._conn.close()
+            except Exception:  # pylint: disable=broad-except
+                pass
 
     # -- reads ---------------------------------------------------------------
 
     def lookup(self, key: str) -> "_CacheEntry | None":
         """The fresh entry for ``key``, or None (miss or expired)."""
         try:
-            row = self._conn.execute(
-                "SELECT payload FROM serp_cache WHERE key = ? AND expires_at > ?",
-                (key, time.time()),
-            ).fetchone()
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT payload FROM serp_cache WHERE key = ? AND expires_at > ?",
+                    (key, time.time()),
+                ).fetchone()
         except sqlite3.Error:
             log.warning("serp-cache: lookup failed", exc_info=True)
             return None
@@ -255,35 +266,43 @@ class SerpCache:
             # cache must never take the search down with it
             log.warning("serp-cache: envelope serialization failed", exc_info=True)
             return
+        due_prune = False
         try:
-            self._conn.execute(
-                "INSERT OR REPLACE INTO serp_cache"
-                " (key, query, lang, pageno, created_at, expires_at, payload)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    entry.key,
-                    entry.query,
-                    entry.lang,
-                    entry.pageno,
-                    entry.created_at,
-                    entry.expires_at,
-                    payload,
-                ),
-            )
-            self._conn.commit()
+            with self._lock:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO serp_cache"
+                    " (key, query, lang, pageno, created_at, expires_at, payload)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        entry.key,
+                        entry.query,
+                        entry.lang,
+                        entry.pageno,
+                        entry.created_at,
+                        entry.expires_at,
+                        payload,
+                    ),
+                )
+                self._conn.commit()
+                self._writes_since_prune += 1
+                if self._writes_since_prune >= _prune_interval():
+                    self._writes_since_prune = 0
+                    due_prune = True
         except sqlite3.Error:
             log.warning("serp-cache: store failed", exc_info=True)
             return
-        self._writes_since_prune += 1
-        if self._writes_since_prune >= _prune_interval():
-            self._writes_since_prune = 0
+        # prune re-acquires the lock itself, so it must run outside it
+        if due_prune:
             self.prune()
 
     def prune(self) -> None:
         """Drop expired entries (lazy maintenance, runs on the write path)."""
         try:
-            self._conn.execute("DELETE FROM serp_cache WHERE expires_at <= ?", (time.time(),))
-            self._conn.commit()
+            with self._lock:
+                self._conn.execute(
+                    "DELETE FROM serp_cache WHERE expires_at <= ?", (time.time(),)
+                )
+                self._conn.commit()
         except sqlite3.Error:
             log.debug("serp-cache: prune failed", exc_info=True)
 
