@@ -249,7 +249,11 @@ class ResultContainer:
     def add_unresponsive_engine(self, engine_name: str, error_type: str, suspended: bool = False):
         with self._lock:
             if self._closed:
-                log.error("call to ResultContainer.add_unresponsive_engine after ResultContainer.close")
+                # expected in this fork: a browser lane keeps solving a
+                # challenge (or a paced fetch) after the request's engine
+                # budget expired, and reports its failure into a container
+                # the client already took. A routine race, not an error.
+                log.warning("call to ResultContainer.add_unresponsive_engine after ResultContainer.close")
                 return
             if searx.engines.engines[engine_name].display_error_messages:
                 self.unresponsive_engines.add(UnresponsiveEngine(engine_name, error_type, suspended))

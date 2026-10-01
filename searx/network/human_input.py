@@ -1006,6 +1006,10 @@ async def _run_image_rounds(page, pointer, solver, max_rounds: int, found) -> bo
             if found is None:
                 solved = not await _page_looks_like_challenge(page)
                 break
+            logger.info(
+                'human input: slide %s accepted (the next image set mounted)',
+                round_index - 1,
+            )
         fresh_slide = True
         profile, frame_loc = found
 
@@ -1192,8 +1196,25 @@ async def _run_image_rounds(page, pointer, solver, max_rounds: int, found) -> bo
         # the browser leaves the challenge page entirely
         await asyncio.sleep(random.uniform(2.0, 3.5))  # noqa: S311
 
-    if not solved:
-        logger.warning('human input: image challenge not solved after %s slide(s)', max_rounds)
+    if solved:
+        logger.info(
+            'human input: image challenge cleared: %s slide(s) pressed in'
+            ' %.0fs',
+            round_index - 1,
+            time.monotonic() - solve_started,
+        )
+    else:
+        # the misleading part of the old message: it printed max_rounds
+        # even when the challenge collapsed after one or two slides --
+        # report the slides actually consumed, and where the page stuck
+        logger.warning(
+            'human input: image challenge NOT solved: %s of %s slide(s)'
+            ' pressed in %.0fs, page still %s',
+            round_index - 1,
+            max_rounds,
+            time.monotonic() - solve_started,
+            page.url.split('?')[0][:120],
+        )
     return solved
 
 
