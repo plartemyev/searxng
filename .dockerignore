@@ -5,3 +5,4 @@
 !searx/**
 !requirements*.txt
 !container/node-driver-wrapper.sh
+!container/patch-bidi-console.py

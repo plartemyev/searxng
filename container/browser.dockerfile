@@ -32,6 +32,17 @@ FROM docker.io/library/archlinux:base-devel
 #   a tiny font list is measurable from JS and unusual).
 # - tk: pyautogui/mouseinfo import tkinter at import time.
 # - mesa: software GL for Firefox's WebGL under Xvfb (no GPU here).
+# - pipewire pipewire-pulse wireplumber dbus: the desktop sound stack.
+#   Without a sound server Firefox reports a 44100 Hz null AudioContext
+#   (real desktops: 48000 Hz) -- a deviceless-container tell a page can
+#   read. One stack serves every lane; _ensure_audio_stack in
+#   searx/network/browser.py starts it on a private XDG_RUNTIME_DIR before
+#   the first browser launches (pipewire-pulse speaks the pulse protocol
+#   Firefox's libpulse talks, so no classic pulseaudio is needed).
+# - speech-dispatcher espeak-ng: the screen-reader TTS stack. Without it
+#   speechSynthesis has zero voices (any desktop with accessibility
+#   installed has some, Thai included); Firefox enumerates its voices
+#   through libspeechd at startup.
 RUN printf 'Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch\n' \
         > /etc/pacman.d/mirrorlist \
     && pacman -Syu --noconfirm \
@@ -39,6 +50,8 @@ RUN printf 'Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch\n' \
         otf-fira-sans otf-fira-mono \
         noto-fonts noto-fonts-cjk noto-fonts-extra ttf-dejavu \
         xorg-server-xvfb openbox tk mesa \
+        pipewire pipewire-pulse wireplumber dbus \
+        speech-dispatcher espeak-ng \
         python python-pip \
     && rm -rf /var/cache/pacman/pkg/* /var/lib/pacman/sync/*
 
@@ -68,11 +81,16 @@ WORKDIR /usr/local/searxng
 # no Playwright browser download needed); python-xlib ships the XTEST
 # input layer for the human-like input fallback
 # (searx/network/human_input.py) on the Xvfb displays.
+# playwright is PINNED: the BiDi console workaround below patches the
+# driver bundle of exactly this version (container/patch-bidi-console.py
+# fails the build when the bundle no longer matches -- bump the pin and
+# re-evaluate the patch together, never one without the other).
 COPY requirements.txt ./
 # --break-system-packages: Arch marks its python as externally managed
 # (PEP 668); inside a single-purpose container image there is no system
 # package set to break.
-RUN pip install --no-cache-dir --break-system-packages -r requirements.txt playwright pyautogui granian
+RUN pip install --no-cache-dir --break-system-packages \
+        "playwright==1.63.0" pyautogui granian -r requirements.txt
 
 # Wrap the playwright node driver (see container/node-driver-wrapper.sh):
 # the driver exits silently on some failures and its stderr would be
@@ -85,6 +103,13 @@ ENV NODE_OPTIONS="--report-on-fatalerror --report-uncaught-exception" \
 RUN d="$(python3 -c 'import playwright, os; print(os.path.join(os.path.dirname(playwright.__file__), "driver"))')" \
     && mv "$d/node" "$d/node.real" \
     && install -m 0755 /usr/local/share/node-driver-wrapper.sh "$d/node"
+
+# BiDi console-entry crash workaround: 1.63.0's driver exits on a page
+# console message with an unstringifiable argument (one Google page can
+# take down every lane). See container/patch-bidi-console.py; the build
+# fails loudly if the bundle does not match the pinned version.
+COPY container/patch-bidi-console.py /usr/local/share/patch-bidi-console.py
+RUN python3 /usr/local/share/patch-bidi-console.py
 
 COPY searx/ ./searx/
 # openbox rc: maximize every window on the lane displays (see
