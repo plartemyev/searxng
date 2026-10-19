@@ -21,6 +21,13 @@ the widget screenshot using the tiles' DOM rectangles: models bind "which
 photo in this strip" far more reliably than absolute tile numbers over a
 composite widget.
 
+The transport adapts itself to the runtime behind the endpoint -- llama.cpp
+and Ollama today. Thinking is switched off by each backend's mechanism (a
+reasoning model otherwise burns minutes and often its whole token budget
+per grid image), and the assistant text is read from the content or the
+runtime's reasoning field (``reasoning_content`` / ``reasoning``), streamed
+(SSE deltas) or buffered, transparently.
+
 Configuration (settings.yml)::
 
     outgoing:
@@ -108,6 +115,10 @@ class VisionSolverConfig:
     session_budget: float = 1500.0
     temperature: float = 0.0
     max_tokens: int = 2048
+    # SSE streaming: long thinking generations keep flowing through
+    # intermediaries instead of one silent block, and both supported
+    # runtimes (llama.cpp, Ollama) emit the same OpenAI-shaped deltas.
+    stream: bool = True
 
     @classmethod
     def from_settings(cls) -> "VisionSolverConfig":
@@ -127,6 +138,7 @@ class VisionSolverConfig:
             ),
             temperature=float(get_setting("outgoing.captcha_vision.temperature", 0.0) or 0.0),
             max_tokens=int(get_setting("outgoing.captcha_vision.max_tokens", 2048) or 2048),
+            stream=bool(get_setting("outgoing.captcha_vision.stream", True)),
         )
 
     def is_configured(self) -> bool:
@@ -233,6 +245,37 @@ def _strip_think_blocks(text: str) -> str:
     return _THINK_BLOCK_RE.sub("", text)
 
 
+_BACKEND_CACHE: dict[tuple[str, str], str] = {}
+_BACKEND_PROBE_TIMEOUT: float = 3.0
+
+
+def _detect_backend(endpoint: str, api_key: str) -> str:
+    """``'ollama'`` or ``'llamacpp'`` -- by the routes only one serves.
+
+    Ollama answers ``GET /api/version``; llama.cpp and other
+    OpenAI-compatible servers have no such route. Cached per
+    endpoint+key: the probe costs one tiny request per process.
+    """
+    cache_key = (endpoint, api_key)
+    cached = _BACKEND_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    backend = "llamacpp"
+    try:
+        headers = {"Authorization": "Bearer %s" % api_key} if api_key else {}
+        resp = curl_requests.get(
+            endpoint.rstrip("/") + "/api/version",
+            headers=headers,
+            timeout=_BACKEND_PROBE_TIMEOUT,
+        )
+        if resp.status_code == 200 and "version" in (resp.json() or {}):
+            backend = "ollama"
+    except Exception:  # pylint: disable=broad-except - probe is best-effort
+        pass
+    _BACKEND_CACHE[cache_key] = backend
+    return backend
+
+
 def _error_body(resp: "curl_requests.Response | None") -> str:
     """The server's error text, when it sent one, as `` -- server: ...``.
 
@@ -254,29 +297,100 @@ class OpenAICompatVisionSolver:
 
     def __init__(self, cfg: VisionSolverConfig):
         self.cfg = cfg
+        self._backend: str | None = None
 
     def describe(self) -> str:
         return f"{self.cfg.model} @ {self.cfg.endpoint}"
 
     # transport
 
+    def _thinking_off_payload(self, prompt_text: str) -> tuple[dict, str]:
+        """Payload base + prompt, with thinking switched off per backend.
+
+        A reasoning model otherwise spends minutes per grid image and can
+        exhaust max_tokens inside its thinking before writing the answer.
+        llama.cpp (and vLLM) take the template switch; Ollama's
+        OpenAI-compatible route ignores that field, so its ``think``
+        switch rides the body and Qwen3-family templates also honor the
+        ``/no_think`` soft switch in the prompt text.
+        """
+        payload: dict = {}
+        if self._backend == "ollama":
+            payload["think"] = False
+            prompt_text = prompt_text + "\n/no_think"
+        else:
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+        return payload, prompt_text
+
+    def _post_stream(self, url: str, payload: dict, headers: dict) -> str:
+        """Streaming chat completion, assembled to one assistant text.
+
+        The runtimes differ in where thinking rides on a delta
+        (llama.cpp: ``reasoning_content``, Ollama: ``reasoning``); the
+        content buffer wins whenever it holds an answer.
+        """
+        payload = {**payload, "stream": True}
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        resp = curl_requests.post(
+            url, json=payload, headers=headers, timeout=self.cfg.timeout, stream=True
+        )
+        try:
+            try:
+                resp.raise_for_status()
+            except RequestException as err:
+                # the body must survive into the caller's error context
+                raise RequestException("%s%s" % (err, _error_body(resp))) from err
+            for line in resp.iter_lines():
+                if isinstance(line, bytes):
+                    line = line.decode("utf-8", "replace")
+                line = line.strip()
+                if not line or line.startswith(":"):
+                    continue  # SSE comment / keepalive
+                if not line.startswith("data:"):
+                    continue
+                chunk = line[len("data:"):].strip()
+                if chunk == "[DONE]":
+                    break
+                try:
+                    event = json.loads(chunk)
+                except ValueError:
+                    continue
+                if isinstance(event, dict) and event.get("error"):
+                    raise RequestException("stream error: %s" % event["error"])
+                try:
+                    delta = event["choices"][0].get("delta") or {}
+                except (KeyError, IndexError, TypeError):
+                    continue
+                piece = delta.get("content")
+                if piece:
+                    content_parts.append(piece)
+                    continue
+                piece = delta.get("reasoning_content") or delta.get("reasoning")
+                if piece:
+                    reasoning_parts.append(piece)
+        finally:
+            resp.close()
+        text = "".join(content_parts)
+        if not text.strip():
+            text = "".join(reasoning_parts)
+        return text
+
     def chat_vision(self, prompt: str, images: list[bytes], mime: str = "image/png", temperature: float | None = None) -> str:
         """One chat completion with attached images; returns the assistant text."""
-        content: list[dict] = [{"type": "text", "text": prompt}]
+        if self._backend is None:
+            self._backend = _detect_backend(self.cfg.endpoint, self.cfg.api_key)
+        payload, prompt_text = self._thinking_off_payload(prompt)
+        content: list[dict] = [{"type": "text", "text": prompt_text}]
         for image in images:
             data_uri = "data:%s;base64,%s" % (mime, base64.b64encode(image).decode("ascii"))
             content.append({"type": "image_url", "image_url": {"url": data_uri}})
-        payload: dict = {
+        payload.update({
             "model": self.cfg.model,
             "messages": [{"role": "user", "content": content}],
             "temperature": self.cfg.temperature if temperature is None else temperature,
             "max_tokens": self.cfg.max_tokens,
-            # reasoning-capable models (Qwen3 on llama-server) otherwise
-            # spend minutes thinking about a grid image and can exhaust
-            # max_tokens before writing the answer; servers that do not
-            # know the template switch ignore it
-            "chat_template_kwargs": {"enable_thinking": False},
-        }
+        })
         if self.cfg.context_size > 0:
             # Ollama-style context hint; unknown fields are ignored by
             # servers that do not implement them.
@@ -286,13 +400,20 @@ class OpenAICompatVisionSolver:
             headers["Authorization"] = "Bearer %s" % self.cfg.api_key
 
         url = self.cfg.endpoint.rstrip("/") + "/v1/chat/completions"
-        data: dict | None = None
+        text: str | None = None
         for attempt in (1, 2):  # one retry: cold model loads and LAN hiccups
             resp = None
             try:
-                resp = curl_requests.post(url, json=payload, headers=headers, timeout=self.cfg.timeout)
-                resp.raise_for_status()
-                data = resp.json()
+                if self.cfg.stream:
+                    text = self._post_stream(url, payload, headers)
+                else:
+                    resp = curl_requests.post(url, json=payload, headers=headers, timeout=self.cfg.timeout)
+                    resp.raise_for_status()
+                    try:
+                        message = resp.json()["choices"][0]["message"]
+                    except (KeyError, IndexError, TypeError) as err:
+                        raise VisionSolverError("unexpected vision response shape: %s" % err) from err
+                    text = self._message_text(message)
                 break
             except (RequestException, ValueError) as err:
                 body = _error_body(resp)
@@ -302,20 +423,23 @@ class OpenAICompatVisionSolver:
                         "vision endpoint unreachable: %s%s" % (err, body)
                     ) from err
                 time.sleep(1.0)
-        if data is None:  # pragma: no cover - the loop always sets or raises
+        if text is None:  # pragma: no cover - the loop always sets or raises
             raise VisionSolverError("vision endpoint returned no data")
-        try:
-            message = data["choices"][0]["message"]
-        except (KeyError, IndexError, TypeError) as err:
-            raise VisionSolverError("unexpected vision response shape: %s" % err) from err
+        return _strip_think_blocks(text)
+
+    @staticmethod
+    def _message_text(message: dict) -> str:
+        """The assistant text, reasoning fields included when needed.
+
+        Reasoning backends park the thinking in their own field and can
+        exhaust max_tokens before writing the answer; the conclusion
+        still holds the JSON the parser looks for (llama-server names it
+        ``reasoning_content``, Ollama ``reasoning``).
+        """
         text = message.get("content") or ""
         if not text.strip():
-            # reasoning backends park the thinking in their own field and
-            # can exhaust max_tokens before writing the answer; the
-            # conclusion still holds the JSON the parser looks for
-            # (llama-server names it reasoning_content, Ollama reasoning)
             text = message.get("reasoning_content") or message.get("reasoning") or ""
-        return _strip_think_blocks(text)
+        return text
 
     # challenge-level API
 

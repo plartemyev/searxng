@@ -6,6 +6,7 @@
 
 import asyncio
 import base64
+import json
 import socket
 import struct
 import zlib
@@ -93,6 +94,24 @@ def test_chat_vision_falls_back_to_reasoning_field(fake_transport):
     assert solver().chat_vision("p", [b"img"]) == 'thinking... {"tiles": [3], "action": "submit"}'
 
 
+def test_chat_vision_uses_reasoning_content_field(fake_transport):
+    """llama-server names its thinking field reasoning_content."""
+    fake_transport.responses = [
+        {"choices": [{"message": {"content": "", "reasoning_content": 'thinking {"tiles": [4], "action": "submit"}'}}]}
+    ]
+    assert solver().chat_vision("p", [b"img"]) == 'thinking {"tiles": [4], "action": "submit"}'
+
+
+def test_chat_vision_strips_inline_think_blocks(fake_transport):
+    """Templates that ignore the thinking switch inline it into content;
+    its idle tile numbers must not reach the answer parser."""
+    fake_transport.responses = [
+        {"choices": [{"message": {"content": '<think>tile 3 and 9 maybe</think>{"tiles": [3], "action": "submit"}'}}]}
+    ]
+    answer = solver().chat_vision("p", [b"img"])
+    assert answer == '{"tiles": [3], "action": "submit"}'
+
+
 def test_widget_prompt_carries_instruction_and_contract():
     prompt = widget_prompt("Select all squares with traffic lights", 9, 3, 3)
     assert "traffic lights" in prompt
@@ -115,6 +134,7 @@ def test_from_settings_reads_all_keys(monkeypatch):
         "outgoing.captcha_vision.max_rounds": 3,
         "outgoing.captcha_vision.temperature": 0.1,
         "outgoing.captcha_vision.max_tokens": 300,
+        "outgoing.captcha_vision.stream": False,
     }
     monkeypatch.setattr(captcha_vision, "get_setting", lambda key, default=None: values.get(key, default))
     cfg = VisionSolverConfig.from_settings()
@@ -125,6 +145,7 @@ def test_from_settings_reads_all_keys(monkeypatch):
     assert cfg.max_rounds == 3
     assert cfg.temperature == 0.1
     assert cfg.max_tokens == 300
+    assert cfg.stream is False
 
 
 def test_from_settings_env_key_wins(monkeypatch):
@@ -179,6 +200,7 @@ class FakeResponse:
         self._payload = payload
         self.status_code = status
         self.text = ""
+        self.closed = False
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -187,16 +209,46 @@ class FakeResponse:
     def json(self):
         return self._payload
 
+    def iter_lines(self):
+        """The same payload as SSE deltas, the way both runtimes stream it."""
+        message = (self._payload.get("choices") or [{}])[0].get("message", {})
+        for key in ("content", "reasoning_content", "reasoning"):
+            piece = message.get(key)
+            if piece:
+                event = json.dumps({"choices": [{"delta": {key: piece}}]})
+                yield ("data: " + event).encode("utf-8")
+                break
+        yield b"data: [DONE]"
+
+    def close(self):
+        self.closed = True
+
 
 class FakeRequests:
     posts = []
+    gets = []
 
-    def __init__(self, responses=None):
+    def __init__(self, responses=None, get_response=None):
         self.responses = list(responses or [])
+        # backend probe outcome; default 404 (no /api/version -> llamacpp)
+        self.get_response = get_response
 
-    def post(self, url, json=None, headers=None, timeout=None):  # pylint: disable=redefined-builtin
-        FakeRequests.posts.append({"url": url, "json": json, "headers": headers, "timeout": timeout})
+    def post(self, url, json=None, headers=None, timeout=None, stream=False):  # pylint: disable=redefined-builtin
+        FakeRequests.posts.append(
+            {"url": url, "json": json, "headers": headers, "timeout": timeout, "stream": stream}
+        )
         outcome = self.responses.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        if isinstance(outcome, (dict, list)):
+            outcome = FakeResponse(outcome)
+        return outcome
+
+    def get(self, url, headers=None, timeout=None):
+        FakeRequests.gets.append({"url": url, "headers": headers, "timeout": timeout})
+        outcome = self.get_response
+        if outcome is None:
+            return FakeResponse({}, status=404)
         if isinstance(outcome, Exception):
             raise outcome
         if not isinstance(outcome, FakeResponse):
@@ -207,6 +259,8 @@ class FakeRequests:
 @pytest.fixture()
 def fake_transport(monkeypatch):
     FakeRequests.posts = []
+    FakeRequests.gets = []
+    monkeypatch.setattr(captcha_vision, "_BACKEND_CACHE", {})
     fake = FakeRequests([completion('{"tiles": [0], "action": "submit"}')])
     monkeypatch.setattr(captcha_vision, "curl_requests", fake)
     return fake
@@ -276,7 +330,7 @@ def test_chat_vision_surfaces_server_error_body(monkeypatch):
     mmproj) must reach the log and the VisionSolverError verbatim."""
 
     class ErrorRequests(FakeRequests):
-        def post(self, url, json=None, headers=None, timeout=None):  # pylint: disable=redefined-builtin,arguments-differ
+        def post(self, url, json=None, headers=None, timeout=None, stream=False):  # pylint: disable=redefined-builtin,arguments-differ
             FakeRequests.posts.append({"url": url})
             resp = FakeResponse({}, status=500)
             resp.text = '{"error":{"message":"image input is not supported - hint: provide the mmproj"}}'
@@ -286,6 +340,80 @@ def test_chat_vision_surfaces_server_error_body(monkeypatch):
     monkeypatch.setattr(captcha_vision, "curl_requests", ErrorRequests())
     with pytest.raises(VisionSolverError, match="image input is not supported"):
         solver().chat_vision("p", [b"fakepng"])
+
+
+class FakeStreamResponse:
+    def __init__(self, lines, status=200):
+        self._lines = lines
+        self.status_code = status
+        self.text = ""
+        self.closed = False
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RequestException("boom")
+
+    def iter_lines(self):
+        return iter(self._lines)
+
+    def close(self):
+        self.closed = True
+
+
+def sse_stream(*deltas):
+    lines = [("data: " + json.dumps({"choices": [{"delta": delta}]})).encode("utf-8") for delta in deltas]
+    lines.append(b"data: [DONE]")
+    return FakeStreamResponse(lines)
+
+
+def test_chat_vision_stream_assembles_content_deltas(fake_transport):
+    fake_transport.responses = [
+        sse_stream(
+            {"reasoning_content": "looking at the grid... "},  # llama.cpp thinking
+            {"content": '{"tiles": '},
+            {"content": '[2], "action": "submit"}'},
+        )
+    ]
+    assert solver().chat_vision("p", [b"img"]) == '{"tiles": [2], "action": "submit"}'
+    assert FakeRequests.posts[-1]["json"]["stream"] is True
+
+
+def test_chat_vision_stream_falls_back_to_reasoning_delta(fake_transport):
+    # a thinking model whose reasoning swallowed the token budget: the
+    # conclusion rides the reasoning delta under either runtime's name
+    fake_transport.responses = [
+        sse_stream({"reasoning_content": 'hmm {"tiles": [5], "action": "submit"}'}),
+    ]
+    assert solver().chat_vision("p", [b"img"]) == 'hmm {"tiles": [5], "action": "submit"}'
+    fake_transport.responses = [
+        sse_stream({"reasoning": 'hmm {"tiles": [6], "action": "submit"}'}),  # ollama name
+    ]
+    assert solver().chat_vision("p", [b"img"]) == 'hmm {"tiles": [6], "action": "submit"}'
+
+
+def test_llamacpp_backend_switches_thinking_via_template(fake_transport):
+    solver().chat_vision("find the red tiles", [b"img"])
+    payload = FakeRequests.posts[-1]["json"]
+    assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "think" not in payload
+    assert payload["messages"][0]["content"][0]["text"] == "find the red tiles"
+
+
+def test_ollama_backend_switches_thinking_via_think_and_prompt(monkeypatch):
+    FakeRequests.posts = []
+    FakeRequests.gets = []
+    monkeypatch.setattr(captcha_vision, "_BACKEND_CACHE", {})
+    fake = FakeRequests(
+        [completion('{"tiles": [1], "action": "submit"}')],
+        get_response={"version": "0.12.6"},
+    )
+    monkeypatch.setattr(captcha_vision, "curl_requests", fake)
+    assert solver().chat_vision("find the red tiles", [b"img"]) == '{"tiles": [1], "action": "submit"}'
+    assert FakeRequests.gets[-1]["url"].endswith("/api/version")
+    payload = FakeRequests.posts[-1]["json"]
+    assert payload.get("think") is False
+    assert "chat_template_kwargs" not in payload
+    assert payload["messages"][0]["content"][0]["text"].endswith("/no_think")
 
 
 def test_solve_image_grid_parses_model_answer(fake_transport):
