@@ -27,7 +27,10 @@ Configuration (settings.yml)::
       captcha_vision:
         enabled: true
         endpoint: 'http://localhost:11434'   # base URL, /v1/chat/completions appended
-        api_key: ''                          # optional Bearer token
+        api_key: ''                          # optional Bearer token; the
+                                             # CAPTCHA_VISION_API_KEY env var
+                                             # overrides this (keeps the secret
+                                             # out of this file)
         model: 'my-vision-model'
         context_size: 58192                  # num_ctx hint (Ollama); 0 = backend default
         timeout: 360                         # seconds per vision call
@@ -55,6 +58,7 @@ __all__ = [
 
 import base64
 import json
+import os
 import re
 import struct
 import time
@@ -110,7 +114,10 @@ class VisionSolverConfig:
         return cls(
             endpoint=(get_setting("outgoing.captcha_vision.endpoint", "") or "").strip(),
             model=(get_setting("outgoing.captcha_vision.model", "") or "").strip(),
-            api_key=(get_setting("outgoing.captcha_vision.api_key", "") or "").strip(),
+            api_key=(
+                os.environ.get("CAPTCHA_VISION_API_KEY")
+                or (get_setting("outgoing.captcha_vision.api_key", "") or "")
+            ).strip(),
             context_size=int(get_setting("outgoing.captcha_vision.context_size", 0) or 0),
             timeout=float(get_setting("outgoing.captcha_vision.timeout", 360.0) or 360.0),
             max_rounds=int(get_setting("outgoing.captcha_vision.max_rounds", 12) or 12),
@@ -213,6 +220,22 @@ def cell_prompt(instruction: str, tile_count: int, negate: bool = False) -> str:
     )
 
 
+def _error_body(resp: "curl_requests.Response | None") -> str:
+    """The server's error text, when it sent one, as `` -- server: ...``.
+
+    An HTTP status alone hides the real problem: a llama.cpp server without
+    its mmproj answers 500 with "image input is not supported", which is
+    exactly what the operator needs in the log.
+    """
+    if resp is None:
+        return ""
+    try:
+        text = (resp.text or "").strip()
+    except Exception:  # pylint: disable=broad-except - body is best-effort context
+        return ""
+    return " -- server: %s" % text[:300] if text else ""
+
+
 class OpenAICompatVisionSolver:
     """Asks a vision model over the OpenAI chat completions schema."""
 
@@ -247,15 +270,19 @@ class OpenAICompatVisionSolver:
         url = self.cfg.endpoint.rstrip("/") + "/v1/chat/completions"
         data: dict | None = None
         for attempt in (1, 2):  # one retry: cold model loads and LAN hiccups
+            resp = None
             try:
                 resp = curl_requests.post(url, json=payload, headers=headers, timeout=self.cfg.timeout)
                 resp.raise_for_status()
                 data = resp.json()
                 break
             except (RequestException, ValueError) as err:
-                logger.warning("vision request attempt %s failed: %s", attempt, err)
+                body = _error_body(resp)
+                logger.warning("vision request attempt %s failed: %s%s", attempt, err, body)
                 if attempt == 2:
-                    raise VisionSolverError("vision endpoint unreachable: %s" % err) from err
+                    raise VisionSolverError(
+                        "vision endpoint unreachable: %s%s" % (err, body)
+                    ) from err
                 time.sleep(1.0)
         if data is None:  # pragma: no cover - the loop always sets or raises
             raise VisionSolverError("vision endpoint returned no data")

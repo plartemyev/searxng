@@ -127,6 +127,36 @@ def test_from_settings_reads_all_keys(monkeypatch):
     assert cfg.max_tokens == 300
 
 
+def test_from_settings_env_key_wins(monkeypatch):
+    monkeypatch.setattr(
+        captcha_vision,
+        "get_setting",
+        lambda key, default=None: "from-settings" if key == "outgoing.captcha_vision.api_key" else default,
+    )
+    monkeypatch.setenv("CAPTCHA_VISION_API_KEY", "sk-from-env")
+    assert VisionSolverConfig.from_settings().api_key == "sk-from-env"
+
+
+def test_from_settings_falls_back_to_settings_key(monkeypatch):
+    monkeypatch.delenv("CAPTCHA_VISION_API_KEY", raising=False)
+    monkeypatch.setattr(
+        captcha_vision,
+        "get_setting",
+        lambda key, default=None: " from-settings " if key == "outgoing.captcha_vision.api_key" else default,
+    )
+    assert VisionSolverConfig.from_settings().api_key == "from-settings"
+
+
+def test_from_settings_empty_env_key_falls_back_to_settings(monkeypatch):
+    monkeypatch.setenv("CAPTCHA_VISION_API_KEY", "")
+    monkeypatch.setattr(
+        captcha_vision,
+        "get_setting",
+        lambda key, default=None: "from-settings" if key == "outgoing.captcha_vision.api_key" else default,
+    )
+    assert VisionSolverConfig.from_settings().api_key == "from-settings"
+
+
 def test_get_vision_solver_none_when_unconfigured(monkeypatch):
     monkeypatch.setattr(captcha_vision, "get_setting", lambda key, default=None: default)
     assert captcha_vision.get_vision_solver() is None
@@ -148,6 +178,7 @@ class FakeResponse:
     def __init__(self, payload, status=200):
         self._payload = payload
         self.status_code = status
+        self.text = ""
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -238,6 +269,23 @@ def test_chat_vision_raises_vision_error_when_endpoint_down(fake_transport, monk
     fake_transport.responses = [RequestException("down"), RequestException("down")]
     with pytest.raises(VisionSolverError):
         solver().chat_vision("p", [b"img"])
+
+
+def test_chat_vision_surfaces_server_error_body(monkeypatch):
+    """A 500 that carries the real reason (e.g. llama.cpp without its
+    mmproj) must reach the log and the VisionSolverError verbatim."""
+
+    class ErrorRequests(FakeRequests):
+        def post(self, url, json=None, headers=None, timeout=None):  # pylint: disable=redefined-builtin,arguments-differ
+            FakeRequests.posts.append({"url": url})
+            resp = FakeResponse({}, status=500)
+            resp.text = '{"error":{"message":"image input is not supported - hint: provide the mmproj"}}'
+            return resp
+
+    monkeypatch.setattr(captcha_vision.time, "sleep", lambda s: None)
+    monkeypatch.setattr(captcha_vision, "curl_requests", ErrorRequests())
+    with pytest.raises(VisionSolverError, match="image input is not supported"):
+        solver().chat_vision("p", [b"fakepng"])
 
 
 def test_solve_image_grid_parses_model_answer(fake_transport):
