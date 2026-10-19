@@ -220,6 +220,19 @@ def cell_prompt(instruction: str, tile_count: int, negate: bool = False) -> str:
     )
 
 
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_think_blocks(text: str) -> str:
+    """Drop inline ``<think>`` reasoning before the answer parser sees it.
+
+    Templates that ignore the thinking switch inline the reasoning into
+    the content, and its idle mentions of tile numbers must not reach the
+    tile parser.
+    """
+    return _THINK_BLOCK_RE.sub("", text)
+
+
 def _error_body(resp: "curl_requests.Response | None") -> str:
     """The server's error text, when it sent one, as `` -- server: ...``.
 
@@ -258,6 +271,11 @@ class OpenAICompatVisionSolver:
             "messages": [{"role": "user", "content": content}],
             "temperature": self.cfg.temperature if temperature is None else temperature,
             "max_tokens": self.cfg.max_tokens,
+            # reasoning-capable models (Qwen3 on llama-server) otherwise
+            # spend minutes thinking about a grid image and can exhaust
+            # max_tokens before writing the answer; servers that do not
+            # know the template switch ignore it
+            "chat_template_kwargs": {"enable_thinking": False},
         }
         if self.cfg.context_size > 0:
             # Ollama-style context hint; unknown fields are ignored by
@@ -292,11 +310,12 @@ class OpenAICompatVisionSolver:
             raise VisionSolverError("unexpected vision response shape: %s" % err) from err
         text = message.get("content") or ""
         if not text.strip():
-            # reasoning models (Ollama moves the thinking into a separate
-            # field) can exhaust max_tokens before writing the answer; their
+            # reasoning backends park the thinking in their own field and
+            # can exhaust max_tokens before writing the answer; the
             # conclusion still holds the JSON the parser looks for
-            text = message.get("reasoning") or ""
-        return text
+            # (llama-server names it reasoning_content, Ollama reasoning)
+            text = message.get("reasoning_content") or message.get("reasoning") or ""
+        return _strip_think_blocks(text)
 
     # challenge-level API
 
