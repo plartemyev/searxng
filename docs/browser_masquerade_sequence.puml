@@ -1,17 +1,19 @@
 @startuml browser_masquerade_sequence
-' Browser masquerade search workflow with measured timings (2026-09-26).
-' 6 lanes on Xvfb :99-:104, distro Chromium 154, Thai residential egress.
+' Browser masquerade search + crawl workflow, measured 2026-10-19.
+' 6 lanes on Xvfb :99-:104, distro Firefox 157 (feat/distro-firefox-fleet),
+' Thai residential egress. Google engine re-enabled; brave back after the
+' IIFE payload fix (see git log 2026-10-19).
 
 autonumber
 
-participant "Onyx\n(web_search tool)" as Onyx
+participant "Onyx\n(web_search / open_url)" as Onyx
 participant "searxng\nwebapp" as Web
-participant "engine module\n(google/bing/brave)" as Eng
+participant "engine module\n(google/bing/brave/...)" as Eng
 participant "BrowserFetchPool\n(6 lanes)" as Pool
-participant "lane N\nChromium on Xvfb" as Lane
+participant "lane N\nFirefox on Xvfb" as Lane
 participant "human_input\n(XTEST pointer)" as Hand
 participant "captcha_vision\n(OpenAI-compatible\nvision endpoint)" as Vision
-participant "provider\n(google.com ...)" as Up
+participant "provider\n(google.com, brave,\bbing, ...)" as Up
 
 Onyx -> Web : GET /search?q=... (json)
 note right of Onyx : Onyx client read budget 450 s = 2x worst\nattempt (SEARXNG_READ_TIMEOUT_SECONDS);\nretries paced 20 s / 40 s like a person\nre-querying
@@ -21,46 +23,56 @@ Eng -> Pool : fetch(url) via browser pool
 note right of Pool : provider send pacing:\n1-5 s random gap per host,\nqueue cap 20 s
 
 Pool -> Pool : checkout next idle lane\n(asyncio lane cycle)
-note right of Pool : per-origin human pacing on the\nbrowser lanes (searx/network/browser.py):\nsame origin keeps a jittered min gap\n-- search engines 4-10 s, other sites\n8-20 s, burst cap 45 s -- across all\nlanes, like one attentive person;\ndifferent origins stay parallel
-note right of Pool : wait here if all 6 lanes busy,\nbounded: 20 s, then the oldest\nbackground browsing session is\ncancelled, then up to 90 s more\n(engine timeout budget:\ngoogle 85 s, others 75 s)
+note right of Pool : lane displays :99-:104 are self-healing\n(2026-10-19): stale X locks are cleaned only\nwhen the lock's PID does not name THIS display\n(PID reuse after restart poisoned the old\ncheck), and a spawned Xvfb is verified --\nsocket newer than pre-spawn, process alive,\nsomething listens -- with one clean+retry\nround before headless fallback
+note right of Pool : per-origin human pacing on the\nbrowser lanes:\nsame origin keeps a jittered min gap\n-- search engines 4-10 s, other sites\n8-20 s, burst cap 45 s -- across all\nlanes, like one attentive person;\ndifferent origins stay parallel
+note right of Pool : wait here if all 6 lanes busy,\nbounded: 20 s, then the oldest\nbackground browsing session is\ncancelled, then up to 90 s more\n(engine timeout budget:\ngoogle 100 s, others 75-90 s)
 
 alt maximum stealth (browser_max_stealth: on)
-    Pool -> Lane : open provider homepage\n(hl/gl locale params ride along)
+    Pool -> Lane : open provider homepage\n(hl/gl locale params ride along;\nno uBlock: google sees the whole jar,\nSERP ad anchors included)
     Lane -> Up : GET homepage
     Hand -> Lane : Bezier move to search box (0.04-0.10 s),\nreal click focuses the box
     Hand -> Lane : type query with human cadence\n(uneven keys, bursts, pauses)
     Hand -> Lane : drift pointer (0.4-1.4 s),\nclick the submit button
     Lane -> Up : form submit -> results page
     Pool -> Lane : settle: wait for navigation,\nread results like a human
-    note right of Pool : full human search measured ~19 s\n(warm lane, google)
+    note right of Pool : warm-lane searches measured\n~20-40 s (google), ~20-25 s (brave)
 
-    opt challenge served (/sorry or 200 CAPTCHA wall)
-        Pool -> Lane : screenshot challenge + instruction text
+    opt google: reCAPTCHA Enterprise (checkbox -> image grid)
+        Hand -> Lane : click the challenge checkbox\n(iframe recaptcha/enterprise/anchor)
+        Lane -> Up : grid mounts (9-16 tiles, instruction\nin the lane's locale -- Thai)
         loop up to 12 rounds (max_rounds)
-            loop 6 votes (votes), rising temperature
-                Lane -> Vision : screenshot + prompt (~35 s per vote,\nendpoint timeout 360 s)
-                Vision --> Lane : tile coordinates
-                Hand -> Lane : click tiles with real X input
-            end
-            Hand -> Lane : press VERIFY (strict-majority quorum)
-            opt rejected -> grid regrows
+            Lane -> Vision : row strips + prompt; ONE vote\ndecides (votes: 1, no inverted\nquorum); endpoint timeout 360 s
+            Vision --> Lane : tile coordinates
+            Hand -> Lane : click tiles, dwell like a person\n(30-70 s observed), press VERIFY
+            opt slide accepted -> next grid
                 Lane -> Lane : next round, adapted geometry
             end
         end
-        note right of Lane : a round costs ~3.5-4 min;\n12 rounds ~50 min worst case.\nA request waiting on a solve\ngives up at its engine timeout,\nthe lane keeps solving in the\nbackground and banks the\nclearance cookies
+        note right of Lane : 2026-10-19: slide-1 clears happen\n(cleared in 57 s -> results in 80 s),\nbut flagged jars mostly get rejected\nand escalated. A request waiting on a\nsolve gives up at its engine timeout\n(100 s); the lane keeps solving up to\nsession_budget 1500 s in the\nbackground and banks the clearance\n+ GOOGLE_ABUSE_EXEMPTION cookie
+    else brave: own /captcha challenge (no third-party widget)
+        Pool -> Lane : wait out the invisible PoW\n(self-clears and reloads the search)
+        opt PoW refused -> slider puzzle
+            Hand -> Lane : drag the knob with real X input
+            opt end-drags refused
+                Lane -> Vision : slider screenshot + prompt\n(vision fallback)
+                Vision --> Lane : target position
+                Hand -> Lane : drag to the vision answer
+            end
+        end
     end
 
-    Pool -> Lane : capture rendered DOM (google desktop layout)
-    Lane --> Pool : HTML (~2.9 MB)
+    Pool -> Lane : capture rendered DOM (provider desktop layout)
+    Lane --> Pool : HTML (~0.3-2.9 MB)
     Pool --> Eng : response
-    Eng -> Eng : parse results\n(/url?q= unwrapped,\n/goto?url= kept as absolute URL)
+    Eng -> Eng : parse results\n(google /goto?url= kept; brave IIFE\nhydration payload unwrapped -- legacy\ndata: [{...}] still supported)
+
 else not a human-search candidate (API endpoints, images, ddg)
     Pool -> Lane : fetch-style request in browser context\n(browser TLS + lane cookies)
     Lane -> Up : GET url
     Lane --> Pool : response
 end
 
-opt post-search browsing (browser_post_search_browsing)\nonly when another lane is idle
+opt post-search browsing (browser_post_search_browsing)\nscheduler: search > crawl > browsing -- skipped when\nwork is pending, preempted by affinity crawls
     Pool -> Lane : background task keeps the SERP page
     loop 1-4 visits, budget 180 s total
         Hand -> Lane : click an organic result\n(/goto wrapper -> new tab; never\ntranslate.goog targets)
@@ -68,10 +80,34 @@ opt post-search browsing (browser_post_search_browsing)\nonly when another lane 
         Hand -> Lane : scroll + pointer drift, dwell 10-30 s
         Lane -> Lane : close tab, back on results
     end
-    note right of Lane : measured: 4 visits in 170 s
+    note right of Lane : measured: 1 visit in 126 s\n(2026-10-19, busy pool)
     Lane --> Pool : lane returns to the cycle
 end
 
 Pool --> Web : parsed results
-Web --> Onyx : json (measured ~19-20 s warm,\nno challenge)
+Web --> Onyx : json (warm lane ~20-40 s;\nchallenged google: 80-100 s or a\ntimeout while the lane banks the\nclearance)
+
+== page crawls (Onyx open_url -> /crawl) ==
+
+Onyx -> Web : GET /crawl?url=...
+Web -> Pool : crawl_render(url)
+Pool -> Pool : affinity: the lane whose SERP\nreturned this URL (memory: last\n600 result URLs per lane)
+note right of Pool : search-engine wrapper links\n(google /goto?url=, /url?q=,\nbing /ck/a, ddg /l/?uddg, yahoo /r/)\nare REFUSED when no lane memory\nholds the minting SERP: the tokens\nare bound to the jar the SERP was\nserved to -- another jar following\none is a cross-jar correlation\nhanded straight to the engine
+
+alt affinity lane free
+    Pool -> Lane : crawl on the finding lane\n(same identity that found the link)
+else affinity lane busy mid-request
+    Pool -> Lane : ride the busy lane (a reader\nwith many tabs, same jar)
+else no memory hit, a lane free
+    Pool -> Lane : crawl on any free lane\n(publisher pages only: wrapper\nlinks would have been refused)
+else no memory hit, all lanes busy
+    Pool -> Lane : borrow any alive lane\n(last resort)
+end
+Pool -> Lane : open page with the crawl filter:\nthird-party ad/metric networks\n(taboola, outbrain, criteo, adnxs, ...)\nand video media aborted; google's own\npipeline (googlesyndication,\ndoubleclick, GA, GTM) loads -- it is\nthe cross-site jar signal
+Lane -> Up : GET url (follows redirects)
+Lane --> Pool : rendered DOM
+Pool --> Web : {final_url, status, html, lane}
+Web --> Onyx : crawl result
+
+note over Pool, Lane : engine-level rate limits surface as a clean\n1 h suspension (searxng suspension state) --\nnever a crashed search thread: the\nTooManyRequestsException carries its message\nin the message= slot and a guard in\nprocessors/abstract.py nulls non-numeric\nsuspended_time values from any engine
 @enduml
