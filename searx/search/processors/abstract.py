@@ -202,6 +202,17 @@ class EngineProcessor(ABC):
             suspended_time = None
             if isinstance(exception_or_message, SearxEngineAccessDeniedException):
                 suspended_time = exception_or_message.suspended_time
+                if not isinstance(suspended_time, (int, float)):
+                    # an engine carried its message in suspended_time:
+                    # passing it on crashes the search thread on
+                    # `default_timer() + suspended_time` (float + str) --
+                    # fall back to the default suspension instead
+                    logger.warning(
+                        "engine %s: ignoring non-numeric suspended_time %r",
+                        self.engine.name,
+                        suspended_time,
+                    )
+                    suspended_time = None
             self.suspended_status.suspend(suspended_time, error_message)  # pylint: disable=no-member
 
     def _extend_container_basic(

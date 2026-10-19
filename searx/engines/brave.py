@@ -257,7 +257,7 @@ def extract_json_data(text: str) -> dict[str, t.Any]:
         # (challenge interstitial, hard block) -- a parse error would
         # misclassify it and retry into the same wall
         raise SearxEngineTooManyRequestsException(
-            "Brave served a page without search data (challenge or block)"
+            message="Brave served a page without search data (challenge or block)"
         ) from e
     js_obj_str = "{" + text[start:end] + "}}]}"
     # js_obj_str = js_obj_str.replace("\xa0", "")  # remove ASCII for &nbsp;
@@ -365,7 +365,7 @@ def _get_response_data(json_data: dict[str, t.Any], category: str | None = None)
             # no response node -- suspend the engine instead of raising a
             # structure error that retries into the same 429
             raise SearxEngineTooManyRequestsException(
-                "Brave rate-limited the query (challenge page served)"
+                message="Brave rate-limited the query (challenge page served)"
             )
     try:
         data: dict[str, t.Any] = json_data["data"][1]["data"]
