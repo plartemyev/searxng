@@ -118,6 +118,7 @@ Implementations
 """
 
 import json
+import re
 import typing as t
 from collections.abc import Callable
 from urllib.parse import urlencode
@@ -238,8 +239,110 @@ def _extract_published_date(published_date_raw: str | None):
         return None
 
 
+def _skip_js_string(text: str, i: int) -> int:
+    """Index just past the string literal opening at ``text[i]``."""
+    quote = text[i]
+    i += 1
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == quote:
+            return i + 1
+        i += 1
+    return n
+
+
+def _match_js_braces(text: str, i: int) -> tuple[str, int]:
+    """The balanced ``{...}`` literal opening at ``text[i]`` (string-aware).
+
+    Returns ``(literal, index_past_close)``.
+    """
+    start = i
+    depth = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch in ('"', "'", "`"):
+            i = _skip_js_string(text, i)
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1], i + 1
+        i += 1
+    return "", start
+
+
+def _iife_data_literals(text: str, array_start: int) -> list[tuple[str, str]]:
+    """The ``return {...}`` object literals of the SvelteKit IIFE payload.
+
+    The data array is ``data: [(function(a,b){return {...}}), ...]``: each
+    element defers its payload behind a function whose returned object
+    literal is exactly the node the legacy format inlined. Only ``return``
+    at array depth counts -- the same text inside a payload string is
+    data, and strings are skipped by the scanner. The element's parameter
+    list rides along: the payload references those parameters (SvelteKit
+    hoists shared strings into them) and they carry no data.
+    """
+    literals: list[tuple[str, str]] = []
+    i = array_start + len("data: [")
+    depth = 1
+    n = len(text)
+    while i < n and depth > 0:
+        ch = text[i]
+        if ch in ('"', "'", "`"):
+            i = _skip_js_string(text, i)
+            continue
+        if (
+            depth == 1
+            and text.startswith("return", i)
+            and not (i > 0 and (text[i - 1].isalnum() or text[i - 1] in "_$"))
+        ):
+            # scan the element for its returned object literal: "return
+            # {node}" or a comma-expression like "return null, {node}" --
+            # the node is the first brace block at the element's top level
+            j = i + len("return")
+            nest = 0
+            while j < n:
+                c = text[j]
+                if c in ('"', "'", "`"):
+                    j = _skip_js_string(text, j)
+                    continue
+                if c == "{" and nest == 0:
+                    literal, j = _match_js_braces(text, j)
+                    if literal:
+                        fn_open = text.rfind("function(", array_start, i)
+                        params = ""
+                        if fn_open != -1:
+                            close = text.find(")", fn_open, i)
+                            if close != -1:
+                                params = text[fn_open + len("function("):close]
+                        literals.append((params, literal))
+                    break
+                if c in "{[(":
+                    nest += 1
+                elif c in "}])":
+                    if nest == 0:
+                        break  # element ended with no returned object
+                    nest -= 1
+                j += 1
+            i = j
+            continue
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+        i += 1
+    return literals
+
+
 def extract_json_data(text: str) -> dict[str, t.Any]:
-    # Example script source containing the data:
+    # Example script source containing the data (legacy literal form):
     #
     # kit.start(app, element, {
     #    node_ids: [0, 19],
@@ -248,10 +351,27 @@ def extract_json_data(text: str) -> dict[str, t.Any]:
     #    form: null,
     #    error: null
     # });
+    #
+    # Newer builds defer each node behind a function:
+    #
+    #    data: [(function(a,b){return {type:"data",data:...}}), ...]
+    #
+    # -- the nodes are then the literals after each ``return {``.
     try:
         start = text.index("data: [{")
         newline = text.index("\n", start)
         end = text.rindex("}}]", start, newline)
+    except ValueError:
+        pass
+    else:
+        js_obj_str = "{" + text[start:end] + "}}]}"
+        # js_obj_str = js_obj_str.replace("\xa0", "")  # remove ASCII for &nbsp;
+        # js_obj_str = js_obj_str.replace(r"\u003C", "<").replace(r"\u003c", "<")  # fix broken HTML tags in strings
+        json_str = js_obj_str_to_json_str(js_obj_str)
+        return json.loads(json_str)
+
+    try:
+        array_start = text.index("data: [")
     except ValueError as e:
         # no app-state script at all: the page is not a search response
         # (challenge interstitial, hard block) -- a parse error would
@@ -259,12 +379,28 @@ def extract_json_data(text: str) -> dict[str, t.Any]:
         raise SearxEngineTooManyRequestsException(
             message="Brave served a page without search data (challenge or block)"
         ) from e
-    js_obj_str = "{" + text[start:end] + "}}]}"
-    # js_obj_str = js_obj_str.replace("\xa0", "")  # remove ASCII for &nbsp;
-    # js_obj_str = js_obj_str.replace(r"\u003C", "<").replace(r"\u003c", "<")  # fix broken HTML tags in strings
-    json_str = js_obj_str_to_json_str(js_obj_str)
-    data: dict[str, t.Any] = json.loads(json_str)
-    return data
+    literals = _iife_data_literals(text, array_start)
+    if not literals:
+        raise SearxEngineTooManyRequestsException(
+            message="Brave served a page without search data (challenge or block)"
+        )
+    nodes = []
+    for params, literal in literals:
+        json_str = js_obj_str_to_json_str(literal)
+        # the IIFE payload deduplicates shared strings into the element's
+        # function parameters ("openGraphDescription":b): they are
+        # hydration arguments, not data -- blank them out so the JSON
+        # parses (and so does an occasional bare undefined)
+        param_names = {p.strip() for p in params.split(",") if p.strip()} | {"undefined"}
+        json_str = re.sub(
+            r":([A-Za-z_$][A-Za-z0-9_$]*)(\s*[,}\]])",
+            lambda m: ":null" + m.group(2)
+            if m.group(1) in param_names
+            else m.group(0),
+            json_str,
+        )
+        nodes.append(json.loads(json_str))
+    return {"data": nodes}
 
 
 def response(resp: "SXNG_Response") -> EngineResults:

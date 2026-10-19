@@ -44,6 +44,38 @@ def test_page_without_app_state_raises_rate_limit():
         extract_json_data("<html><body>access denied</body></html>")
 
 
+_IIFE_PAYLOAD = (
+    '{type:"data",data:{noResults:false,body:{response:{web:{results:'
+    '[{title:"t",url:"https://x.org",description:\'write "return {" and "]" to trip it\'}]}}}}}'
+)
+
+
+def _iife_kit_html(payload: str) -> str:
+    # the real 2026-10 page: elements are functions, not called inline
+    return (
+        '<html><script>kit.start(app, el, {\n'
+        ' data: [(function(a,b){return {type:"data",data:{userAgent:{uaString:"x"},'
+        'query:{text:"test"}}}}), (function(c,d){return ' + payload + '})],\n'
+        ' form: null,\n error: null\n});</script></html>'
+    )
+
+
+def test_iife_payload_parses():
+    data = extract_json_data(_iife_kit_html(_IIFE_PAYLOAD))
+    response = _get_response_data(data, "search")
+    assert response["results"][0]["title"] == "t"
+    assert response["results"][0]["url"] == "https://x.org"
+    # strings inside the payload are data, not code
+    assert "return {" in response["results"][0]["description"]
+
+
+def test_iife_challenge_raises_rate_limit():
+    challenge = 'null, {type:"data",data:{challengeSet:{set_token:"tok",tokens:["a","b"]}}}'
+    data = extract_json_data(_iife_kit_html(challenge))
+    with pytest.raises(SearxEngineTooManyRequestsException):
+        _get_response_data(data, "search")
+
+
 def test_healthy_serp_still_parses():
     data = extract_json_data(_kit_html(_RESPONSE_NODE))
     web = _get_response_data(data, "search")
