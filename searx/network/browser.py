@@ -656,9 +656,12 @@ _LAUNCH_ARGS_FIREFOX = [
 # distro Firefox install runs as; the automation-safe bits (crash reporter
 # off, updates off, first-run pages off) stay as Playwright set them.
 _FIREFOX_USER_PREFS = {
-    # The Arch firefox-ublock-origin package installs uBlock as a
-    # distribution extension; Playwright disables exactly those for tests.
-    "extensions.installDistroAddons": True,
+    # uBlock stays OFF on the lanes: google.com must see the whole jar --
+    # the SERP's ad anchors and trackers are part of a real desktop's
+    # network look, and a jar that never fetches the ads google just
+    # served it is visible server-side. (Playwright disables distro
+    # add-ons for tests; uBlock was deliberately re-enabled before.)
+    "extensions.installDistroAddons": False,
     # Stock ETP posture (Total Cookie Protection on, the release default);
     # Playwright sets cookieBehavior0 / -tp so tests don't fight cookie
     # partitioning.
@@ -1080,6 +1083,39 @@ _CRAWL_LANE_WAIT_S = 30.0
 # ARE the organic click targets on the results page. Any other same-site
 # link (verticals, related searches, settings) is not a reader's click.
 _REDIRECT_HINTS = ("/ck/a", "/goto?url=", "/l/?uddg", "/url?q=", "/interstitial", "/proxy?")
+# Crawled publisher pages load with ads, metrics and video filtered: a
+# research crawl fans out over dozens of pages and unfiltered rendering
+# (autoplay video, ad slots) is what made the ad-rendering fleet measure
+# 7G+ per search session. Google-origin traffic is NOT filtered: searches
+# and post-search browsing stay whole-page (the SERP's own ad anchors are
+# part of a real jar's network look -- see _FIREFOX_USER_PREFS on uBlock).
+_CRAWL_BLOCKED_HOST_PARTS = (
+    "doubleclick.net", "googlesyndication.com", "googleadservices.com",
+    "google-analytics.com", "googletagmanager.com", "adservice.google.",
+    "connect.facebook.net", "facebook.net", "taboola.", "outbrain.",
+    "criteo.", "amazon-adsystem.com", "adnxs.", "pubmatic.",
+    "rubiconproject.", "scorecardresearch.", "quantserve.", "hotjar.",
+    "moatads.", "adsafeprotected.", "casalemedia.", "openx.",
+    "smartadserver.", "sharethrough.", "yieldmo.", "zedo.", "bidswitch.",
+    "teads.", "media.net", "ads.yahoo.", "atdmt.", "bing.com/bat.js",
+)
+_CRAWL_BLOCKED_MEDIA_EXTENSIONS = (
+    ".mp4", ".m4v", ".webm", ".mkv", ".mov", ".avi", ".m3u8", ".mpd",
+    ".ts", ".flv", ".ogv",
+)
+
+
+def _crawl_request_blocked(url: str) -> bool:
+    """True for a subresource the crawl filter drops (host or media type)."""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return False
+    host = (parts.hostname or "").lower()
+    if any(host == part or host.endswith("." + part) for part in _CRAWL_BLOCKED_HOST_PARTS):
+        return True
+    return parts.path.lower().endswith(_CRAWL_BLOCKED_MEDIA_EXTENSIONS)
+
 # Clicking a bare image or archive URL is not reading; skip those links.
 _POST_SEARCH_SKIP_EXTENSIONS = (
     ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".ico", ".css", ".js",
@@ -1101,6 +1137,29 @@ def _is_search_origin(host: str) -> bool:
     """Is this host a search engine the pool actually queries?"""
     host = (host or "").lower()
     return any(part in host for part in _SEARCH_ORIGIN_HOST_PARTS)
+
+
+def _is_serp_wrap_url(url: str) -> bool:
+    """A search engine's outbound wrapper link (google /goto?url= or
+    /url?q=, bing /ck/a, duckduckgo /l/?uddg=, yahoo /r/...).
+
+    These carry a token minted when the SERP was rendered, bound to the
+    jar it was served to: another jar following one is either a broken
+    redirect or a clean statement that two jars share a backend. Crawls
+    of a wrapper whose minting lane is not in memory are refused (see
+    _checkout_for_crawl).
+    """
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return False
+    host = (parts.hostname or "").lower()
+    if not host:
+        return False
+    if not (_is_search_origin(host) or host.endswith("search.yahoo.com")):
+        return False
+    tail = f"{parts.path}?{parts.query}"
+    return any(hint in tail for hint in _REDIRECT_HINTS)
 
 
 def _is_browsable_search_url(url: str) -> bool:
@@ -1648,8 +1707,12 @@ class _Lane:
         # last return-to-cycle time (monotonic); drives idle reaping
         self.last_used = time.monotonic()
         # result URLs this lane's searches returned (most recent last);
-        # a later crawl of one of them routes back to this lane
-        self.serp_urls = deque(maxlen=100)
+        # a later crawl of one of them routes back to this lane. The cap
+        # rides out back-to-back research bursts (13 queries x ~30 links
+        # each evicted a 100-entry memory within one burst, which would
+        # strand wrapper links like google /goto without their minting
+        # lane -- see _checkout_for_crawl).
+        self.serp_urls = deque(maxlen=600)
         # SERP page handed over by a human-path fetch for post-search
         # browsing; the browsing session consumes (and closes) it.
         self.serp_page = None
@@ -2718,10 +2781,19 @@ class BrowserFetchPool:
         """
         await self._init()
         await self._ensure_browser_alive()
+        preferred = self._lane_for_serp_url(url)
+        if preferred is None and _is_serp_wrap_url(url):
+            # the token was minted for a jar whose memory has been evicted
+            # (or was never recorded): following it from any other lane
+            # hands the engine a cross-jar correlation -- or just a broken
+            # redirect. Refuse instead of picking a wrong identity.
+            raise BrowserFetchError(
+                "refusing search-engine wrapper link without its minting"
+                " lane in memory: %s" % url[:120]
+            )
         # human pacing: keep the minimum gap to the previous hit on this
         # origin before any lane is taken (never consumes pool capacity)
         await self._origin_gate(url)
-        preferred = self._lane_for_serp_url(url)
         # register the wait so browsing sessions yield for this crawl
         # (affinity lane preferred, any lane otherwise)
         self._scheduler.enter_crawl(preferred)
@@ -2787,6 +2859,30 @@ class BrowserFetchPool:
             raise BrowserFetchError("no alive browser lane available for crawling")
         return lane, False, True
 
+    async def _apply_crawl_filter(self, page) -> None:
+        """Drop ad/metric/video subresources on a crawled page.
+
+        Crawl pages only: google-origin traffic (searches, post-search
+        browsing) stays unfiltered -- those pages are the persona, and a
+        jar that never fetches the ads the SERP served is a server-side
+        visible absence. The handler never raises: a filter error must
+        not fail the crawl.
+        """
+
+        async def _route(route):
+            try:
+                if _crawl_request_blocked(route.request.url):
+                    await route.abort()
+                else:
+                    await route.continue_()
+            except Exception:  # pylint: disable=broad-except
+                try:
+                    await route.continue_()
+                except Exception:  # pylint: disable=broad-except
+                    pass
+
+        await page.route("**/*", _route)
+
     async def crawl_render(self, url: str, *, timeout_s: float = 30.0) -> dict:
         """Navigate a page in a lane browser and return the rendered DOM.
 
@@ -2806,6 +2902,7 @@ class BrowserFetchPool:
         try:
             page = await lane.context.new_page()
             try:
+                await self._apply_crawl_filter(page)
                 response = await page.goto(
                     url, timeout=timeout_s * 1000, wait_until="commit"
                 )
