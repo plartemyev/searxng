@@ -1083,21 +1083,22 @@ _CRAWL_LANE_WAIT_S = 30.0
 # ARE the organic click targets on the results page. Any other same-site
 # link (verticals, related searches, settings) is not a reader's click.
 _REDIRECT_HINTS = ("/ck/a", "/goto?url=", "/l/?uddg", "/url?q=", "/interstitial", "/proxy?")
-# Crawled publisher pages load with ads, metrics and video filtered: a
-# research crawl fans out over dozens of pages and unfiltered rendering
-# (autoplay video, ad slots) is what made the ad-rendering fleet measure
-# 7G+ per search session. Google-origin traffic is NOT filtered: searches
-# and post-search browsing stay whole-page (the SERP's own ad anchors are
-# part of a real jar's network look -- see _FIREFOX_USER_PREFS on uBlock).
+# Crawled publisher pages load with third-party ad/metric networks and
+# video filtered: a research crawl fans out over dozens of pages and
+# unfiltered rendering (autoplay video, ad-network widgets) is what made
+# the ad-rendering fleet measure 7G+ per search session. Google's OWN
+# pipeline (googlesyndication, doubleclick, googleadservices, GA, GTM) is
+# deliberately allowed everywhere -- those requests are the cross-site
+# jar signal we are feeding google, and letting AdSense render also keeps
+# sites that gate on GTM/dataLayer from breaking mid-crawl. Non-google
+# trackers stay blocked: no jar value, pure resource cost.
 _CRAWL_BLOCKED_HOST_PARTS = (
-    "doubleclick.net", "googlesyndication.com", "googleadservices.com",
-    "google-analytics.com", "googletagmanager.com", "adservice.google.",
     "connect.facebook.net", "facebook.net", "taboola.", "outbrain.",
     "criteo.", "amazon-adsystem.com", "adnxs.", "pubmatic.",
     "rubiconproject.", "scorecardresearch.", "quantserve.", "hotjar.",
     "moatads.", "adsafeprotected.", "casalemedia.", "openx.",
     "smartadserver.", "sharethrough.", "yieldmo.", "zedo.", "bidswitch.",
-    "teads.", "media.net", "ads.yahoo.", "atdmt.", "bing.com/bat.js",
+    "teads.", "media.net", "ads.yahoo.", "atdmt.",
 )
 _CRAWL_BLOCKED_MEDIA_EXTENSIONS = (
     ".mp4", ".m4v", ".webm", ".mkv", ".mov", ".avi", ".m3u8", ".mpd",
@@ -1112,7 +1113,7 @@ def _crawl_request_blocked(url: str) -> bool:
     except ValueError:
         return False
     host = (parts.hostname or "").lower()
-    if any(host == part or host.endswith("." + part) for part in _CRAWL_BLOCKED_HOST_PARTS):
+    if any(part in host for part in _CRAWL_BLOCKED_HOST_PARTS):
         return True
     return parts.path.lower().endswith(_CRAWL_BLOCKED_MEDIA_EXTENSIONS)
 
@@ -2860,13 +2861,12 @@ class BrowserFetchPool:
         return lane, False, True
 
     async def _apply_crawl_filter(self, page) -> None:
-        """Drop ad/metric/video subresources on a crawled page.
+        """Drop third-party ad/metric networks and video on a crawled page.
 
-        Crawl pages only: google-origin traffic (searches, post-search
-        browsing) stays unfiltered -- those pages are the persona, and a
-        jar that never fetches the ads the SERP served is a server-side
-        visible absence. The handler never raises: a filter error must
-        not fail the crawl.
+        Google's own ad/metrics pipeline is deliberately allowed everywhere
+        (see _CRAWL_BLOCKED_HOST_PARTS): those beacons are the cross-site
+        signal the jar exists to accumulate. The handler never raises: a
+        filter error must not fail the crawl.
         """
 
         async def _route(route):

@@ -81,14 +81,21 @@ class TestIsSerpWrapUrl:
 
 
 class TestCrawlRequestBlocked:
-    def test_ad_hosts_blocked(self):
-        assert _crawl_request_blocked("https://securepubads.g.doubleclick.net/tag/js/gpt.js")
-        assert _crawl_request_blocked("https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js")
-        assert _crawl_request_blocked("https://www.google-analytics.com/analytics.js")
+    def test_third_party_ad_hosts_blocked(self):
+        assert _crawl_request_blocked("https://cdn.taboola.com/lib/trc.js")
+        assert _crawl_request_blocked("https://connect.facebook.net/en_US/fbevents.js")
+        assert _crawl_request_blocked("https://pixel.quantserve.com/pixel.js")
+
+    def test_google_ad_pipeline_allowed_everywhere(self):
+        # googlesyndication/doubleclick/GA/GTM are the cross-site jar
+        # signal: allowed on crawled pages too
+        assert not _crawl_request_blocked("https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js")
+        assert not _crawl_request_blocked("https://googleads.g.doubleclick.net/pagead/ads")
+        assert not _crawl_request_blocked("https://www.google-analytics.com/analytics.js")
+        assert not _crawl_request_blocked("https://www.googletagmanager.com/gtm.js?id=x")
 
     def test_publisher_and_fonts_allowed(self):
         assert not _crawl_request_blocked("https://example.org/page")
-        # google-origin page traffic (SERP anchors, fonts) stays unfiltered
         assert not _crawl_request_blocked("https://fonts.googleapis.com/css2?family=x")
         assert not _crawl_request_blocked("https://www.google.com/search?q=x")
 
