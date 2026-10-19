@@ -63,6 +63,7 @@ import os
 import random
 import re
 import shutil
+import socket
 import subprocess
 import threading
 import time
@@ -337,6 +338,19 @@ def _lane_display_number(lane_index: int) -> int:
     return _XVFB_BASE_DISPLAY + max(0, lane_index)
 
 
+def _argv_names_display(argv: list[str], display_number: int) -> bool:
+    """True when a command line names this display (":104" or ":104.0").
+
+    The lock-file PID check needs this to be display-specific: after a
+    container restart every pool process is reassigned from the same low
+    PID range, so a stale lock's PID often belongs to a DIFFERENT display's
+    live Xvfb. Matching the display argument (not the "Xvfb" binary name,
+    and not a substring -- ":10" vs ":104") is what tells the two apart.
+    """
+    wanted = f":{display_number}"
+    return any(arg == wanted or arg.startswith(wanted + ".") for arg in argv)
+
+
 def _cleanup_stale_x_locks(display_number: int) -> None:
     """Remove X lock/socket leftovers from a previous container run.
 
@@ -350,10 +364,10 @@ def _cleanup_stale_x_locks(display_number: int) -> None:
     pool's own human input layer included -- could no longer connect. That
     is exactly what happens when a second pool process in the same
     container (debug probe, Onyx worker) calls ensure_display on a display
-    this pool already serves. X lock files record the server's PID, and
-    the cmdline check guards against PID reuse, so a live server's
-    display is left alone and the second Xvfb fails to bind (harmless:
-    the caller falls back to headless).
+    this pool already serves. X lock files record the server's PID; the
+    guard requires the recorded PID to belong to a process whose command
+    line names THIS display -- PID reuse by an unrelated Xvfb (see
+    _argv_names_display) must not shield a genuinely stale lock.
     """
     lock_path = f"/tmp/.X{display_number}-lock"  # noqa: S108
     stale_paths = (
@@ -366,13 +380,14 @@ def _cleanup_stale_x_locks(display_number: int) -> None:
     except (OSError, ValueError):
         owner_pid = None
     if owner_pid is not None:
+        argv: list[str] = []
         try:
             with open(f"/proc/{owner_pid}/cmdline", "rb") as proc_file:
-                owner_cmd = proc_file.read().decode("utf-8", errors="replace")
-            if "Xvfb" in owner_cmd or "Xorg" in owner_cmd:
-                return  # live X server owns this display: leave it alone
+                argv = proc_file.read().decode("utf-8", errors="replace").split("\x00")
         except OSError:
             pass  # PID gone: the lock is genuinely stale
+        if _argv_names_display(argv, display_number):
+            return  # a live X server owns this display: leave it alone
     for path in stale_paths:
         try:
             os.remove(path)
@@ -433,6 +448,45 @@ def _ensure_window_manager(display: str) -> None:
         logger.info("Started openbox on %s", display)
 
 
+_XVFB_STARTUP_TIMEOUT = 5.0
+
+
+def _x_listener_alive(socket_path: str) -> bool:
+    """True when a process accepts connections on the display socket.
+
+    A leftover socket file from a dead X server accepts no connection:
+    this is what tells a wedged display from a working one, however
+    recent the file's timestamp looks.
+    """
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(1.0)
+        sock.connect(socket_path)
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def _xvfb_came_up(process, socket_path: str, before_mtime: float) -> bool:
+    """True when THIS spawn owns a live X server on ``socket_path``.
+
+    All three checks matter: the process must still be running (it dies
+    on a stale lock within milliseconds of spawning), the socket must be
+    NEWER than ``before_mtime`` (a leftover from a dead server must not
+    count as started) and something must actually listen on it.
+    """
+    if process.poll() is not None:
+        return False
+    try:
+        if os.stat(socket_path).st_mtime <= before_mtime:
+            return False
+    except OSError:
+        return False
+    return _x_listener_alive(socket_path)
+
+
 def ensure_display(lane_index: int = 0):
     """Return the X display for pool lane ``lane_index``, starting Xvfb.
 
@@ -457,33 +511,40 @@ def ensure_display(lane_index: int = 0):
         xvfb = shutil.which("Xvfb")
         if xvfb is None:
             return None
-        try:
-            os.makedirs("/tmp/.X11-unix", exist_ok=True)  # noqa: S108
-            _cleanup_stale_x_locks(_lane_display_number(lane_index))
-            process = subprocess.Popen(  # pylint: disable=consider-using-with
-                [
-                    xvfb,
-                    display,
-                    "-screen",
-                    "0",
-                    _XVFB_GEOMETRY,
-                    "-nolisten",
-                    "tcp",
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except OSError:
-            logger.warning("Failed to start Xvfb; falling back to headless browser")
-            return None
-        # Wait for a live process AND a fresh socket: a leftover socket from
-        # a stopped X server must not count as a working display.
         socket_path = f"/tmp/.X11-unix/X{display.lstrip(':')}"  # noqa: S108
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline:
-            if process.poll() is not None:
-                break
-            if os.path.exists(socket_path):
+        for attempt in (1, 2):
+            try:
+                os.makedirs("/tmp/.X11-unix", exist_ok=True)  # noqa: S108
+                _cleanup_stale_x_locks(_lane_display_number(lane_index))
+                try:
+                    before_mtime = os.stat(socket_path).st_mtime
+                except OSError:
+                    before_mtime = 0.0
+                process = subprocess.Popen(  # pylint: disable=consider-using-with
+                    [
+                        xvfb,
+                        display,
+                        "-screen",
+                        "0",
+                        _XVFB_GEOMETRY,
+                        "-nolisten",
+                        "tcp",
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except OSError:
+                logger.warning("Failed to start Xvfb; falling back to headless browser")
+                return None
+            # Wait for THIS spawn to own a live display: a leftover socket
+            # from a stopped X server must not count as a working display,
+            # and an Xvfb dying on a stale lock must not race the check.
+            deadline = time.monotonic() + _XVFB_STARTUP_TIMEOUT
+            while time.monotonic() < deadline:
+                if _xvfb_came_up(process, socket_path, before_mtime):
+                    break
+                time.sleep(0.1)
+            if _xvfb_came_up(process, socket_path, before_mtime):
                 logger.info(
                     "Started Xvfb on %s for lane %d", display, lane_index
                 )
@@ -491,16 +552,23 @@ def ensure_display(lane_index: int = 0):
                 _xvfb_processes[display] = process
                 spawn_wm = True
                 break
-            time.sleep(0.1)
-        if not spawn_wm:
+            # Nothing live on the display: either Xvfb died (stale lock it
+            # could not take) or the socket is a leftover no cleanup saw
+            # before the spawn. Clear what is there NOW and try once more
+            # before giving up on headed mode.
             logger.warning(
-                "Xvfb on %s did not come up; falling back to headless browser",
-                display,
+                "Xvfb on %s did not come up (attempt %d/2)", display, attempt
             )
             try:
                 process.kill()
             except OSError:
                 pass
+            _cleanup_stale_x_locks(_lane_display_number(lane_index))
+        if not spawn_wm:
+            logger.warning(
+                "Xvfb on %s did not come up; falling back to headless browser",
+                display,
+            )
             _xvfb_processes.pop(display, None)
             return None
     # the WM spawn takes _xvfb_lock itself: never call it while that lock
