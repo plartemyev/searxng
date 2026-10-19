@@ -948,3 +948,75 @@ def test_dwell_returns_promptly_when_stopped_upfront():
         )
 
     _run(check())
+
+
+# _discover_browser: outgoing.browser_kind selects the fleet's binary, the
+# other kind stays as the automatic fallback when it is missing
+
+
+@pytest.fixture
+def _browser_paths(monkeypatch, tmp_path):
+    """Point both kinds' candidate paths at files under tmp_path."""
+    firefox = tmp_path / "firefox"
+    chromium = tmp_path / "chromium"
+    firefox.write_text("")
+    chromium.write_text("")
+    monkeypatch.setattr(
+        browser_module,
+        "_BROWSER_CANDIDATE_PATHS",
+        {"firefox": (str(firefox),), "chromium": (str(chromium),)},
+    )
+    monkeypatch.delenv("SEARXNG_BROWSER_EXECUTABLE_PATH", raising=False)
+    monkeypatch.delenv("SEARXNG_CHROMIUM_EXECUTABLE_PATH", raising=False)
+    monkeypatch.delenv("SEARXNG_BROWSER_KIND", raising=False)
+    return firefox, chromium
+
+
+def test_discover_browser_default_prefers_firefox(_browser_paths):
+    firefox, _ = _browser_paths
+    assert browser_module._discover_browser() == ("firefox", str(firefox))
+
+
+def test_discover_browser_configured_kind_wins(_browser_paths):
+    _, chromium = _browser_paths
+    assert browser_module._discover_browser("chromium") == ("chromium", str(chromium))
+    assert browser_module._discover_browser("FIREFOX") == (
+        "firefox",
+        str(_browser_paths[0]),
+    )
+
+
+def test_discover_browser_falls_back_when_missing(_browser_paths, monkeypatch, caplog):
+    firefox, _ = _browser_paths
+    # the configured chromium binary is absent: the fleet still comes up
+    monkeypatch.setattr(
+        browser_module,
+        "_BROWSER_CANDIDATE_PATHS",
+        {"firefox": (str(firefox),), "chromium": ("/nonexistent/chromium",)},
+    )
+    assert browser_module._discover_browser("chromium") == ("firefox", str(firefox))
+
+
+def test_discover_browser_nothing_found(_browser_paths, monkeypatch):
+    monkeypatch.setattr(
+        browser_module,
+        "_BROWSER_CANDIDATE_PATHS",
+        {"firefox": ("/nonexistent/ff",), "chromium": ("/nonexistent/chromium",)},
+    )
+    assert browser_module._discover_browser("firefox") == ("firefox", None)
+
+
+def test_discover_browser_executable_path_pin_wins(_browser_paths, monkeypatch):
+    firefox, chromium = _browser_paths
+    monkeypatch.setenv("SEARXNG_BROWSER_EXECUTABLE_PATH", str(chromium))
+    assert browser_module._discover_browser("firefox") == ("chromium", str(chromium))
+    # a recognizable pin plus an explicit kind: the kind decides
+    monkeypatch.setenv("SEARXNG_BROWSER_KIND", "firefox")
+    assert browser_module._discover_browser("chromium") == ("firefox", str(chromium))
+
+
+def test_pool_browser_kind_normalizes(caplog):
+    assert browser_module.BrowserFetchPool(browser_kind="chromium")._browser_kind == "chromium"
+    assert browser_module.BrowserFetchPool(browser_kind=" Firefox ")._browser_kind == "firefox"
+    assert browser_module.BrowserFetchPool(browser_kind="safari")._browser_kind == "firefox"
+    assert browser_module.BrowserFetchPool()._browser_kind == "firefox"

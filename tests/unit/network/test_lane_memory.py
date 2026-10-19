@@ -10,8 +10,8 @@ from searx.network.browser import (
     BrowserFetchError,
     BrowserFetchPool,
     _Lane,
-    _crawl_request_blocked,
     _is_serp_wrap_url,
+    _page_request_blocked,
 )
 
 from tests import SearxTestCase
@@ -80,31 +80,31 @@ class TestIsSerpWrapUrl:
         assert not _is_serp_wrap_url("not a url at all")
 
 
-class TestCrawlRequestBlocked:
+class TestPageRequestBlocked:
     def test_third_party_ad_hosts_blocked(self):
-        assert _crawl_request_blocked("https://cdn.taboola.com/lib/trc.js")
-        assert _crawl_request_blocked("https://connect.facebook.net/en_US/fbevents.js")
-        assert _crawl_request_blocked("https://pixel.quantserve.com/pixel.js")
+        assert _page_request_blocked("https://cdn.taboola.com/lib/trc.js")
+        assert _page_request_blocked("https://connect.facebook.net/en_US/fbevents.js")
+        assert _page_request_blocked("https://pixel.quantserve.com/pixel.js")
 
     def test_google_ad_pipeline_allowed_everywhere(self):
         # googlesyndication/doubleclick/GA/GTM are the cross-site jar
         # signal: allowed on crawled pages too
-        assert not _crawl_request_blocked("https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js")
-        assert not _crawl_request_blocked("https://googleads.g.doubleclick.net/pagead/ads")
-        assert not _crawl_request_blocked("https://www.google-analytics.com/analytics.js")
-        assert not _crawl_request_blocked("https://www.googletagmanager.com/gtm.js?id=x")
+        assert not _page_request_blocked("https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js")
+        assert not _page_request_blocked("https://googleads.g.doubleclick.net/pagead/ads")
+        assert not _page_request_blocked("https://www.google-analytics.com/analytics.js")
+        assert not _page_request_blocked("https://www.googletagmanager.com/gtm.js?id=x")
 
     def test_publisher_and_fonts_allowed(self):
-        assert not _crawl_request_blocked("https://example.org/page")
-        assert not _crawl_request_blocked("https://fonts.googleapis.com/css2?family=x")
-        assert not _crawl_request_blocked("https://www.google.com/search?q=x")
+        assert not _page_request_blocked("https://example.org/page")
+        assert not _page_request_blocked("https://fonts.googleapis.com/css2?family=x")
+        assert not _page_request_blocked("https://www.google.com/search?q=x")
 
     def test_video_media_blocked(self):
-        assert _crawl_request_blocked("https://cdn.example.org/clip.mp4?token=1")
-        assert _crawl_request_blocked("https://stream.example.org/hls/index.m3u8")
+        assert _page_request_blocked("https://cdn.example.org/clip.mp4?token=1")
+        assert _page_request_blocked("https://stream.example.org/hls/index.m3u8")
 
     def test_garbage_is_allowed(self):
-        assert not _crawl_request_blocked("not a url at all")
+        assert not _page_request_blocked("not a url at all")
 
 
 class TestCrossLaneWrapperGuard(SearxTestCase):

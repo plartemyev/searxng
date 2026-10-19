@@ -19,15 +19,21 @@ include::browser_masquerade_sequence.puml[]
 
 Modified parts of the flow vs upstream searxng:
 
-- Engine requests are served by a per-lane masqueraded Firefox, not httpx
-  (``outgoing.using_browser``).
+- Engine requests are served by a per-lane masqueraded browser, not httpx
+  (``outgoing.using_browser``). The binary is a configuration choice:
+  ``outgoing.browser_kind`` (``firefox`` -- the default and this
+  deployment's fleet -- or ``chromium``); the other kind is the automatic
+  fallback when the configured binary is missing. Images build per kind
+  with the ``SEARXNG_BROWSER_KIND`` build argument, which also ships as the
+  environment default inside the image.
 - In maximum stealth mode every search is typed into the provider's UI with
   real X input (``outgoing.browser_max_stealth``).
 - The lanes run without an ad blocker: google sees the whole jar, SERP ad
-  anchors included. Crawled publisher pages load with third-party
-  ad/metric networks and video filtered in code
-  (``BrowserFetchPool._apply_crawl_filter``); google's own pipeline
-  (googlesyndication, doubleclick, GA, GTM) is allowed everywhere.
+  anchors included. Publisher pages load with third-party ad/metric
+  networks and video filtered in code, universally -- every lane whatever
+  its browser kind, on crawls (``BrowserFetchPool._apply_page_filter``)
+  and on the post-search browsing click-throughs alike; google's own
+  pipeline (googlesyndication, doubleclick, GA, GTM) is allowed everywhere.
 - Challenges are provider-specific:
 
   - google: reCAPTCHA Enterprise -- checkbox click, then an image grid

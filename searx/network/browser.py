@@ -17,8 +17,10 @@ curl_cffi client. The browser is tuned to look like a user-started browser
   ``navigator.languages`` and WebGL vendor/renderer claims with the
   Linux-desktop persona
 
-A distro Chromium binary is used instead when no Firefox is present (the
-original fleet posture), so older images keep working.
+Which browser the fleet masquerades as is a configuration choice:
+``outgoing.browser_kind`` selects the distro binary (``firefox`` by
+default, ``chromium``). The other kind is the automatic fallback when the
+configured binary is missing, so older Chromium-only images keep working.
 
 GET requests use a fetch-style ``context.request.get`` (browser TLS stack +
 cookie jar, no page render). On a bot challenge (Cloudflare interstitial,
@@ -301,7 +303,29 @@ class CrawlBodyTooLarge(BrowserFetchError):
     """Raised when a crawled body exceeds the configured size cap."""
 
 
-def _discover_browser() -> tuple[str, str | None]:
+_BROWSER_CANDIDATE_PATHS = {
+    "firefox": _FIREFOX_CANDIDATE_PATHS,
+    "chromium": _CHROMIUM_CANDIDATE_PATHS,
+}
+
+
+def _normalize_browser_kind(value, default: str = "firefox") -> str:
+    """Validate a configured browser kind; unrecognized values fall back to
+    ``default`` with a warning (a typo must not take the fleet down)."""
+    kind = (value or "").strip().lower()
+    if kind in _BROWSER_CANDIDATE_PATHS:
+        return kind
+    if kind:
+        logger.warning(
+            "browser kind %r is not one of: %s -- using %r",
+            value,
+            ", ".join(_BROWSER_CANDIDATE_PATHS),
+            default,
+        )
+    return default
+
+
+def _discover_browser(preferred_kind: str = "firefox") -> tuple[str, str | None]:
     """Locate the pool's browser binary: ``(kind, path)``.
 
     ``kind`` is ``"firefox"`` or ``"chromium"`` and selects the Playwright
@@ -311,26 +335,43 @@ def _discover_browser() -> tuple[str, str | None]:
     fallback. ``path`` is None when nothing was found, in which case the
     caller warns and Playwright falls back to its own bundled browser.
 
+    ``preferred_kind`` -- ``outgoing.browser_kind`` in settings.yml (the
+    ``SEARXNG_BROWSER_KIND`` environment variable is its image-level
+    default) -- is tried first; the other kind stays as an automatic
+    fallback so an image without the configured binary keeps working (one
+    warning line notes the substitution).
+
     ``SEARXNG_BROWSER_EXECUTABLE_PATH`` (or the legacy
     ``SEARXNG_CHROMIUM_EXECUTABLE_PATH``) pins an explicit binary;
     ``SEARXNG_BROWSER_KIND`` pins the kind when the file name is not
     recognizable.
     """
+    preferred_kind = _normalize_browser_kind(preferred_kind)
     env_path = os.environ.get("SEARXNG_BROWSER_EXECUTABLE_PATH") or os.environ.get(
         "SEARXNG_CHROMIUM_EXECUTABLE_PATH"
     )
     if env_path and os.path.isfile(env_path):
-        kind = os.environ.get("SEARXNG_BROWSER_KIND", "").strip().lower()
-        if kind not in ("firefox", "chromium"):
-            kind = "firefox" if "firefox" in os.path.basename(env_path) else "chromium"
+        env_kind = (os.environ.get("SEARXNG_BROWSER_KIND") or "").strip().lower()
+        if env_kind in _BROWSER_CANDIDATE_PATHS:
+            # an explicit pin wins, whatever the file name looks like
+            return env_kind, env_path
+        # no recognizable pin: the file name decides
+        kind = "firefox" if "firefox" in os.path.basename(env_path) else "chromium"
         return kind, env_path
-    for candidate in _FIREFOX_CANDIDATE_PATHS:
-        if os.path.isfile(candidate):
-            return "firefox", candidate
-    for candidate in _CHROMIUM_CANDIDATE_PATHS:
-        if os.path.isfile(candidate):
-            return "chromium", candidate
-    return "firefox", None
+    # the configured kind first, the other kind as the automatic fallback
+    order = [preferred_kind] + [k for k in _BROWSER_CANDIDATE_PATHS if k != preferred_kind]
+    for kind in order:
+        for candidate in _BROWSER_CANDIDATE_PATHS[kind]:
+            if os.path.isfile(candidate):
+                if kind != preferred_kind:
+                    logger.warning(
+                        "no %s browser found (outgoing.browser_kind); using"
+                        " the %s distro binary instead",
+                        preferred_kind,
+                        kind,
+                    )
+                return kind, candidate
+    return preferred_kind, None
 
 
 def _lane_display_number(lane_index: int) -> int:
@@ -1083,16 +1124,19 @@ _CRAWL_LANE_WAIT_S = 30.0
 # ARE the organic click targets on the results page. Any other same-site
 # link (verticals, related searches, settings) is not a reader's click.
 _REDIRECT_HINTS = ("/ck/a", "/goto?url=", "/l/?uddg", "/url?q=", "/interstitial", "/proxy?")
-# Crawled publisher pages load with third-party ad/metric networks and
-# video filtered: a research crawl fans out over dozens of pages and
-# unfiltered rendering (autoplay video, ad-network widgets) is what made
-# the ad-rendering fleet measure 7G+ per search session. Google's OWN
-# pipeline (googlesyndication, doubleclick, googleadservices, GA, GTM) is
-# deliberately allowed everywhere -- those requests are the cross-site
-# jar signal we are feeding google, and letting AdSense render also keeps
-# sites that gate on GTM/dataLayer from breaking mid-crawl. Non-google
-# trackers stay blocked: no jar value, pure resource cost.
-_CRAWL_BLOCKED_HOST_PARTS = (
+# Publisher pages load with third-party ad/metric networks and video
+# filtered, on every lane whatever browser kind it runs (firefox or
+# chromium) and for every page the fleet opens beyond the search engines
+# themselves: crawl renders and post-search browsing click-throughs alike.
+# Unfiltered rendering (autoplay video, ad-network widgets, banner farms)
+# is what made the ad-rendering fleet measure 7G+ per search session. The
+# search engines' own pages (SERPs, challenge warm-ups) stay unfiltered:
+# google's OWN pipeline (googlesyndication, doubleclick, googleadservices,
+# GA, GTM) is deliberately allowed everywhere -- those requests are the
+# cross-site jar signal we are feeding google, and letting AdSense render
+# also keeps sites that gate on GTM/dataLayer from breaking mid-crawl.
+# Non-google trackers stay blocked: no jar value, pure resource cost.
+_PAGE_FILTER_BLOCKED_HOST_PARTS = (
     "connect.facebook.net", "facebook.net", "taboola.", "outbrain.",
     "criteo.", "amazon-adsystem.com", "adnxs.", "pubmatic.",
     "rubiconproject.", "scorecardresearch.", "quantserve.", "hotjar.",
@@ -1100,22 +1144,22 @@ _CRAWL_BLOCKED_HOST_PARTS = (
     "smartadserver.", "sharethrough.", "yieldmo.", "zedo.", "bidswitch.",
     "teads.", "media.net", "ads.yahoo.", "atdmt.",
 )
-_CRAWL_BLOCKED_MEDIA_EXTENSIONS = (
+_PAGE_FILTER_BLOCKED_MEDIA_EXTENSIONS = (
     ".mp4", ".m4v", ".webm", ".mkv", ".mov", ".avi", ".m3u8", ".mpd",
     ".ts", ".flv", ".ogv",
 )
 
 
-def _crawl_request_blocked(url: str) -> bool:
-    """True for a subresource the crawl filter drops (host or media type)."""
+def _page_request_blocked(url: str) -> bool:
+    """True for a subresource the page filter drops (host or media type)."""
     try:
         parts = urlsplit(url)
     except ValueError:
         return False
     host = (parts.hostname or "").lower()
-    if any(part in host for part in _CRAWL_BLOCKED_HOST_PARTS):
+    if any(part in host for part in _PAGE_FILTER_BLOCKED_HOST_PARTS):
         return True
-    return parts.path.lower().endswith(_CRAWL_BLOCKED_MEDIA_EXTENSIONS)
+    return parts.path.lower().endswith(_PAGE_FILTER_BLOCKED_MEDIA_EXTENSIONS)
 
 # Clicking a bare image or archive URL is not reading; skip those links.
 _POST_SEARCH_SKIP_EXTENSIONS = (
@@ -1832,6 +1876,7 @@ class BrowserFetchPool:
         profile_dir: str | None = None, post_search_browsing: bool = False,
         origin_gap_search: tuple[float, float] | None = None,
         origin_gap_site: tuple[float, float] | None = None,
+        browser_kind: str = "firefox",
     ):
         self._pool_size = max(1, pool_size)
         self._verify = verify
@@ -1840,6 +1885,10 @@ class BrowserFetchPool:
         self._max_stealth = max_stealth
         self._profile_dir = profile_dir
         self._post_search = post_search_browsing
+        # the browser binary this fleet masquerades as ("firefox" or
+        # "chromium"); the other kind is the automatic fallback when the
+        # configured binary is missing (see _discover_browser)
+        self._browser_kind = _normalize_browser_kind(browser_kind)
         self._gap_search = tuple(origin_gap_search or _ORIGIN_GAP_SEARCH_S)
         self._gap_site = tuple(origin_gap_site or _ORIGIN_GAP_SITE_S)
         # per-origin pacing state: one lock serializes the waiters for an
@@ -1886,14 +1935,18 @@ class BrowserFetchPool:
                 ) from e
 
             executable_path: str | None
-            browser_kind, executable_path = _discover_browser()
+            browser_kind, executable_path = _discover_browser(self._browser_kind)
             if executable_path is None:
+                fallback_kind = "chromium" if browser_kind == "firefox" else "firefox"
                 logger.warning(
-                    "No distro Firefox or Chromium found (looked in %s and"
-                    " %s); using Playwright's bundled browser, which is"
-                    " easier for bot detectors to fingerprint",
-                    ", ".join(_FIREFOX_CANDIDATE_PATHS),
-                    ", ".join(_CHROMIUM_CANDIDATE_PATHS),
+                    "No distro %s browser found (looked in %s; the %s"
+                    " fallback paths %s were tried too); using Playwright's"
+                    " bundled browser, which is easier for bot detectors to"
+                    " fingerprint",
+                    browser_kind,
+                    ", ".join(_BROWSER_CANDIDATE_PATHS[browser_kind]),
+                    fallback_kind,
+                    ", ".join(_BROWSER_CANDIDATE_PATHS[fallback_kind]),
                 )
 
             try:
@@ -2361,7 +2414,9 @@ class BrowserFetchPool:
                 await lane.browser.close()
             except Exception:  # pylint: disable=broad-except
                 pass
-        replacement = await self._launch_lane(lane_index, lane.browser_kind, _discover_browser()[1])
+        replacement = await self._launch_lane(
+            lane_index, lane.browser_kind, _discover_browser(lane.browser_kind)[1]
+        )
         lane.browser = replacement.browser
         lane.context = replacement.context
         lane.display = replacement.display
@@ -2860,18 +2915,22 @@ class BrowserFetchPool:
             raise BrowserFetchError("no alive browser lane available for crawling")
         return lane, False, True
 
-    async def _apply_crawl_filter(self, page) -> None:
-        """Drop third-party ad/metric networks and video on a crawled page.
+    async def _apply_page_filter(self, page) -> None:
+        """Drop third-party ad/metric networks and video on a fleet page.
 
-        Google's own ad/metrics pipeline is deliberately allowed everywhere
-        (see _CRAWL_BLOCKED_HOST_PARTS): those beacons are the cross-site
+        Installed on EVERY publisher page the pool opens -- crawl renders
+        and post-search browsing click-throughs alike, on whatever browser
+        kind the lane runs (firefox or chromium): heavy ad banners and
+        autoplay video are pure resource cost. Google's own ad/metrics
+        pipeline is deliberately allowed everywhere (see
+        _PAGE_FILTER_BLOCKED_HOST_PARTS): those beacons are the cross-site
         signal the jar exists to accumulate. The handler never raises: a
-        filter error must not fail the crawl.
+        filter error must not fail the page.
         """
 
         async def _route(route):
             try:
-                if _crawl_request_blocked(route.request.url):
+                if _page_request_blocked(route.request.url):
                     await route.abort()
                 else:
                     await route.continue_()
@@ -2902,7 +2961,7 @@ class BrowserFetchPool:
         try:
             page = await lane.context.new_page()
             try:
-                await self._apply_crawl_filter(page)
+                await self._apply_page_filter(page)
                 response = await page.goto(
                     url, timeout=timeout_s * 1000, wait_until="commit"
                 )
@@ -3605,6 +3664,12 @@ class BrowserFetchPool:
             random.uniform(*_POST_SEARCH_DWELL_RANGE),
             max(5.0, deadline - time.monotonic()),
         )
+        # the visited page is a publisher page: the universal ad/metric/video
+        # cut applies here exactly as on crawls, whatever browser kind the
+        # lane runs. A click-through's navigation has already started, so
+        # requests racing this install slip through; everything after it is
+        # filtered.
+        await self._apply_page_filter(opened)
         logger.debug(
             "post-search browsing: visiting %s for %.0fs", opened.url[:100], dwell
         )
@@ -3835,6 +3900,13 @@ def get_browser_fetch_pool() -> BrowserFetchPool:
             max_stealth=get_setting("outgoing.browser_max_stealth", False),
             profile_dir=get_setting("outgoing.browser_profile_dir", "") or None,
             post_search_browsing=get_setting("outgoing.browser_post_search_browsing", False),
+            # which browser the fleet masquerades as: settings.yml decides,
+            # the image's SEARXNG_BROWSER_KIND env is the default
+            # ("firefox" | "chromium", see _discover_browser)
+            browser_kind=get_setting(
+                "outgoing.browser_kind",
+                os.environ.get("SEARXNG_BROWSER_KIND", "firefox"),
+            ),
             origin_gap_search=_gap_range_setting(
                 "outgoing.browser_origin_gap_search", _ORIGIN_GAP_SEARCH_S
             ),

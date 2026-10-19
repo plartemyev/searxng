@@ -1,20 +1,36 @@
-# SearXNG image variant with the masqueraded Firefox fetch pool
+# SearXNG image variant with the masqueraded browser fetch pool
 # (outgoing.using_browser). Arch-based: the browser fetch pool needs a
-# real Firefox (distro build, driven over WebDriver BiDi), Xvfb for
-# headed mode, and playwright.
+# real distro browser (Firefox or Chromium -- see SEARXNG_BROWSER_KIND
+# below), Xvfb for headed mode, and playwright.
 FROM docker.io/library/archlinux:base-devel
+
+# SEARXNG_BROWSER_KIND selects which browser the fleet masquerades as:
+# "firefox" (default) or "chromium". It picks the distro browser package
+# installed below and ships as an ENV default, so the runtime choice
+# (outgoing.browser_kind in settings.yml; searx/network/browser.py falls
+# back to this env and then to the other binary) agrees with the image
+# without extra configuration. Build one image per kind:
+#   docker build --build-arg SEARXNG_BROWSER_KIND=firefox ...
+#   docker build --build-arg SEARXNG_BROWSER_KIND=chromium ...
+# Browser profiles are NOT interchangeable across kinds: give each kind
+# its own lane-profile volume.
+ARG SEARXNG_BROWSER_KIND=firefox
 
 # pacman -Syu (not -Sy): a partial upgrade against stale mirrors breaks
 # glibc/pyc mismatches. The image's default mirrorlist resolves to slow
 # hosts from this network (14 min to fetch firefox's dep tree); pin the
 # GeoIP CDN mirror, which sustains ~26 MB/s here. Packages:
-# - firefox: the distro build the pool masquerades as (no Playwright
-#   fork); driven through Playwright's "moz-firefox" channel, which
-#   speaks Firefox's native WebDriver BiDi protocol.
-# - firefox-ublock-origin: uBlock as a distribution extension, enabled
-#   for every profile -- most desktop Firefox installs block ads, and
-#   so does this fleet (see _FIREFOX_USER_PREFS in browser.py, which
-#   re-enables distro add-ons that Playwright's test profile disables).
+# - the browser: a distro build the pool masquerades as (no Playwright
+#   fork). firefox is driven through Playwright's "moz-firefox" channel,
+#   which speaks Firefox's native WebDriver BiDi protocol; chromium uses
+#   Playwright's chromium launch path.
+# - firefox-ublock-origin: uBlock as a distribution extension, part of a
+#   stock distro Firefox install. The fleet keeps it DISABLED at runtime
+#   (extensions.installDistroAddons False in _FIREFOX_USER_PREFS,
+#   browser.py: google must see the whole jar, SERP ad anchors included);
+#   the ad cutting is done in code instead, universally for both browser
+#   kinds (_apply_page_filter). The package stays so flipping the pref
+#   needs no rebuild.
 # - otf-fira-sans / otf-fira-mono: the Fira family (renamed from
 #   ttf-fira-* in current Arch repos).
 # - noto-fonts: Thai glyphs (the pool's geo identity is th-TH; challenge
@@ -31,11 +47,11 @@ FROM docker.io/library/archlinux:base-devel
 #   (the base image's fontconfig has almost no fallbacks otherwise --
 #   a tiny font list is measurable from JS and unusual).
 # - tk: pyautogui/mouseinfo import tkinter at import time.
-# - mesa: software GL for Firefox's WebGL under Xvfb (no GPU here).
+# - mesa: software GL for the browser's WebGL under Xvfb (no GPU here).
 # - pipewire pipewire-pulse wireplumber dbus: the desktop sound stack.
-#   Without a sound server Firefox reports a 44100 Hz null AudioContext
-#   (real desktops: 48000 Hz) -- a deviceless-container tell a page can
-#   read. One stack serves every lane; _ensure_audio_stack in
+#   Without a sound server the browser reports a 44100 Hz null
+#   AudioContext (real desktops: 48000 Hz) -- a deviceless-container tell
+#   a page can read. One stack serves every lane; _ensure_audio_stack in
 #   searx/network/browser.py starts it on a private XDG_RUNTIME_DIR before
 #   the first browser launches (pipewire-pulse speaks the pulse protocol
 #   Firefox's libpulse talks, so no classic pulseaudio is needed).
@@ -46,7 +62,10 @@ FROM docker.io/library/archlinux:base-devel
 RUN printf 'Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch\n' \
         > /etc/pacman.d/mirrorlist \
     && pacman -Syu --noconfirm \
-        firefox firefox-ublock-origin \
+        $(case "$SEARXNG_BROWSER_KIND" in \
+              chromium) printf '%s ' chromium ;; \
+              *) printf '%s ' firefox firefox-ublock-origin ;; \
+          esac) \
         otf-fira-sans otf-fira-mono \
         noto-fonts noto-fonts-cjk noto-fonts-extra ttf-dejavu \
         xorg-server-xvfb openbox tk mesa \
@@ -59,8 +78,10 @@ ENV LANG=C.UTF-8
 # Docker's seccomp profile blocks the unprivileged user namespaces the
 # Firefox content sandbox needs; without this the content processes die
 # at startup. Invisible to pages (JS cannot observe the sandbox), same
-# posture as Chromium's --no-sandbox in a container.
-ENV MOZ_DISABLE_CONTENT_SANDBOX=1
+# posture as Chromium's --no-sandbox in a container. (Firefox fleets
+# only; ignored elsewhere.)
+ENV MOZ_DISABLE_CONTENT_SANDBOX=1 \
+    SEARXNG_BROWSER_KIND=${SEARXNG_BROWSER_KIND}
 
 # same paths / user convention as the official image. The Arch upgrade
 # ships a systemd-imds system account that lands on UID/GID 977 (a
@@ -76,7 +97,7 @@ RUN if getent passwd systemd-imds >/dev/null; then userdel systemd-imds; fi \
     && chown -R searxng:searxng /etc/searxng /var/cache/searxng /tmp/.X11-unix
 
 WORKDIR /usr/local/searxng
-# pip: playwright drives the pool's Firefox (the "moz-firefox" channel
+# pip: playwright drives the pool's browser (the "moz-firefox" channel
 # speaks WebDriver BiDi, which the distro Firefox implements natively --
 # no Playwright browser download needed); python-xlib ships the XTEST
 # input layer for the human-like input fallback
@@ -126,13 +147,16 @@ RUN mkdir -p openbox \
 </openbox_config>\n' > openbox/rc.xml
 # freeze the version: searx/version.py shells out to git (absent in the
 # image) when built from a checkout. GIT_URL must stay the official one:
-# Onyx's provider connection test asserts brand.GIT_URL equals it.
-RUN printf 'VERSION_STRING = "2026.10.1-browser-ff"\nVERSION_TAG = "2026.10.1"\nDOCKER_TAG = "browser"\nGIT_URL = "https://github.com/searxng/searxng"\nGIT_BRANCH = "master"\n' > searx/version.py
+# Onyx's provider connection test asserts brand.GIT_URL equals it. The
+# version names the fleet's browser kind, so a container reports what it
+# masquerades as.
+RUN printf 'VERSION_STRING = "2026.10.2-browser-%s"\nVERSION_TAG = "2026.10.2"\nDOCKER_TAG = "browser"\nGIT_URL = "https://github.com/searxng/searxng"\nGIT_BRANCH = "master"\n' "${SEARXNG_BROWSER_KIND}" > searx/version.py
 RUN chown -R searxng:searxng /usr/local/searxng
 
-# Persistent per-lane Firefox profiles (outgoing.browser_profile_dir): the
-# deployment mounts a docker volume here; pre-owning the path means the
-# volume inherits the searxng ownership instead of root's.
+# Persistent per-lane browser profiles (outgoing.browser_profile_dir): the
+# deployment mounts a docker volume here -- one volume per browser kind
+# (profiles are not interchangeable); pre-owning the path means the volume
+# inherits the searxng ownership instead of root's.
 RUN mkdir -p /var/lib/searxng/lanes && chown -R searxng:searxng /var/lib/searxng
 
 USER searxng
