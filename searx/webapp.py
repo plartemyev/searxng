@@ -454,6 +454,20 @@ def render(template_name: str, **kwargs):
     return result
 
 
+def _endpoint_secret() -> str:
+    """The shared endpoint secret: settings first, then the container env.
+
+    The env override mirrors the captcha solver's api_key handling: the
+    settings file is git-tracked and must not hold the secret (the
+    deployment interpolates it from the gitignored .env).
+    """
+    return str(
+        get_setting('outgoing.browser_crawl_secret', '')
+        or os.environ.get('BROWSER_CRAWL_SECRET')
+        or ''
+    )
+
+
 @app.before_request
 def pre_request():
     sxng_request.start_time = default_timer()  # pylint: disable=assigning-non-slot
@@ -514,6 +528,43 @@ def pre_request():
     for plugin in searx.plugins.STORAGE:
         if (plugin.id not in disabled_plugins) or plugin.id in allowed_plugins:
             sxng_request.user_plugins.append(plugin.id)
+
+
+@app.before_request
+def require_endpoint_secret():
+    """Shared-secret gate for every route but the health probe.
+
+    Runs after pre_request (the after_request timers expect its state) and
+    before any real work. When ``outgoing.browser_crawl_secret`` (or the
+    ``BROWSER_CRAWL_SECRET`` env) is set, callers must present it as the
+    ``X-Crawl-Secret`` header or as HTTP basic auth (any username, the
+    secret as the password: browsers then prompt for it, and http clients
+    honor credentials embedded in the URL). Search and crawl requests cost
+    the browser fleet's trained cookie reputation; on an instance published
+    to a network this is what keeps that from being free for callers
+    without the secret.
+    """
+    if sxng_request.path == '/healthz':
+        return None
+    secret = _endpoint_secret()
+    if not secret:
+        return None
+    from hmac import compare_digest  # pylint: disable=import-outside-toplevel
+
+    secret_bytes = secret.encode('utf-8')
+    # byte-wise compares: header values may carry any latin-1 junk a
+    # client sends, and compare_digest raises on non-ascii str
+    presented = sxng_request.headers.get('X-Crawl-Secret', '').encode('utf-8', 'replace')
+    if compare_digest(presented, secret_bytes):
+        return None
+    auth = sxng_request.authorization
+    if auth is not None and compare_digest((auth.password or '').encode('utf-8', 'replace'), secret_bytes):
+        return None
+    return flask.Response(
+        'unauthorized: missing or invalid endpoint secret\n',
+        status=401,
+        headers={'WWW-Authenticate': 'Basic realm="searxng"'},
+    )
 
 
 @app.after_request
@@ -611,9 +662,8 @@ def crawl():
     """
     if not searx.get_setting('outgoing.browser_crawl_endpoint', False):
         return Response('crawl endpoint disabled\n', status=404, mimetype='text/plain')
-    secret = searx.get_setting('outgoing.browser_crawl_secret', '')
-    if secret and sxng_request.headers.get('X-Crawl-Secret', '') != secret:
-        return Response('invalid crawl secret\n', status=403, mimetype='text/plain')
+    # the shared secret is enforced by the require_endpoint_secret gate
+    # (before_request), like on every other route
 
     from searx.network import crawl as crawl_client
 

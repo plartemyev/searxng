@@ -242,3 +242,97 @@ class ViewsTestCase(SearxTestCase):  # pylint: disable=too-many-public-methods
         self.assertEqual(result.status_code, 200)
         json_result = result.get_json()
         self.assertTrue(json_result)
+
+class EndpointSecretTestCase(SearxTestCase):
+    """The shared-secret gate (webapp.require_endpoint_secret)."""
+
+    SECRET = 'unit-test-secret'
+
+    def setUp(self):
+        super().setUp()
+        real_get_setting = searx.get_setting
+
+        def fake_get_setting(name, default=None):
+            if name == 'outgoing.browser_crawl_secret':
+                return self.SECRET
+            return real_get_setting(name, default)
+
+        self.setattr4test(searx.webapp, 'get_setting', fake_get_setting)
+
+        # no deployment env leakage into unit tests
+        real_environ_get = searx.webapp.os.environ.get
+
+        def no_secret_env(name, default=None):
+            if name == 'BROWSER_CRAWL_SECRET':
+                return None
+            return real_environ_get(name, default)
+
+        self.setattr4test(searx.webapp.os.environ, 'get', no_secret_env)
+
+    def _gate_open(self):
+        """Stub the settings so no secret is configured at all."""
+        real_get_setting = searx.get_setting
+
+        def no_secret_setting(name, default=None):
+            if name == 'outgoing.browser_crawl_secret':
+                return ''
+            return real_get_setting(name, default)
+
+        self.setattr4test(searx.webapp, 'get_setting', no_secret_setting)
+
+    def _auth_header(self, user: str, password: str) -> dict:
+        import base64
+
+        token = base64.b64encode(f'{user}:{password}'.encode()).decode()
+        return {'Authorization': f'Basic {token}'}
+
+    def test_gate_open_without_secret(self):
+        self._gate_open()
+        self.assertEqual(self.client.get('/healthz').status_code, 200)
+        self.assertNotEqual(self.client.get('/config').status_code, 401)
+
+    def test_gate_closed_without_credentials(self):
+        result = self.client.get('/config')
+        self.assertEqual(result.status_code, 401)
+        self.assertIn('Basic', result.headers.get('WWW-Authenticate', ''))
+
+    def test_healthz_exempt(self):
+        self.assertEqual(self.client.get('/healthz').status_code, 200)
+
+    def test_header_grants_access(self):
+        result = self.client.get('/config', headers={'X-Crawl-Secret': self.SECRET})
+        self.assertEqual(result.status_code, 200)
+
+    def test_wrong_header_rejected(self):
+        result = self.client.get('/config', headers={'X-Crawl-Secret': 'not-the-secret'})
+        self.assertEqual(result.status_code, 401)
+
+    def test_basic_auth_grants_access(self):
+        result = self.client.get('/config', headers=self._auth_header('', self.SECRET))
+        self.assertEqual(result.status_code, 200)
+
+    def test_wrong_basic_password_rejected(self):
+        result = self.client.get('/config', headers=self._auth_header('', 'not-the-secret'))
+        self.assertEqual(result.status_code, 401)
+
+    def test_non_ascii_junk_rejected_not_500(self):
+        result = self.client.get('/config', headers={'X-Crawl-Secret': 'ünïcödé-junk'})
+        self.assertEqual(result.status_code, 401)
+
+    def test_env_override_closes_the_gate(self):
+        # the gitignored-env pattern: setting empty, the container env
+        # carries the secret (read at request time by _endpoint_secret)
+        self._gate_open()
+        current_environ_get = searx.webapp.os.environ.get
+
+        def env_secret(name, default=None):
+            if name == 'BROWSER_CRAWL_SECRET':
+                return self.SECRET
+            return current_environ_get(name, default)
+
+        self.setattr4test(searx.webapp.os.environ, 'get', env_secret)
+        self.assertEqual(self.client.get('/config').status_code, 401)
+        self.assertEqual(
+            self.client.get('/config', headers={'X-Crawl-Secret': self.SECRET}).status_code,
+            200,
+        )
