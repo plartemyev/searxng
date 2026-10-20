@@ -1,0 +1,38 @@
+meta {
+  name: Crawl render (page HTML)
+  type: http
+  seq: 5
+}
+
+get {
+  url: {{baseUrl}}/crawl
+  body: none
+  auth: basic
+}
+
+auth:basic {
+    username:
+    password: {{secret}}
+}
+
+params:query {
+  @description('''absolute http(s) URL the fleet should fetch (redirects followed, translate.goog rewritten)''')
+  url: {{crawlUrl}}
+  mode: render
+  @description('''seconds, Onyx clamps 5-120''')
+  timeout: {{crawlTimeout}}
+}
+
+tests {
+  test("200 OK", function() {
+    expect(res.status).to.equal(200);
+  });
+
+  test("html payload present", function() {
+    expect(res.body.html).to.be.a("string").that.is.not.empty;
+  });
+
+  console.log("final_url:", res.body.final_url, "| status:", res.body.status,
+    "| challenge:", res.body.challenge, "| lane:", res.body.lane,
+    "| html bytes:", (res.body.html || "").length);
+}

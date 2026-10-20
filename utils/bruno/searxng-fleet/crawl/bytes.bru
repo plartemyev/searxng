@@ -1,0 +1,41 @@
+meta {
+  name: Crawl bytes (downloads)
+  type: http
+  seq: 6
+}
+
+get {
+  url: {{baseUrl}}/crawl
+  body: none
+  auth: basic
+}
+
+auth:basic {
+    username:
+    password: {{secret}}
+}
+
+params:query {
+  url: {{crawlUrl}}
+  mode: bytes
+  timeout: {{crawlTimeout}}
+  @description('''matches the deployment's 500 MB BINARY_DOWNLOAD_MAX_SIZE_BYTES''')
+  max_bytes: 524288000
+}
+
+tests {
+  test("200 OK", function() {
+    expect(res.status).to.equal(200);
+  });
+
+  test("X-Final-URL header present", function() {
+    const headers = Object.fromEntries(
+      Object.entries(res.headers || {}).map(([k, v]) => [k.toLowerCase(), v])
+    );
+    expect(headers["x-final-url"]).to.be.a("string");
+  });
+
+  console.log("x-final-url:", res.headers["x-final-url"],
+    "| x-crawl-status:", res.headers["x-crawl-status"],
+    "| bytes:", res.body.length);
+}

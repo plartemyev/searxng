@@ -1,0 +1,33 @@
+meta {
+  name: Web search with language
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{baseUrl}}/search
+  body: form-urlencoded
+  auth: basic
+}
+
+auth:basic {
+    username:
+    password: {{secret}}
+}
+
+body:form-urlencoded {
+  @description('''the client adds language when the provider config or the agent tool call carries one''')
+  q: siamese cat
+  format: json
+  language: en
+}
+
+tests {
+  test("200 OK", function() {
+    expect(res.status).to.equal(200);
+  });
+
+  test("results array present", function() {
+    expect(res.body.results).to.be.an("array");
+  });
+}

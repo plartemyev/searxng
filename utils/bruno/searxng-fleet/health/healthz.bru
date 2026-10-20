@@ -1,0 +1,21 @@
+meta {
+  name: Healthz (no auth, exempt by design)
+  type: http
+  seq: 8
+}
+
+get {
+  url: {{baseUrl}}/healthz
+  body: none
+  auth: none
+}
+
+tests {
+  test("200 OK", function() {
+    expect(res.status).to.equal(200);
+  });
+
+  test("body is OK", function() {
+    expect(res.body.trim()).to.equal("OK");
+  });
+}

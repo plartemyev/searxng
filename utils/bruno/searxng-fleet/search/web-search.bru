@@ -1,0 +1,41 @@
+meta {
+  name: Web search (q + format)
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/search
+  body: form-urlencoded
+  auth: basic
+}
+
+auth:basic {
+    username:
+    password: {{secret}}
+}
+
+body:form-urlencoded {
+  q: siamese cat
+  format: json
+}
+
+tests {
+  test("200 OK", function() {
+    expect(res.status).to.equal(200);
+  });
+
+  test("results array present", function() {
+    expect(res.body.results).to.be.an("array");
+  });
+
+  test("has results", function() {
+    expect(res.body.results.length).to.be.above(0);
+  });
+
+  test("lane not burning engines", function() {
+    expect(res.body.unresponsive_engines || []).to.have.length(0);
+  });
+
+  console.log("results:", res.body.results.length, "| unresponsive_engines:", JSON.stringify(res.body.unresponsive_engines));
+}

@@ -1,0 +1,37 @@
+meta {
+  name: Image search (categories=images)
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{baseUrl}}/search
+  body: form-urlencoded
+  auth: basic
+}
+
+auth:basic {
+    username:
+    password: {{secret}}
+}
+
+body:form-urlencoded {
+  @description('''the desktop Google-images grid through the human flow''')
+  q: siamese cat
+  format: json
+  categories: images
+}
+
+tests {
+  test("200 OK", function() {
+    expect(res.status).to.equal(200);
+  });
+
+  test("has image hits (img_src)", function() {
+    const hits = res.body.results.filter(r => r.img_src);
+    expect(hits.length).to.be.above(0);
+  });
+
+  console.log("image hits:", res.body.results.filter(r => r.img_src).length,
+    "| results:", res.body.results.length);
+}

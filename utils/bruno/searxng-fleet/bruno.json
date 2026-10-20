@@ -1,0 +1,8 @@
+{
+  "version": "1",
+  "name": "searxng fleet",
+  "type": "collection",
+  "presets": {
+    "requestTimeout": 300000
+  }
+}

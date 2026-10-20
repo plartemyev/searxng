@@ -1,0 +1,28 @@
+meta {
+  name: Provider connection check
+  type: http
+  seq: 4
+}
+
+get {
+  url: {{baseUrl}}/config
+  body: none
+  auth: basic
+}
+
+auth:basic {
+    username:
+    password: {{secret}}
+}
+
+tests {
+  test("200 OK", function() {
+    expect(res.status).to.equal(200);
+  });
+
+  test("brand.GIT_URL is searxng", function() {
+    expect(res.body.brand.GIT_URL).to.equal("https://github.com/searxng/searxng");
+  });
+
+  console.log("version:", res.body.version, "| fleet:", res.body.brand.VERSION_STRING);
+}

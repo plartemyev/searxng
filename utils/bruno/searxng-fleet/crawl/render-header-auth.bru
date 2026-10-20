@@ -1,0 +1,28 @@
+meta {
+  name: Crawl render via X-Crawl-Secret header
+  type: http
+  seq: 7
+}
+
+get {
+  url: {{baseUrl}}/crawl
+  body: none
+  auth: none
+}
+
+headers {
+  @description('''alt auth for curl-style clients; Onyx itself rides basic auth''')
+  X-Crawl-Secret: {{secret}}
+}
+
+params:query {
+  url: {{crawlUrl}}
+  mode: render
+  timeout: {{crawlTimeout}}
+}
+
+tests {
+  test("200 OK", function() {
+    expect(res.status).to.equal(200);
+  });
+}

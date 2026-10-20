@@ -77,3 +77,10 @@ Modified parts of the flow vs upstream searxng:
 - Engine rate limits surface as a clean 1 h suspension; the suspension path
   never crashes the search thread (non-numeric ``suspended_time`` values
   from engines are nulled in ``searx/search/processors/abstract.py``).
+- When ``outgoing.browser_crawl_secret`` (or the ``BROWSER_CRAWL_SECRET``
+  env) is set, ``webapp.require_endpoint_secret`` gates every route but
+  ``/healthz`` behind it: the ``X-Crawl-Secret`` header or HTTP basic auth
+  (any username, the secret as the password) -- what makes a LAN-published
+  instance safe to share with clients. A Bruno collection exercising every
+  endpoint Onyx drives lives in ``utils/bruno/searxng-fleet`` (GUI or
+  ``bru run --env local``).
