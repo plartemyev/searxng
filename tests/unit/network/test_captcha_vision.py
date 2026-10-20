@@ -7,8 +7,10 @@
 import asyncio
 import base64
 import json
+import os
 import socket
 import struct
+import time
 import zlib
 
 import pytest
@@ -1093,7 +1095,7 @@ def test_quorum_skips_unusable_votes(fake_transport, monkeypatch):
 
 def _live_endpoint_up() -> bool:
     try:
-        with socket.create_connection(("172.17.172.35", 11434), timeout=1.0):
+        with socket.create_connection(("172.29.153.35", 8011), timeout=1.0):
             return True
     except OSError:
         return False
@@ -1128,20 +1130,23 @@ def _synthetic_grid_png() -> bytes:
     )
 
 
-@pytest.mark.skipif(not _live_endpoint_up(), reason="vision endpoint 172.17.172.35:11434 unreachable")
+@pytest.mark.skipif(not _live_endpoint_up(), reason="vision endpoint 172.29.153.35:8011 unreachable")
 def test_live_endpoint_solves_synthetic_grid():
     cfg = VisionSolverConfig(
-        endpoint="http://172.17.172.35:11434",
-        model="ornith-1.5:9b",
-        context_size=58192,
+        endpoint="http://172.29.153.35:8011",
+        model="Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+        api_key=os.environ.get("CAPTCHA_VISION_API_KEY", ""),
         timeout=360.0,
     )
     solver_live = OpenAICompatVisionSolver(cfg)
     widget = _synthetic_grid_png()
     cells = [captcha_vision.crop_png(widget, 2 + col * 64, 2 + row * 64, 60, 60) for row in range(3) for col in range(3)]
+    t0 = time.perf_counter()
     solution = solver_live.solve_grid(
         widget, ("cells", cells), "Select all squares with red color", 9, 3, 3
     )
+    elapsed = time.perf_counter() - t0
+    print(f"\n[synthetic grid solve] {solver_live!r} -> {solution.tiles} in {elapsed:.1f}s")
     assert solution.tiles, "model returned no tiles"
     assert all(0 <= t < 9 for t in solution.tiles)
     assert solution.action == "submit"
