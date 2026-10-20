@@ -88,6 +88,11 @@ _LaunchT = TypeVar("_LaunchT")
 
 # Grace period after a challenge navigation to let challenge JS settle.
 _BOT_CHALLENGE_GRACE_MS = 5000
+# Ceiling on the network-idle wait before crawl DOM capture. networkidle
+# returns early when the network goes quiet; lazily hydrated embeds
+# (Wikipedia's audio player mounts after networkidle) need the ceiling,
+# not the early exit. Settable via outgoing.browser_crawl_settle_ms.
+_CRAWL_SETTLE_MS = 12000
 # Default per-request budget when the caller does not provide a timeout.
 _DEFAULT_TIMEOUT_S = 20.0
 # Floor for caller-provided timeouts: browser fetches are slower than curl.
@@ -2961,6 +2966,36 @@ class BrowserFetchPool:
 
         await page.route("**/*", _route)
 
+    @staticmethod
+    async def _scroll_for_lazy_content(page) -> None:
+        """Scroll the page down and back before DOM capture.
+
+        Viewport-gated embeds (Wikipedia's audio player, lazy image
+        stacks) only mount when scrolled into view; the wheel flicks also
+        read as a human glance. Returns to the top so the captured DOM
+        matches a fresh read of the page.
+        """
+        try:
+            height = await page.evaluate(
+                "document.body ? document.body.scrollHeight : 0"
+            )
+        except Exception:  # pylint: disable=broad-except
+            height = 0
+        viewport = page.viewport_size or {"width": 1280, "height": 720}
+        # ~a viewport per flick, bounded to ten flicks on very tall pages
+        steps = max(
+            2, min(10, int((height or viewport["height"] * 4) // viewport["height"]))
+        )
+        try:
+            for _ in range(steps):
+                await page.mouse.wheel(0, random.randint(600, 1100))
+                await asyncio.sleep(random.uniform(0.25, 0.6))
+            await asyncio.sleep(random.uniform(0.4, 0.9))
+            await page.evaluate("window.scrollTo(0, 0)")
+            await asyncio.sleep(random.uniform(0.2, 0.4))
+        except Exception:  # pylint: disable=broad-except
+            pass
+
     async def crawl_render(self, url: str, *, timeout_s: float = 30.0) -> dict:
         """Navigate a page in a lane browser and return the rendered DOM.
 
@@ -2968,12 +3003,17 @@ class BrowserFetchPool:
         navigation follows redirects, so google's encrypted ``/goto``
         wrappers resolve to their real target; a landing on a Google
         Translate copy is rewritten to the original page and re-fetched
-        (the translation service stays unused).
+        (the translation service stays unused). Before capture the page
+        settles for ``outgoing.browser_crawl_settle_ms`` (networkidle
+        ceiling) and goes through a scroll down-and-back cycle, so
+        lazily hydrated embeds are present in the captured DOM.
         """
         # pylint: disable=import-outside-toplevel
+        from searx import get_setting
         from searx.network.human_input import debug_trace_enabled
 
         url = unwrap_google_translate_url(url)
+        settle_ms = get_setting("outgoing.browser_crawl_settle_ms", _CRAWL_SETTLE_MS)
         lane, affinity, borrowed = await self._checkout_for_crawl(url)
         if affinity:
             logger.info("affinity crawl on lane %s (borrowed=%s)", lane.display or "headless", borrowed)
@@ -2990,10 +3030,11 @@ class BrowserFetchPool:
                     await page.wait_for_timeout(_BOT_CHALLENGE_GRACE_MS)
                 try:
                     await page.wait_for_load_state(
-                        "networkidle", timeout=_BOT_CHALLENGE_GRACE_MS
+                        "networkidle", timeout=settle_ms
                     )
                 except Exception:  # pylint: disable=broad-except
                     pass
+                await self._scroll_for_lazy_content(page)
                 final_url = page.url
                 if _is_google_translate_url(final_url):
                     original = unwrap_google_translate_url(final_url)
@@ -3010,10 +3051,11 @@ class BrowserFetchPool:
                         status = response.status if response else None
                         try:
                             await page.wait_for_load_state(
-                                "networkidle", timeout=_BOT_CHALLENGE_GRACE_MS
+                                "networkidle", timeout=settle_ms
                             )
                         except Exception:  # pylint: disable=broad-except
                             pass
+                        await self._scroll_for_lazy_content(page)
                         final_url = page.url
                 html_text = await page.content()
                 result = {
