@@ -946,6 +946,12 @@ def _is_challenge_url(url: str | None) -> bool:
     return parts.path == "/captcha" or parts.path.startswith("/captcha/")
 
 
+def _is_images_grid_url(url: str | None) -> bool:
+    """Is this a google images results page (the lazy-painting grid)?"""
+    params = parse_qs(urlsplit(url or "").query)
+    return (params.get("tbm") or [""])[0] == "isch" or (params.get("udm") or [""])[0] == "2"
+
+
 def _is_google_translate_url(url: str | None) -> bool:
     """Is this a Google Translate wrapper URL?
 
@@ -1047,6 +1053,12 @@ def _homepage_url_from_search_url(url: str) -> str:
     its own search form submits those parameters with the typed query.
     ``cr=countryXX`` from the engine URL is the searxng spelling of
     ``gl``.
+
+    A google images request (``tbm=isch`` / ``udm=2``) starts from the
+    images front page (``/imghp``): its search box submits into the images
+    vertical, while the generic homepage's box always lands on the web
+    SERP -- a web results DOM the images parser would read as zero
+    results.
     """
     parts = urlsplit(url)
     params = parse_qs(parts.query)
@@ -1060,7 +1072,14 @@ def _homepage_url_from_search_url(url: str) -> str:
         cr = cr_values[0].strip()
         if cr.lower().startswith("country") and len(cr) > len("country"):
             carried.append(("gl", cr[len("country"):].upper()))
-    base = f"{parts.scheme}://{parts.netloc}/"
+    # vertical front pages: a vertical marker in the engine URL picks the
+    # provider page whose search box submits into that vertical
+    tbm = (params.get("tbm") or [""])[0]
+    udm = (params.get("udm") or [""])[0]
+    path = "/"
+    if tbm == "isch" or udm == "2":
+        path = "/imghp"
+    base = f"{parts.scheme}://{parts.netloc}{path}"
     return base + ("?" + urlencode(carried) if carried else "")
 
 
@@ -3388,6 +3407,13 @@ class BrowserFetchPool:
                         except Exception:  # pylint: disable=broad-except
                             pass
                     await human_read_results(page, pointer)
+                    if _is_images_grid_url(page.url):
+                        # scanning an image grid scrolls: the extra viewport
+                        # lets more lazy tiles paint before the DOM is
+                        # captured (the grid swaps inline placeholders for
+                        # the real thumbnails as tiles enter the viewport)
+                        pointer.scroll(-random.randint(3, 6))
+                        await asyncio.sleep(random.uniform(1.0, 2.0))
                     if _is_challenge_url(page.url):
                         # a flagged search can be routed to /sorry late, after
                         # the results already rendered

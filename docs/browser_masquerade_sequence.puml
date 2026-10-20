@@ -2,7 +2,10 @@
 ' Browser masquerade search + crawl workflow, measured 2026-10-19.
 ' 6 lanes on Xvfb :99-:104, distro Firefox 157 (feat/distro-firefox-fleet),
 ' Thai residential egress. Google engine re-enabled; brave back after the
-' IIFE payload fix (see git log 2026-10-19).
+' IIFE payload fix (see git log 2026-10-19). 2026-10-20: google images
+' switched from the discontinued WML endpoint to the desktop image grid,
+' served by the same human flow from /imghp (imgres+tiles parser; the
+' 2026-10-20 run: 50 results, 21-35 s warm lane).
 
 autonumber
 
@@ -28,14 +31,14 @@ note right of Pool : per-origin human pacing on the\nbrowser lanes:\nsame origin
 note right of Pool : wait here if all 6 lanes busy,\nbounded: 20 s, then the oldest\nbackground browsing session is\ncancelled, then up to 90 s more\n(engine timeout budget:\ngoogle 100 s, others 75-90 s)
 
 alt maximum stealth (browser_max_stealth: on)
-    Pool -> Lane : open provider homepage\n(hl/gl locale params ride along;\nno uBlock: google sees the whole jar,\nSERP ad anchors included)
+    Pool -> Lane : open provider homepage\n(vertical front page: google web ->\ngoogle.com, google images -> /imghp --\nits search box submits into the\nvertical; hl/gl locale params ride along;\nno uBlock: google sees the whole jar,\nSERP ad anchors included)
     Lane -> Up : GET homepage
     Hand -> Lane : Bezier move to search box (0.04-0.10 s),\nreal click focuses the box
     Hand -> Lane : type query with human cadence\n(uneven keys, bursts, pauses)
     Hand -> Lane : drift pointer (0.4-1.4 s),\nclick the submit button
-    Lane -> Up : form submit -> results page
+    Lane -> Up : form submit -> results page\n(google's form lands on its own\nvertical: /search udm=2 for images)
     Pool -> Lane : settle: wait for navigation,\nread results like a human
-    note right of Pool : warm-lane searches measured\n~20-40 s (google), ~20-25 s (brave)
+    note right of Pool : warm-lane searches measured\n~20-40 s (google), ~20-25 s (brave);\nan images grid gets one extra\nviewport of scroll so its lazy\ntiles paint before capture
 
     opt google: reCAPTCHA Enterprise (checkbox -> image grid)
         Hand -> Lane : click the challenge checkbox\n(iframe recaptcha/enterprise/anchor)
@@ -66,7 +69,7 @@ alt maximum stealth (browser_max_stealth: on)
     Pool --> Eng : response
     Eng -> Eng : parse results\n(google /goto?url= kept; brave IIFE\nhydration payload unwrapped -- legacy\ndata: [{...}] still supported)
 
-else not a human-search candidate (API endpoints, images, ddg)
+else not a human-search candidate (API endpoints, ddg)
     Pool -> Lane : fetch-style request in browser context\n(browser TLS + lane cookies)
     Lane -> Up : GET url
     Lane --> Pool : response

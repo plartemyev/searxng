@@ -27,7 +27,16 @@ Modified parts of the flow vs upstream searxng:
   with the ``SEARXNG_BROWSER_KIND`` build argument, which also ships as the
   environment default inside the image.
 - In maximum stealth mode every search is typed into the provider's UI with
-  real X input (``outgoing.browser_max_stealth``).
+  real X input (``outgoing.browser_max_stealth``). The visit starts from the
+  provider's front page for the requested vertical: google web searches
+  start from ``google.com``, google image searches from ``/imghp`` -- its
+  search box submits into the images vertical (``udm=2``), so the typed
+  query lands where the engine's parser looks. The ``google images`` engine
+  rides the same desktop interface and human flow (the discontinued WML
+  image endpoint answered zero results), and the desktop grid parser reads
+  the ``div[data-lpage]`` tiles plus the legacy ``/imgres`` links; an image
+  grid gets one extra viewport of scroll before capture so its lazy tiles
+  paint.
 - The lanes run without an ad blocker: google sees the whole jar, SERP ad
   anchors included. Publisher pages load with third-party ad/metric
   networks and video filtered in code, universally -- every lane whatever

@@ -4,8 +4,14 @@
 import typing as t
 from urllib.parse import parse_qs, unquote, urlparse
 
-from searx.engines.google import fetch_traits  # pylint: disable=unused-import
-from searx.engines.google import google_request, wml_dom
+from lxml import html
+
+from searx.engines.google import (  # pylint: disable=unused-import
+    detect_google_sorry,
+    fetch_traits,
+    google_request,
+    wml_dom,
+)
 from searx.result_types import EngineResults
 from searx.utils import eval_xpath_list
 
@@ -20,15 +26,11 @@ about = {
     "official_api_documentation": "https://developers.google.com/custom-search",
     "use_official_api": False,
     "require_api_key": False,
-    "results": "XML",
+    "results": "HTML",
 }
 
 # engine dependent config
 categories = ["images", "web"]
-# The legacy WML endpoint (see searx.engines.google) answers to the Nokia
-# user agent: keep the engine's identity headers when the masqueraded
-# browser pool serves the request.
-browser_keep_identity_headers = True
 paging = True
 enable_http3 = True
 max_page = 50
@@ -52,10 +54,129 @@ def request(query: str, params: "OnlineParams") -> None:
         eng_traits=traits,
         safesearch_map=filter_mapping,
         use_locales=False,
+        desktop_interface=True,
     )
 
 
+# -- desktop interface ------------------------------------------------------
+#
+# The desktop image grid is parsed on structural anchors, class names are
+# best-effort hints only. One result tile per ``div[data-lpage]`` (the
+# source page the tile opens); the tile's thumbnail ``img`` carries the
+# result title in its ``alt``. Many tiles also keep a legacy ``/imgres``
+# link whose ``imgurl`` is the full-resolution image and whose ``w``/``h``
+# name the resolution. Bare ``/imgres`` links (a classic grid without the
+# tile wrapper) are parsed by the same loop that covers them there.
+
+_imgres_xpath = "//a[contains(@href, '/imgres?')]"
+
+_tile_xpath = "//div[@data-lpage]"
+
+# The tile's result title lives in the alt of its image -- the painted
+# ``encrypted-tbn`` thumbnail or its inline placeholder; favicon and
+# similar decoration images carry no alt text.
+_tile_title_xpath = (
+    ".//img["
+    " (contains(@src, 'encrypted-tbn') or starts-with(@src, 'data:image'))"
+    " and normalize-space(@alt)"
+    "]/@alt"
+)
+
+_tile_thumbnail_xpath = ".//img[contains(@src, 'encrypted-tbn')]/@src"
+
+
+def desktop_dom(resp: "SXNG_Response"):
+    """Parse a desktop-interface response, None when it is not one."""
+    detect_google_sorry(resp)
+    text = resp.text
+    if text.lstrip().startswith("<?xml"):
+        # XML declaration: this is the legacy WML layout, parsed by wml_dom
+        return None
+    dom = html.fromstring(text)
+    if dom.xpath("//div[@id='search']") or dom.xpath(_imgres_xpath):
+        return dom
+    return None
+
+
+def _parse_desktop_dom(dom) -> EngineResults:
+    """Parse the results of the desktop image grid."""
+    results = EngineResults()
+    seen: set[tuple[str, str]] = set()
+
+    def add(url: str, title: str, img_src: str, thumbnail_src: str, resolution: str) -> None:
+        if not url.startswith(("http://", "https://")) or not title:
+            return
+        key = (url, img_src)
+        if key in seen:
+            return
+        seen.add(key)
+        results.add(
+            results.types.Image(
+                url=url,
+                title=title,
+                img_src=img_src,
+                thumbnail_src=thumbnail_src,
+                resolution=resolution,
+            )
+        )
+
+    # modern grid: one tile per source page
+    for tile in dom.xpath(_tile_xpath):
+        url = (tile.get("data-lpage") or "").strip()
+        titles = tile.xpath(_tile_title_xpath)
+        title = titles[0].strip() if titles else ""
+        thumbs = tile.xpath(_tile_thumbnail_xpath)
+        thumbnail_src = thumbs[0] if thumbs else ""
+        # full-resolution image and display size from the tile's legacy
+        # /imgres link, when the tile keeps one
+        img_src = ""
+        resolution = ""
+        for link in tile.xpath(".//a[contains(@href, '/imgres?')]"):
+            qs = parse_qs(urlparse(link.get("href", "")).query)
+            img_src = qs.get("imgurl", [""])[0]
+            width, height = qs.get("w", [""])[0], qs.get("h", [""])[0]
+            resolution = f"{width} x {height}" if width and height else ""
+            break
+        img_src = img_src or thumbnail_src
+        if not title:
+            title = urlparse(url).netloc
+        add(url, title, img_src, thumbnail_src, resolution)
+
+    # classic grid: bare /imgres links, most already covered by their tile
+    for link in dom.xpath(_imgres_xpath):
+        qs = parse_qs(urlparse(link.get("href", "")).query)
+        img_src = qs.get("imgurl", [""])[0]
+        url = qs.get("imgrefurl", [""])[0]
+        if not img_src or not url:
+            continue
+        width, height = qs.get("w", [""])[0], qs.get("h", [""])[0]
+        tbnid = qs.get("tbnid", [""])[0]
+        title = unquote(urlparse(img_src).path.rsplit("/", 1)[-1]) or urlparse(url).netloc
+        add(
+            url,
+            title,
+            img_src,
+            f"https://encrypted-tbn0.gstatic.com/images?q=tbn:{tbnid}" if tbnid else "",
+            f"{width} x {height}" if width and height else "",
+        )
+
+    if not results and dom.xpath("//div[@id='rso']//a[.//h3]"):
+        # a web SERP, not an image grid: the search flow landed on the
+        # wrong vertical -- without this line the failure is invisible
+        # (a silent zero-results success)
+        logger.warning("google images: desktop DOM holds web results, no image tiles")
+
+    return results
+
+
 def response(resp: "SXNG_Response") -> EngineResults:
+    # The browser pool (and the human fallback's rendered page last resort)
+    # serves the desktop interface: parse it when the body is one, fall
+    # back to the legacy WML layout otherwise.
+    dom = desktop_dom(resp)
+    if dom is not None:
+        return _parse_desktop_dom(dom)
+
     results = EngineResults()
     dom = wml_dom(resp)
 
