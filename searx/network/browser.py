@@ -2996,6 +2996,54 @@ class BrowserFetchPool:
         except Exception:  # pylint: disable=broad-except
             pass
 
+    @staticmethod
+    async def _prune_invisible_dom(page) -> int:
+        """Remove elements the rendered layout never shows, so the captured
+        DOM matches what a reader sees.
+
+        Hidden templates, hover-only tooltips, collapsed menus and dead
+        responsive blocks are real DOM but never render; downstream text
+        extraction reads them as content. Walks top-down and removes every
+        element that computes as invisible (display/visibility/opacity,
+        zero box, hidden attribute, <template>/<noscript>), keeping any
+        subtree that still lays out visible boxes.
+        """
+        return await page.evaluate(
+            """
+            () => {
+              const laid = (el) => {
+                const r = el.getBoundingClientRect();
+                if (r.width === 0 && r.height === 0) return false;
+                const cs = getComputedStyle(el);
+                return cs.display !== 'none'
+                  && cs.visibility !== 'hidden' && cs.visibility !== 'collapse'
+                  && parseFloat(cs.opacity || '1') !== 0;
+              };
+              const dead = (el) => {
+                if (el.hasAttribute('hidden')) return true;
+                const tag = el.tagName;
+                if (tag === 'TEMPLATE' || tag === 'NOSCRIPT') return true;
+                if (el.checkVisibility) {
+                  return !el.checkVisibility(
+                    { checkOpacity: true, checkVisibilityCSS: true });
+                }
+                return !laid(el);
+              };
+              let n = 0;
+              for (const el of Array.from(document.body.querySelectorAll('*'))) {
+                if (!el.isConnected) continue;  // ancestor already pruned
+                if (!dead(el)) continue;
+                let liveDescendant = false;
+                for (const d of el.querySelectorAll('*')) {
+                  if (laid(d)) { liveDescendant = true; break; }
+                }
+                if (!liveDescendant) { el.remove(); n++; }
+              }
+              return n;
+            }
+            """
+        )
+
     async def crawl_render(self, url: str, *, timeout_s: float = 30.0) -> dict:
         """Navigate a page in a lane browser and return the rendered DOM.
 
@@ -3006,7 +3054,11 @@ class BrowserFetchPool:
         (the translation service stays unused). Before capture the page
         settles for ``outgoing.browser_crawl_settle_ms`` (networkidle
         ceiling) and goes through a scroll down-and-back cycle, so
-        lazily hydrated embeds are present in the captured DOM.
+        lazily hydrated embeds are present in the captured DOM. Just
+        before capture the DOM is pruned to the visible layout: elements
+        that compute as hidden (JS templates, hover-only tooltips,
+        collapsed menus, dead responsive blocks) are dropped, so the
+        serialized HTML carries what a reader actually sees.
         """
         # pylint: disable=import-outside-toplevel
         from searx import get_setting
@@ -3057,6 +3109,15 @@ class BrowserFetchPool:
                             pass
                         await self._scroll_for_lazy_content(page)
                         final_url = page.url
+                try:
+                    pruned = await self._prune_invisible_dom(page)
+                    if pruned:
+                        logger.info(
+                            "crawl of %s: pruned %s invisible elements",
+                            url, pruned,
+                        )
+                except Exception:  # pylint: disable=broad-except
+                    logger.debug("crawl of %s: invisible-DOM prune failed", url)
                 html_text = await page.content()
                 result = {
                     "final_url": final_url,

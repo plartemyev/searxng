@@ -84,3 +84,9 @@ Modified parts of the flow vs upstream searxng:
   instance safe to share with clients. A Bruno collection exercising every
   endpoint Onyx drives lives in ``utils/bruno/searxng-fleet`` (GUI or
   ``bru run --env local``).
+- ``/crawl?mode=render`` captures the *visible* layout. After the settle
+  and scroll down-and-back cycle, every element that computes as hidden
+  (``display``/``visibility``/opacity, zero box, ``hidden`` attribute,
+  ``<template>``/``<noscript>``) is pruned from the live DOM before
+  serialization -- hover-only tooltips, collapsed menus, JS templates and
+  dead responsive blocks never reach the returned HTML.
