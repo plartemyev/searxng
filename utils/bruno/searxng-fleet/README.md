@@ -1,10 +1,5 @@
 # searxng-fleet (Bruno collection)
 
-Every endpoint variant Onyx drives on this fork's masqueraded-browser
-fleet, plus the health probe and the shared-secret gate's negative
-checks. This replaces the Postman collection that briefly lived in the
-deployment repo (`deployment/docker_compose/searxng.postman_collection.json`).
-
 ## Setup
 
 Paste the fleet's shared secret into `environments/local.bru`
