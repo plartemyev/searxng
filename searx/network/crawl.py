@@ -19,6 +19,7 @@ from searx.network.browser import (
     BrowserFetchError,
     CrawlBodyTooLarge,
     get_browser_fetch_pool,
+    telegram_channel_preview_url,
     unwrap_google_translate_url,
 )
 from searx.network.client import get_loop
@@ -63,8 +64,10 @@ def render_page(
     url: str, *, timeout_s: float = 30.0, allow_private_network: bool = False
 ) -> dict:
     """Render one page on a lane browser: html + final URL (redirects
-    followed, Google Translate wrappers resolved to the original)."""
+    followed, Google Translate wrappers resolved to the original, t.me
+    channels served from their /s/ web preview)."""
     url = unwrap_google_translate_url(url)
+    url = telegram_channel_preview_url(url)
     _assert_crawlable_url(url, allow_private_network)
     future = asyncio.run_coroutine_threadsafe(
         get_browser_fetch_pool().crawl_render(url, timeout_s=timeout_s), get_loop()
@@ -84,6 +87,7 @@ def fetch_bytes(
 ) -> dict:
     """Fetch raw bytes in a lane's browser context (browser TLS + cookies)."""
     url = unwrap_google_translate_url(url)
+    url = telegram_channel_preview_url(url)
     _assert_crawlable_url(url, allow_private_network)
     future = asyncio.run_coroutine_threadsafe(
         get_browser_fetch_pool().crawl_bytes(

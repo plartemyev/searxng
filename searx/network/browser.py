@@ -1047,6 +1047,52 @@ def unwrap_google_translate_url(url: str) -> str:
     return urlunparse(("https", original_host, parts.path, "", urlencode(query), ""))
 
 
+# Telegram hosts serving channel pages. The bare ``t.me/<channel>`` URL is
+# an app hand-off stub rendered by JS, while the readable public history of
+# the same channel lives at ``t.me/s/<channel>``; telegram.me mirrors t.me.
+_TELEGRAM_HOSTS = {"t.me", "www.t.me", "telegram.me", "www.telegram.me"}
+_TELEGRAM_CANONICAL_HOST = "t.me"
+# Single-segment t.me paths that are not channel names (share links,
+# instant-view proxies, static pages); rewriting those to /s/ is nonsense.
+_TELEGRAM_NON_CHANNEL_PATHS = {"s", "share", "iv", "proxy", "contact", "tos", "faq"}
+
+
+def _is_telegram_channel_url(url: str | None) -> bool:
+    """Is this a Telegram channel page: the bare ``t.me/<channel>`` URL or
+    its ``/s/`` web preview?"""
+    parts = urlsplit(url or "")
+    if (parts.hostname or "").lower() not in _TELEGRAM_HOSTS:
+        return False
+    segments = [s for s in parts.path.split("/") if s]
+    if len(segments) == 2 and segments[0].lower() == "s":
+        return True
+    return (
+        len(segments) == 1
+        and segments[0].lower() not in _TELEGRAM_NON_CHANNEL_PATHS
+    )
+
+
+def telegram_channel_preview_url(url: str) -> str:
+    """Map ``t.me/<channel>`` to its public web preview ``t.me/s/<channel>``.
+
+    The bare channel URL only hands off to the Telegram apps, so a crawl
+    of it captures a stub; the ``/s/`` path serves the real channel
+    history as HTML. The telegram.me mirrors are canonicalized to t.me so
+    the preview is fetched without the mirror's redirect hop. Post links
+    (``t.me/<channel>/<post>``), the preview itself, non-channel utility
+    paths and non-telegram URLs come back unchanged.
+    """
+    parts = urlsplit(url or "")
+    if (parts.hostname or "").lower() not in _TELEGRAM_HOSTS:
+        return url
+    segments = [s for s in parts.path.split("/") if s]
+    if len(segments) != 1 or segments[0].lower() in _TELEGRAM_NON_CHANNEL_PATHS:
+        return url
+    return urlunparse(
+        ("https", _TELEGRAM_CANONICAL_HOST, "/s/" + segments[0], "", parts.query, "")
+    )
+
+
 def _homepage_url_from_search_url(url: str) -> str:
     """The provider front page, carrying the engine URL's locale parameters.
 
@@ -2997,6 +3043,27 @@ class BrowserFetchPool:
             pass
 
     @staticmethod
+    async def _scroll_up_for_telegram_preview(page) -> None:
+        """Walk a t.me/s channel preview UP before DOM capture.
+
+        The preview can open parked deep in the channel history with the
+        newest posts above the viewport; upward wheel flicks walk back
+        toward the top the way a reader would and trigger the preview's
+        above-viewport lazy load. Ten screens is the same bound the
+        down-scroll uses. Ends at the top so the capture matches a fresh
+        read of the page.
+        """
+        try:
+            for _ in range(10):
+                await page.mouse.wheel(0, -random.randint(600, 1100))
+                await asyncio.sleep(random.uniform(0.25, 0.6))
+            await asyncio.sleep(random.uniform(0.4, 0.9))
+            await page.evaluate("window.scrollTo(0, 0)")
+            await asyncio.sleep(random.uniform(0.2, 0.4))
+        except Exception:  # pylint: disable=broad-except
+            pass
+
+    @staticmethod
     async def _prune_invisible_dom(page) -> int:
         """Remove elements the rendered layout never shows, so the captured
         DOM matches what a reader sees.
@@ -3051,7 +3118,10 @@ class BrowserFetchPool:
         navigation follows redirects, so google's encrypted ``/goto``
         wrappers resolve to their real target; a landing on a Google
         Translate copy is rewritten to the original page and re-fetched
-        (the translation service stays unused). Before capture the page
+        (the translation service stays unused). Telegram channel links
+        are served from their ``/s/`` web preview and scroll up instead
+        of down before capture; a redirect landing on a bare channel URL
+        is re-fetched from the preview. Before capture the page
         settles for ``outgoing.browser_crawl_settle_ms`` (networkidle
         ceiling) and goes through a scroll down-and-back cycle, so
         lazily hydrated embeds are present in the captured DOM. Just
@@ -3065,6 +3135,7 @@ class BrowserFetchPool:
         from searx.network.human_input import debug_trace_enabled
 
         url = unwrap_google_translate_url(url)
+        url = telegram_channel_preview_url(url)
         settle_ms = get_setting("outgoing.browser_crawl_settle_ms", _CRAWL_SETTLE_MS)
         lane, affinity, borrowed = await self._checkout_for_crawl(url)
         if affinity:
@@ -3086,10 +3157,32 @@ class BrowserFetchPool:
                     )
                 except Exception:  # pylint: disable=broad-except
                     pass
-                await self._scroll_for_lazy_content(page)
                 final_url = page.url
+                preview = telegram_channel_preview_url(final_url)
+                if preview != final_url:
+                    logger.info(
+                        "crawl of %s landed on a Telegram app-stub URL;"
+                        " fetching the web preview %s",
+                        url, preview[:100],
+                    )
+                    response = await page.goto(
+                        preview, timeout=timeout_s * 1000, wait_until="commit"
+                    )
+                    status = response.status if response else None
+                    try:
+                        await page.wait_for_load_state(
+                            "networkidle", timeout=settle_ms
+                        )
+                    except Exception:  # pylint: disable=broad-except
+                        pass
+                    final_url = page.url
+                if _is_telegram_channel_url(final_url):
+                    await self._scroll_up_for_telegram_preview(page)
+                else:
+                    await self._scroll_for_lazy_content(page)
                 if _is_google_translate_url(final_url):
                     original = unwrap_google_translate_url(final_url)
+                    original = telegram_channel_preview_url(original)
                     if original != final_url:
                         logger.info(
                             "crawl of %s landed on a Google Translate copy;"
@@ -3107,8 +3200,11 @@ class BrowserFetchPool:
                             )
                         except Exception:  # pylint: disable=broad-except
                             pass
-                        await self._scroll_for_lazy_content(page)
                         final_url = page.url
+                        if _is_telegram_channel_url(final_url):
+                            await self._scroll_up_for_telegram_preview(page)
+                        else:
+                            await self._scroll_for_lazy_content(page)
                 try:
                     pruned = await self._prune_invisible_dom(page)
                     if pruned:
@@ -3148,6 +3244,7 @@ class BrowserFetchPool:
         from searx.network.human_input import debug_trace_enabled
 
         url = unwrap_google_translate_url(url)
+        url = telegram_channel_preview_url(url)
         lane, affinity, borrowed = await self._checkout_for_crawl(url)
         try:
             async with lane.lock:

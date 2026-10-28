@@ -440,6 +440,82 @@ def test_unwrap_google_translate_url():
     assert unwrap_google_translate_url("https://example.org/x") == "https://example.org/x"
 
 
+def test_is_telegram_channel_url():
+    assert browser_module._is_telegram_channel_url("https://t.me/durov")
+    assert browser_module._is_telegram_channel_url("https://www.t.me/s/durov")
+    assert browser_module._is_telegram_channel_url("https://telegram.me/durov")
+    assert browser_module._is_telegram_channel_url("https://telegram.me/s/durov")
+    assert not browser_module._is_telegram_channel_url("https://t.me/durov/1234")
+    assert not browser_module._is_telegram_channel_url("https://t.me/share/url?url=x")
+    assert not browser_module._is_telegram_channel_url("https://example.org/durov")
+    assert not browser_module._is_telegram_channel_url(None)
+
+
+def test_telegram_channel_preview_url():
+    from searx.network.browser import telegram_channel_preview_url
+
+    assert telegram_channel_preview_url("https://t.me/durov") == "https://t.me/s/durov"
+    assert (
+        telegram_channel_preview_url("https://www.t.me/Durov?before=42")
+        == "https://t.me/s/Durov?before=42"
+    )
+    # the telegram.me mirrors canonicalize to t.me
+    assert (
+        telegram_channel_preview_url("https://telegram.me/durov")
+        == "https://t.me/s/durov"
+    )
+    assert (
+        telegram_channel_preview_url("http://www.telegram.me/Durov?before=42")
+        == "https://t.me/s/Durov?before=42"
+    )
+    # already the preview, a single post, a utility path, not telegram
+    assert telegram_channel_preview_url("https://t.me/s/durov") == "https://t.me/s/durov"
+    assert (
+        telegram_channel_preview_url("https://telegram.me/s/durov")
+        == "https://telegram.me/s/durov"
+    )
+    assert (
+        telegram_channel_preview_url("https://t.me/durov/1234")
+        == "https://t.me/durov/1234"
+    )
+    assert (
+        telegram_channel_preview_url("https://t.me/share/url?url=x")
+        == "https://t.me/share/url?url=x"
+    )
+    assert telegram_channel_preview_url("https://example.org/x") == "https://example.org/x"
+
+
+def test_scroll_up_for_telegram_preview(monkeypatch):
+    """The t.me capture scroll flicks upward only and ends at the top."""
+
+    async def _nosleep(_delay=None):
+        pass
+
+    monkeypatch.setattr(browser_module.asyncio, "sleep", _nosleep)
+
+    wheels = []
+    evals = []
+
+    class _Mouse:
+        async def wheel(self, dx, dy):
+            wheels.append((dx, dy))
+
+    async def _evaluate(script):
+        evals.append(script)
+
+    page = SimpleNamespace(
+        viewport_size={"width": 1280, "height": 720}, mouse=_Mouse(), evaluate=_evaluate
+    )
+
+    async def _run():
+        await browser_module.BrowserFetchPool._scroll_up_for_telegram_preview(page)
+
+    asyncio.new_event_loop().run_until_complete(_run())
+    assert len(wheels) == 10
+    assert all(dx == 0 and dy < 0 for dx, dy in wheels)
+    assert evals == ["window.scrollTo(0, 0)"]
+
+
 def test_lane_serp_url_affinity_routing():
     """A crawl of a URL a lane's search returned routes back to that lane."""
     from types import SimpleNamespace as NS
